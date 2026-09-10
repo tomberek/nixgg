@@ -31,9 +31,21 @@ type Stub struct {
 // build output. ".nix-socket" is builder-rpc-v0's own unix socket —
 // `nix store add --scan` can't ingest a socket. ".gg-stage" is
 // StageForScan's own working directory.
+//
+// ".nixgg" is nixgg's own scratch dir — staged source trees, thunks and
+// memo caches. It is scaffolding, never output, and capturing it is
+// expensive: `nix store add --scan` records a reference for every store
+// path it finds inside, which drags the whole staging closure into the
+// captured tree.
+//
+// Excluding it is safe. The final stage re-runs the build under the
+// shims and recreates what it needs; staged sources are already in the
+// store as derivation inputs; and sandbox mode marks outputs with
+// drvref stub FILES, so nothing in the tree points into .nixgg.
 var skipNames = map[string]bool{
 	".nix-socket": true,
 	".gg-stage":   true,
+	".nixgg":      true,
 }
 
 // Walk finds every drvref stub under root, in deterministic
@@ -143,11 +155,37 @@ func copyRecursive(src, dst string) error {
 			return err
 		}
 		for _, e := range entries {
+			// skipNames applies at EVERY depth, not just the root: the
+			// scratch dir sits at the project root paths.Resolve chose,
+			// which is usually several levels down. Walk already skips by
+			// name at any depth, so without this the two halves of the
+			// assembly disagree about what counts as build output.
+			if skipNames[e.Name()] {
+				continue
+			}
 			if err := copyRecursive(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
 				return err
 			}
 		}
 		return nil
+	case drvref.Is(src):
+		// A drvref stub's whole content is a /nix/store/….drv path, and
+		// `nix store add --scan` records every store path it finds. So
+		// copying stubs verbatim makes the captured tree REFERENCE each
+		// producing derivation, and a derivation's closure includes its
+		// own inputs — for a compile, its whole staged source tree.
+		// Nix then bind-mounts that closure into every derivation that
+		// consumes the tree.
+		//
+		// Blanking them is safe because of ordering, not luck:
+		// cmdAssemble calls Walk on the ORIGINAL root and already holds
+		// every stub's drv path before StageForScan runs. The staged
+		// copy needs only the tree's SHAPE, and the assembly overlays
+		// the real artifact over each stub anyway.
+		//
+		// Keep an empty file rather than skipping: recipes stat their
+		// outputs, and the overlay's `cp -a` wants the path to exist.
+		return os.WriteFile(dst, nil, info.Mode().Perm())
 	default:
 		return copyFile(src, dst, info.Mode().Perm())
 	}

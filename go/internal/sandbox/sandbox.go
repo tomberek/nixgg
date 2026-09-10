@@ -142,6 +142,11 @@ func DerivationAdd(cfg *toolchain.Config, drv expr.JSONDrv) (string, error) {
 // highest-volume of the three sandbox ops (one call per compile TU,
 // same as DerivationAdd).
 func StoreAddScan(cfg *toolchain.Config, name, path string) (string, error) {
+	// Sanitized once, before a backend is chosen: every path below —
+	// helper, direct RPC, and the CLI fallback — hands this name to the
+	// daemon, and Nix's naming rules apply identically to each. Doing it
+	// per-backend would let a new one be added without it.
+	name = StoreName(name)
 	if b, closeB, ok, err := selectBackend(); err != nil {
 		return "", fmt.Errorf("rpc store add --scan: %w", err)
 	} else if ok {

@@ -270,3 +270,50 @@ func TUID(absOutput string) string {
 	h := sha256.Sum256([]byte(absOutput))
 	return slug + "-" + hex.EncodeToString(h[:6])
 }
+
+// SourcesShared stages entries as SYMLINKS into per-file store objects
+// rather than hardlinked copies.
+//
+// The staged tree keeps its exact shape — same relative paths, so
+// `#include "../foo.h"` and the caller's -I flags resolve unchanged —
+// but its bytes collapse from the full header closure to one symlink
+// entry each. A TU staging ~190 headers becomes ~190
+// symlinks / a few KB, and the header content is stored once no matter
+// how many TUs include it.
+//
+// That matters because the closure is overwhelmingly shared: across 60
+// sampled translation units the same headers recurred roughly 17x, and
+// a per-TU copy pays that duplication in full every time.
+//
+// store maps an absolute path to the store object holding its content;
+// the caller supplies it so this package stays free of nix plumbing.
+// Returns the absolute path to .nixgg/srcs/<tu-id>/, like Sources.
+func SourcesShared(l paths.Layout, tuID string, entries []Entry, store func(abs string) (string, error)) (string, error) {
+	dir := filepath.Join(l.Srcs, tuID)
+	if err := os.MkdirAll(l.Srcs, 0o755); err != nil {
+		return "", err
+	}
+	// No reuse check: the symlink targets are content-addressed, so a
+	// changed header yields a different target and the cheap thing is to
+	// rebuild the (tiny) farm.
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		sp, err := store(e.Abs)
+		if err != nil {
+			return "", fmt.Errorf("share %s: %w", e.Abs, err)
+		}
+		dst := filepath.Join(dir, e.Rel)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.Symlink(sp, dst); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}

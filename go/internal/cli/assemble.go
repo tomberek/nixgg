@@ -1,11 +1,20 @@
-// cmdAssemble implements `nixgg assemble <root> <name>`.
+// cmdAssemble implements `nixgg assemble <root> <name> [outputKey]`.
 //
 // splitStdenv's build-stage postBuild step: <root> is a tree of real
 // files interleaved with drvref stubs (one per cc/c++/ar/link call the
 // shims intercepted — see internal/drvref). Walk it, build one
 // assembly drv whose builder restores the tree and overlays each stub
-// with its resolved artifact, and submit it as the outer derivation's
-// "out" output.
+// with its resolved artifact, and submit it as one of the outer
+// derivation's outputs.
+//
+// outputKey defaults to "out", which is dynDrvStdenv's shape: its
+// phase-1 derivation declares exactly one output. mkNixggBuild is the
+// caller that needs it explicit — since the multi-target rework its
+// outer derivation declares "<target>.drv" per target and NO "out" at
+// all, so submitting under "out" fails with "submitted unknown output".
+// The name argument must agree: Nix enforces that the submitted drv is
+// named outputPathName(<outer name>, outputKey), i.e. the outer name
+// plus "-" plus outputKey minus its ".drv" suffix.
 package cli
 
 import (
@@ -19,10 +28,14 @@ import (
 )
 
 func cmdAssemble(args []string) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: nixgg assemble <root> <name>")
+	if len(args) != 2 && len(args) != 3 {
+		return fmt.Errorf("usage: nixgg assemble <root> <name> [output-key]")
 	}
 	root, name := args[0], args[1]
+	outputKey := "out"
+	if len(args) == 3 && args[2] != "" {
+		outputKey = args[2]
+	}
 
 	cfg, err := toolchain.FromEnv()
 	if err != nil {
@@ -65,9 +78,9 @@ func cmdAssemble(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "[nixgg assemble] drv: %s\n", drvPath)
 
-	if err := sandbox.SubmitOutput(cfg, drvPath, "out"); err != nil {
+	if err := sandbox.SubmitOutput(cfg, drvPath, outputKey); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[nixgg assemble] submitted: %s\n", drvPath)
+	fmt.Fprintf(os.Stderr, "[nixgg assemble] submitted: %s (output %s)\n", drvPath, outputKey)
 	return nil
 }

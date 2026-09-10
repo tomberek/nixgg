@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,16 @@ func TestFromArgv0(t *testing.T) {
 		{"ld.gold", ToolLD},
 		{"ld.lld", ToolLD},
 		{"x86_64-linux-gnu-ld", ToolLD},
+		// Not a compiler, but modelled: `ld -r` partial links fuse
+		// multi-object components. Anything that is not `-r`
+		// passes straight through — see shim.LD.
+		{"ld", ToolLD},
+
+		// A whole-crate compiler rather than a per-TU one — see
+		// shim.Rustc. Reached only when a caller points the build's
+		// RUSTC at our shim; nothing resolves it via PATH.
+		{"rustc", ToolRustc},
+		{"/nix/store/xxx-rustc-1.95.0/bin/rustc", ToolRustc},
 
 		// Not compilers.
 		{"make", ToolUnknown},
@@ -219,5 +230,45 @@ func TestExpandRspfilesLeavesNonFilesAlone(t *testing.T) {
 	got := ExpandRspfiles(in)
 	if !reflect.DeepEqual(got, in) {
 		t.Errorf("ExpandRspfiles mangled a non-file @arg\n got: %q\nwant: %q", got, in)
+	}
+}
+
+// rustc's @-file format is not the compiler drivers': one line is one
+// argument, verbatim. The kernel's generated cfg file is the case that
+// matters, and it fails loudly rather than subtly — rustc requires the
+// quotes that shell tokenisation removes:
+//
+//	error: invalid `--cfg` argument: `CONFIG_RTC_DRV_CROS_EC=m`
+//
+// which is where this came from.
+func TestExpandRustArgfilesKeepsLinesVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rustc_cfg")
+	body := "--cfg=CONFIG_RTC_DRV_CROS_EC\n" +
+		"--cfg=CONFIG_RTC_DRV_CROS_EC=\"m\"\n" +
+		"--cfg=CONFIG_MSG=\"hello world\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := ExpandRustArgfiles([]string{"--edition=2021", "@" + path, "lib.rs"})
+	want := []string{
+		"--edition=2021",
+		"--cfg=CONFIG_RTC_DRV_CROS_EC",
+		`--cfg=CONFIG_RTC_DRV_CROS_EC="m"`,
+		`--cfg=CONFIG_MSG="hello world"`,
+		"lib.rs",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ExpandRustArgfiles =\n  %q\nwant\n  %q", got, want)
+	}
+
+	// The compiler-driver expander must still do its own thing — this is
+	// a second convention, not a replacement.
+	drv := ExpandRspfiles([]string{"@" + path})
+	for _, a := range drv {
+		if strings.Contains(a, `="m"`) {
+			t.Errorf("ExpandRspfiles now behaves like the rustc one: %q", drv)
+		}
 	}
 }

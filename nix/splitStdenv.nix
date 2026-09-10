@@ -97,6 +97,16 @@
   # filtering — always safe). Same shape as the old configureCacheStdenv
   # param — see nix/configureSrcFilter.nix.
   configureSrcFilter ? null,
+  # Stage each TU as a symlink farm into per-file store objects rather
+  # than copying. Without it a kernel stages ~150 GB of duplicated
+  # headers; with it, a fraction of that. Threaded into ggShimsOnPath's
+  # NIXGG_SHARED_STAGE — see internal/stage's SourcesShared.
+  sharedStaging ? false,
+  # Subtrees whose build reads object BYTES inline, which no derivation
+  # can model. The shims pass work under them straight through — see
+  # internal/mode. Threaded into ggShimsOnPath's
+  # NIXGG_PASSTHROUGH_PATHS.
+  passthroughPaths ? [ ],
 }:
 
 let
@@ -117,10 +127,50 @@ let
       coreutils
       gcc
       gnumake
+      passthroughPaths
+      sharedStaging
       system
       ;
   };
   inherit (shared) ggShimsOnPath submitBuildTreeScript outputPlaceholder;
+
+  # Replay the build stage's exports, gap-filling only: a variable the
+  # final stage already set always wins, so its own outputs and
+  # stdenv-managed state cannot be clobbered. Splitting one
+  # mkDerivation across two derivations splits the shell too, and
+  # packages routinely export in one stage and read in a later one.
+  ggRestoreEnv = ''
+    if [ -f "$NIX_BUILD_TOP/.gg-env" ]; then
+      while IFS= read -r ggLine; do
+        case "$ggLine" in
+          "declare -x "*) ;;
+          *) continue ;;
+        esac
+        ggKV=''${ggLine#declare -x }
+        ggName=''${ggKV%%=*}
+        case "$ggName" in
+          PATH|PWD|OLDPWD|HOME|SHLVL|_) continue ;;
+          TMP|TMPDIR|TEMP|TEMPDIR) continue ;;
+          NIX_BUILD_TOP|NIX_STORE|NIX_BUILD_CORES|NIX_LOG_FD) continue ;;
+          out|outputs) continue ;;
+          NIXGG_*) continue ;;
+          # Phase control. Derivation attributes are exported like any
+          # other variable, so the build stage's own `dontInstall = true`
+          # arrives here as dontInstall=1 — and the final stage, which
+          # never sets it, would gap-fill it and then SKIP ITS OWN
+          # installPhase. That failure is silent: the builder exits 0
+          # having run nothing, and Nix reports only "failed to produce
+          # output path". Same hazard for dontFixup/doCheck/doDist and
+          # for the phase list itself.
+          dont*|do[A-Z]*|phases|*Phase|*Phases) continue ;;
+        esac
+        # Gap-fill only: never override what the final stage decided.
+        if [ -z "''${!ggName+x}" ]; then
+          eval "export $ggKV"
+        fi
+      done < "$NIX_BUILD_TOP/.gg-env"
+    fi
+  '';
 
   # extraAttrs runs first as a shared baseline; the role-specific hatch
   # composes on top and wins — see extraAttrs's own docstring above.
@@ -145,6 +195,21 @@ stdenv0.override (
         probeArgs = lib.toFunction argsOrFn { };
         drvName = if probeArgs ? name then probeArgs.name else "${probeArgs.pname}-${probeArgs.version}";
         outerName = "gg-build-${drvName}";
+
+        # Honour what the package asked for: phases written against
+        # structuredAttrs use bash array syntax, which does not exist
+        # when it is off. Default matches make-derivation.nix.
+        structuredAttrs = probeArgs.__structuredAttrs or (config.structuredAttrsByDefault or false);
+
+        # builder-rpc-v0 wants $out unset; /nonexistent keeps stdenv's
+        # _assignFirst happy while making a real write fail loudly.
+        # Under structuredAttrs only `env` reaches the derivation as
+        # environment variables, so the placeholder goes there.
+        nonexistentOut =
+          if structuredAttrs then
+            { env = (probeArgs.env or { }) // { out = "/nonexistent"; }; }
+          else
+            { out = "/nonexistent"; };
 
         # Store paths the shim's storedeps matcher needs to recognize in
         # -I/-L flags — same computation as mkNixggBuild.nix's
@@ -335,7 +400,6 @@ stdenv0.override (
                     # suffix). The final stage keeps the package's real
                     # `outputs`.
                     outputs = [ "out" ];
-                    out = "/nonexistent";
                     # make-derivation.nix computes `outputs' = outputs ++
                     # optional separateDebugInfo' "debug"` at its OWN
                     # layer, downstream of this override, so `outputs =
@@ -349,7 +413,14 @@ stdenv0.override (
                     # (and any hook attached to it) entirely, so
                     # restoring the configure stage's tree needs its own
                     # always-run phase name instead.
-                    phases = "unpackPhase patchPhase ggRestorePhase buildPhase";
+                    # ggSubmitPhase is named explicitly here because
+                    # setup.sh only splices postPhases when `phases` is
+                    # UNSET. The configureStage == null path below leaves
+                    # it unset and gets the submit via postPhases; this
+                    # branch would silently drop it, and a build that
+                    # submits nothing fails with Nix's opaque "failed to
+                    # submit output path for 'out'".
+                    phases = "unpackPhase patchPhase ggRestorePhase buildPhase ggSubmitPhase";
                     ggRestorePhase = configureStage.restorePhase;
                   }
                   # Extra outputs (bin/dev/man/...) are plain env vars
@@ -366,7 +437,11 @@ stdenv0.override (
                     }) extraOutputs
                   )
                   // {
-                    __structuredAttrs = false;
+                    # Honoured, not forced: the package's phases may be
+                    # written against structuredAttrs. The `out`
+                    # placeholder moves into `env` to match — see
+                    # nonexistentOut.
+                    __structuredAttrs = structuredAttrs;
                     requiredSystemFeatures = (orig.requiredSystemFeatures or [ ]) ++ [ "builder-rpc-v0" ];
                     __contentAddressed = true;
                     outputHashMode = "text";
@@ -387,8 +462,17 @@ stdenv0.override (
                     preBuild = ''
                       unset NIXGG_BYPASS
                     '' + (orig.preBuild or "");
-                    postBuild = (orig.postBuild or "") + submitBuildTreeScript outerName;
-                  };
+                    # A real phase, not a postBuild hook: postBuild only
+                    # runs if the package's buildPhase calls runHook, and
+                    # many hand-written ones do not (nixpkgs' own
+                    # linux-config among them) — those built fine,
+                    # submitted nothing, and failed with Nix's opaque
+                    # "failed to submit output path for 'out'".
+                    # postPhases is spliced on unconditionally by setup.sh.
+                    postPhases = (lib.toList (orig.postPhases or [ ])) ++ [ "ggSubmitPhase" ];
+                    ggSubmitPhase = submitBuildTreeScript outerName;
+                  }
+                  // nonexistentOut;
               in
               applyExtra extraBuildAttrs finalAttrs base;
 
@@ -414,12 +498,27 @@ stdenv0.override (
                 // {
                   phases = "ggRestorePhase checkPhase installPhase fixupPhase installCheckPhase distPhase";
                   dontUnpack = true;
-                  __structuredAttrs = false;
+                  # Honoured, not forced — same reasoning as the build
+                  # stage above. This stage owns the package's REAL
+                  # outputs, so it needs no placeholder.
+                  __structuredAttrs = structuredAttrs;
                   ggRestorePhase = ''
                     runHook preGgRestore
                     cp -a ${builtTree}/. "$NIX_BUILD_TOP/"
                     chmod -R u+w "$NIX_BUILD_TOP"
                     cd "$NIX_BUILD_TOP/$(cat "$NIX_BUILD_TOP/.gg-cwd")"
+                    ${ggRestoreEnv}
+
+                    # The final stage needs the shims reachable but
+                    # inert: build systems bake absolute tool paths at
+                    # configure time (cmake does; a caller can via
+                    # makeFlags), so those paths get invoked here whether
+                    # or not we planned for it. Without the env the shim
+                    # cannot build its config and exits non-zero. Nothing
+                    # is left to accelerate, so BYPASS makes each one
+                    # exec the real tool.
+                    export NIXGG_BYPASS=1
+                    ${ggShimsOnPath knownStorePathsJSON}
                     export DESTDIR="$NIX_BUILD_TOP/.gg-destdir"
                     # `export DESTDIR` alone is not enough: some packages'
                     # own Configure/Makefile (openssl's
@@ -439,7 +538,19 @@ stdenv0.override (
                     # own `make install_sw` wrote straight to its literal
                     # `/nonexistent` prefix, never under $DESTDIR, until
                     # this was added.
-                    installFlags="''${installFlags-} DESTDIR=$DESTDIR"
+                    # installFlagsArray, not installFlags: under
+                    # __structuredAttrs `installFlags` is a bash ARRAY, and
+                    # assigning a scalar to an array name writes element 0
+                    # — which silently welds this onto the package's first
+                    # real flag. nixpkgs' kernel sets INSTALL_PATH=$out
+                    # there, so `make install` received one token
+                    # "INSTALL_PATH=… DESTDIR=…" and died on `cp: target
+                    # 'DESTDIR=…': No such file or directory` — after a
+                    # 2h54m build that had otherwise fully succeeded.
+                    # setup.sh concatenates installFlagsArray in both
+                    # modes (concatTo, installPhase), and it is always a
+                    # plain array, so appending there is mode-independent.
+                    installFlagsArray+=( "DESTDIR=$DESTDIR" )
                     runHook postGgRestore
                   '';
                   installFlags = (orig.installFlags or "");

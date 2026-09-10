@@ -104,6 +104,13 @@
   #     { name = "vendor"; patterns = [ "deps/**/*.c" ]; }
   #   ];
   batchGroups ? [ ],
+  # Stage each TU as a farm of symlinks into per-file store objects.
+  # Sandbox mode only, off by default — see splitStdenv.sharedStaging.
+  sharedStaging ? false,
+
+  # Subtrees whose build reads object bytes inline, or expects a compile
+  # to fail — see splitStdenv.passthroughPaths. Empty for most projects.
+  passthroughPaths ? [ ],
 }:
 
 let
@@ -271,6 +278,11 @@ let
     export NIX_CFLAGS_COMPILE NIX_LDFLAGS
     export NIXGG_KNOWN_STORE_PATHS=${lib.escapeShellArg knownStorePathsJSON}
     export NIXGG_BATCH_GROUPS=${lib.escapeShellArg batchGroupsJSON}
+    # Must match the sandbox-side attr below. mode.Passthrough reads this
+    # in BOTH modes, so a native replay that lacks it models TUs the
+    # sandbox passed through — different drv sets, and drv-equivalence
+    # fails for any package that sets passthroughPaths.
+    export NIXGG_PASSTHROUGH_PATHS=${lib.escapeShellArg (builtins.toJSON passthroughPaths)}
   '';
 
   drv = stdenv.mkDerivation (
@@ -334,6 +346,11 @@ let
       # llvm). NIXGG_RPC=0 is the escape hatch back to the CLI
       # fallback if something unforeseen turns up.
       NIXGG_RPC            = "1";
+    }
+    // lib.optionalAttrs sharedStaging { NIXGG_SHARED_STAGE = "1"; }
+    // { NIXGG_PASSTHROUGH_PATHS = builtins.toJSON passthroughPaths; }
+    // {
+
       # See scrubWrapperEnv above for what this does and why. Two points
       # specific to the sandbox side: the shims/ dir goes ahead of the
       # toolchain stdenv already put on PATH so cc/c++/ar dispatch through

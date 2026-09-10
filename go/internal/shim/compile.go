@@ -9,8 +9,10 @@
 package shim
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -154,6 +156,39 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 
 	logf("compile %s -> %s", source, output)
 
+	// A source that is not a regular file cannot be modelled: there are
+	// no bytes to content-address. In practice that means /dev/null,
+	// which is how build systems ask the compiler a question rather
+	// than requesting an artifact — the answer has to be the real
+	// compiler's verdict, so get out of the way.
+	if !isRegularFile(source) {
+		logf("  passthrough: %s is not a regular file (compiler probe)", source)
+		return Passthrough(realTool, args)
+	}
+
+	// `.incbin` embeds a file's bytes at ASSEMBLY time, naming it in a
+	// string the preprocessor never looks at, so `gcc -M` cannot report
+	// it. The file is absent from the staged tree and the TU dies in the
+	// assembler. The named file is usually generated, so it is not a
+	// static dependency the scanner could learn either.
+	if usesIncbin(source) {
+		logf("  passthrough: %s uses .incbin (assembler-time file dependency)", source)
+		return Passthrough(realTool, args)
+	}
+
+	// Subtrees the caller declared as passthrough: their build reads
+	// object BYTES inline, or expects a compile to FAIL and reads the
+	// diagnostic, so a derivation cannot stand in for either. Checked
+	// before the scan so we don't pay for header discovery we are about
+	// to throw away.
+	// Keyed on the OUTPUT as well as the source: a declared subtree is
+	// about where the object LANDS, and a build may compile a source
+	// from elsewhere into it.
+	if mode.For(source) == mode.Passthrough || mode.For(output) == mode.Passthrough {
+		logf("  passthrough: caller declared this subtree")
+		return Passthrough(realTool, args)
+	}
+
 	// Resolve the real cc for scan-headers to match the caller's tool
 	// role — same reason as the passthrough case above.
 	scannerCC := realTool
@@ -235,7 +270,14 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		tuKey = rel
 	}
 	tuID := stage.TUID(tuKey)
-	if _, err := stage.Sources(l, tuID, entries); err != nil {
+	if sharedStagingEnabled() {
+		_, err = stage.SourcesShared(l, tuID, entries, func(abs string) (string, error) {
+			return storeShared(cfg, abs)
+		})
+	} else {
+		_, err = stage.Sources(l, tuID, entries)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -488,11 +530,21 @@ func parseCompileArgs(args []string) (source, output, depfile string, flags []st
 			// `-Wp,-MMD,path/to/foo.d` or `-Wp,-MMD,path,-MP` — Kbuild's
 			// own c_flags (scripts/Makefile.lib) always uses this
 			// instead of separate -MD/-MF tokens.
+			//
+			// The depfile path is captured so the shim can still write
+			// the .d the caller expects, then the dependency parts are
+			// stripped: they name a path relative to make's cwd, and the
+			// derivation's cwd is a read-only store path. Anything ELSE
+			// in the same -Wp, group is a real preprocessor flag and has
+			// to survive, which is why this strips rather than drops the
+			// whole argument. scan.StripWpDep is shared with the scanner
+			// so both agree on what counts as dependency plumbing.
 			if p := depfileFromWp(a); p != "" {
 				depfile = p
 			}
-			// Not appended to flags: these target the caller's own
-			// cpp/depfile bookkeeping, meaningless inside the sandbox.
+			if kept, ok := scan.StripWpDep(a); ok {
+				flags = append(flags, kept)
+			}
 		case a == "-x" || a == "-Xlinker" || a == "-Xassembler":
 			// Two-arg forms with values that aren't sources; keep both.
 			if i+1 >= len(args) {
@@ -846,4 +898,42 @@ func writeSynthesizedDepfile(depfile, output, source string, headers []scan.Head
 	}
 	b.WriteByte('\n')
 	return os.WriteFile(depfile, []byte(b.String()), 0o644)
+}
+
+// isRegularFile reports whether path is a regular file. A symlink to a
+// regular file counts (Stat follows); a character device, fifo or
+// directory does not. Errors count as "not regular" so a source that
+// cannot be stat'd goes to the real compiler, which will produce the
+// caller's expected diagnostic rather than ours.
+func isRegularFile(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
+}
+
+// maxIncbinScan caps how much of a source we read looking for .incbin.
+// Real sources are far smaller; the cap only guards against a generated
+// multi-megabyte file making every compile pay to read it.
+const maxIncbinScan = 4 << 20
+
+// usesIncbin reports whether a source contains an .incbin directive.
+//
+// Deliberately a substring search rather than a parse. The directive
+// appears inside a C string literal in inline asm, inside .S files, and
+// behind #ifdefs, so anything short of running the preprocessor and
+// assembler would still be an approximation — and the cost of guessing
+// wrong is asymmetric. A false positive costs one un-accelerated
+// compile; a false negative is a build failure in the assembler, far
+// from the cause.
+func usesIncbin(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, maxIncbinScan)
+	n, err := io.ReadFull(f, buf)
+	if n == 0 && err != nil {
+		return false
+	}
+	return bytes.Contains(buf[:n], []byte(".incbin"))
 }

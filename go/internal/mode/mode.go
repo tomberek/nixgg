@@ -26,11 +26,26 @@ type Mode int
 const (
 	Placeholder Mode = iota
 	Realise
+	// Passthrough: run the real compiler in the build tree and model
+	// nothing.
+	//
+	// A different reason from Realise. Realise is for builds that need a
+	// runnable artifact immediately; Passthrough is for compiles the
+	// build EXPECTS TO FAIL, where the failure is the result and the
+	// artifact is the compiler's stderr.
+	//
+	// Accelerating those is not merely wasteful, it is wrong: a
+	// derivation that fails, fails the build, whereas the caller was
+	// going to inspect the error and carry on. Realise is no help
+	// either — `nix build` on a deliberately-failing compile fails just
+	// as hard.
+	Passthrough
 )
 
 // For returns the mode for a given source or output path.
 //
-// Placeholder unless the path matches a known conftest/probe pattern:
+// Placeholder unless the path matches:
+//   - a caller-declared passthrough subtree (passthrough.go)
 //   - autoconf conftests (basename starts with "conftest")
 //   - cmake compiler-detection files (test?Compiler…, CheckXXX…)
 //   - cmake TryCompile scratch (path contains CMakeFiles/CMake{Scratch,Tmp})
@@ -103,6 +118,9 @@ const (
 func For(path string) Mode {
 	base := filepath.Base(path)
 	switch {
+	// Project-specific subtrees the caller declared — see passthrough.go.
+	case matchesPassthrough(path):
+		return Passthrough
 	case strings.HasPrefix(base, "conftest"):
 		return Realise
 	case matchCMakeProbe(base):

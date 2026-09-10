@@ -48,6 +48,11 @@ func Archive(args []string, cfg *toolchain.Config, l paths.Layout) error {
 		return RealiseThunkArgsAndPassthrough(cfg, l, realARFor(cfg), args, sandbox.Enabled())
 	}
 
+	if carvedOut(archive) {
+		logf("ar passthrough: %s is in a carved-out subtree", archive)
+		return Passthrough(realARFor(cfg), args)
+	}
+
 	logf("archive %s <- %s", archive, joinBase(inputs))
 
 	if handled, err := tryBatchArchive(cfg, l, archive, modifiers, inputs); handled {
@@ -175,6 +180,18 @@ func parseARArgs(args []string) (modifiers, archive string, inputs []string, ok 
 	// `ar rN 3 archive.a obj` that we don't model.
 	if !isARModifiers(modifiers) {
 		return
+	}
+	// `a`, `b`, `i` and `N` each take a positional argument that follows
+	// the modifier string (`ar rN <count> <archive> <member>...`), which
+	// shifts the archive name one slot right. Their semantics —
+	// insert-relative-to-member, use-instance-N — are member mutations
+	// this shim deliberately does not model.
+	//
+	// Bail explicitly: these were previously rejected only by accident,
+	// via the members-must-end-in-.o check that allowing `.a` members
+	// removes.
+	if strings.ContainsAny(modifiers, "abiN") {
+		return "", "", nil, false
 	}
 	archive = args[1]
 	for _, in := range args[2:] {

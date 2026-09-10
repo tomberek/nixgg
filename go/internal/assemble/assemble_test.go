@@ -185,3 +185,101 @@ func TestStageForScanIsSelfExcluding(t *testing.T) {
 		t.Errorf("a.txt should be staged: %v", err)
 	}
 }
+
+// .nixgg is nixgg's own scratch dir. Capturing it into the assembled
+// tree is expensive at scale: under shared staging it holds one symlink
+// farm per translation unit, and `nix store add --scan` records a
+// reference to every file object they point at.
+//
+// Neither Walk nor StageForScan may look inside it.
+func TestNixggScratchDirIsExcluded(t *testing.T) {
+	root := t.TempDir()
+	// A staged farm at the depth it actually occurs: nixgg puts its
+	// scratch dir at the project root, which is usually several levels
+	// down — NOT the top level. A version of this test using the top
+	// level passes against code that only filters the outer ReadDir.
+	farm := filepath.Join(root, "src-1.0", "build", ".nixgg", "srcs", "tu0")
+	if err := os.MkdirAll(farm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/nix/store/aaa-hdr.h", filepath.Join(farm, "hdr.h")); err != nil {
+		t.Fatal(err)
+	}
+	// A thunk, and a stub that must NOT be mistaken for build output.
+	if err := os.WriteFile(filepath.Join(root, "src-1.0", "build", ".nixgg", "scan-cache"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Real output alongside it.
+	if err := os.WriteFile(filepath.Join(root, "src-1.0", "build", "real.txt"), []byte("out"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, err := StageForScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(staged, "src-1.0", "build", ".nixgg")); !os.IsNotExist(err) {
+		t.Error(".nixgg was copied into the staged tree; its closure would pull in " +
+			"every staged source object")
+	}
+	if _, err := os.Lstat(filepath.Join(staged, "src-1.0", "build", "real.txt")); err != nil {
+		t.Errorf("real build output was not staged: %v", err)
+	}
+}
+
+// A drvref stub's content is a /nix/store/….drv path, and
+// `nix store add --scan` records every store path it finds. Copying
+// stubs verbatim therefore makes the captured tree reference every
+// producing derivation — and a derivation's closure contains its own
+// inputs, so for a TU that is its staged source farm and every header in
+// it.
+//
+// At scale that is tens of thousands of stubs pulling in the whole
+// staging closure, which Nix bind-mounts into every derivation that
+// consumes the tree — enough to exceed the kernel mount limit and fail
+// as "No space left on device" on a disk that is nowhere near full.
+//
+// Walk runs before StageForScan and already holds every drv path, and
+// the assembly overlays the real artifact over each stub, so the staged
+// bytes are dead. Blank them.
+func TestStageForScanBlanksDrvrefStubs(t *testing.T) {
+	root := t.TempDir()
+	drvPath := "/nix/store/00000000000000000000000000000000-tu-x.o.drv"
+	stub := filepath.Join(root, "x.o")
+	if err := os.WriteFile(stub, []byte(drvref.Body(drvPath)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(root, "real.txt")
+	if err := os.WriteFile(real, []byte("genuine output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Walk must still see the stub: it runs first and is what the
+	// assembly is built from.
+	stubs, err := Walk(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stubs) != 1 || stubs[0].DrvPath != drvPath {
+		t.Fatalf("Walk lost the stub: %+v", stubs)
+	}
+
+	staged, err := StageForScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(staged, "x.o"))
+	if err != nil {
+		t.Fatalf("staged stub missing entirely; the overlay needs the path to exist: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("staged stub still carries %d bytes (%q) — --scan will record "+
+			"a reference to the drv and drag in its whole input closure",
+			len(got), string(got))
+	}
+	// Real output must be untouched.
+	if b, err := os.ReadFile(filepath.Join(staged, "real.txt")); err != nil || string(b) != "genuine output" {
+		t.Errorf("real build output was altered: %q %v", string(b), err)
+	}
+}

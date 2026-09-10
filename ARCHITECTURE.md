@@ -174,7 +174,9 @@ nixgg/
 │   ├── go.mod                  no external deps; stdlib only
 │   └── internal/               (listed below)
 ├── bin/nixgg                   built static ELF (git-ignored)
-├── shims/                      symlinks: cc, gcc, c++, g++, ar, ranlib, ld → ../bin/nixgg
+├── shims/                      symlinks: cc, gcc, c++, g++, ar, ranlib,
+│                               ld, ld.bfd, ld.gold, ld.lld, objtool,
+│                               objcopy, rustc → ../bin/nixgg
 ├── nix/
 │   ├── builder.nix             per-TU CA derivation (native mode)
 │   ├── linker.nix              link CA derivation (native mode)

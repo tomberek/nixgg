@@ -359,6 +359,9 @@ type JSONDrvInput struct {
 	Kind string
 	Ref  string
 	Name string
+	// Crate: rustc externs only. The name the consuming crate binds
+	// this dependency to.
+	Crate string
 }
 
 // ArchiveJSONParams is the sandbox-mode analog of ArchiveParams.
@@ -395,6 +398,119 @@ func ArchiveJSON(p ArchiveJSONParams) JSONDrv {
 		ExtraInputs: inputsFromJSON(p.ExtraInputs),
 		StoreDeps:   p.StoreDeps,
 		WrapperEnv:  p.Env,
+	}
+	return d.toJSON(p.ExtraSrcs, nil)
+}
+
+// TransformJSONParams describes an in-place rewrite of one object.
+type TransformJSONParams struct {
+	Name        string
+	OutName     string
+	System      string
+	Bash        string
+	Coreutils   string
+	ToolBin     string // absolute /nix/store/… path of the rewriting binary
+	InPlace     bool   // true: tool rewrites its single operand (objtool)
+	Flags       []string
+	Input       JSONDrvInput
+	StoreDeps   []string
+	Placeholder string
+	ExtraSrcs   []string
+	Env         map[string]string
+}
+
+// TransformJSON produces a JSONDrv for a KindTransform step: consume
+// one object, emit the same object rewritten. Sandbox mode only.
+func TransformJSON(p TransformJSONParams) JSONDrv {
+	d := &Derivation{
+		Kind:        KindTransform,
+		ToolInPlace: p.InPlace,
+		Name:        p.Name,
+		System:      p.System,
+		Bash:        p.Bash,
+		Coreutils:   p.Coreutils,
+		OutName:     p.OutName,
+		ToolBin:     p.ToolBin,
+		Flags:       p.Flags,
+		Inputs:      inputsFromJSON([]JSONDrvInput{p.Input}),
+		StoreDeps:   p.StoreDeps,
+		WrapperEnv:  p.Env,
+	}
+	return d.toJSON(p.ExtraSrcs, nil)
+}
+
+// PartialLinkJSONParams describes an `ld -r` step.
+type PartialLinkJSONParams struct {
+	Name        string
+	OutName     string
+	System      string
+	Bash        string
+	Coreutils   string
+	ToolBin     string // absolute /nix/store/… path of `ld`
+	Flags       []string
+	Inputs      []JSONDrvInput
+	StoreDeps   []string
+	Placeholder string
+	ExtraSrcs   []string
+	Env         map[string]string
+}
+
+// PartialLinkJSON produces a JSONDrv for `ld -r`: several objects in,
+// one object out. Sandbox mode only.
+func PartialLinkJSON(p PartialLinkJSONParams) JSONDrv {
+	d := &Derivation{
+		Kind:       KindPartialLink,
+		Name:       p.Name,
+		System:     p.System,
+		Bash:       p.Bash,
+		Coreutils:  p.Coreutils,
+		OutName:    p.OutName,
+		ToolBin:    p.ToolBin,
+		Flags:      p.Flags,
+		Inputs:     inputsFromJSON(p.Inputs),
+		StoreDeps:  p.StoreDeps,
+		WrapperEnv: p.Env,
+	}
+	return d.toJSON(p.ExtraSrcs, nil)
+}
+
+// RustcJSONParams describes one rustc crate compile.
+type RustcJSONParams struct {
+	Name      string
+	System    string
+	Bash      string
+	Coreutils string
+	RustcBin  string // absolute /nix/store/…/bin/rustc
+	SrcStore  string // staged crate tree
+	// Source is relative to SrcStore, or an absolute /nix/store path
+	// when the crate root is itself already store content — Rust's own
+	// `core` is compiled straight out of the rustc source tree.
+	Source    string
+	Flags     []string
+	Externs   []JSONDrvInput // each carries the crate name it binds to
+	Emits     []RustEmit
+	StoreDeps []string
+	ExtraSrcs []string
+	Env       map[string]string
+}
+
+// RustcJSON produces a JSONDrv for a rustc crate compile. Sandbox mode
+// only: nothing that builds Rust reaches nixgg without it.
+func RustcJSON(p RustcJSONParams) JSONDrv {
+	d := &Derivation{
+		Kind:       KindRustc,
+		Name:       p.Name,
+		System:     p.System,
+		Bash:       p.Bash,
+		Coreutils:  p.Coreutils,
+		RustcBin:   p.RustcBin,
+		SrcStore:   p.SrcStore,
+		Source:     p.Source,
+		Flags:      p.Flags,
+		Inputs:     inputsFromJSON(p.Externs),
+		Emits:      p.Emits,
+		StoreDeps:  p.StoreDeps,
+		WrapperEnv: p.Env,
 	}
 	return d.toJSON(p.ExtraSrcs, nil)
 }
@@ -444,7 +560,7 @@ func inputsFromJSON(xs []JSONDrvInput) []derivInput {
 		if kind == "store" && !strings.HasPrefix(ref, "/nix/store/") {
 			ref = "/nix/store/" + ref
 		}
-		out[i] = derivInput{InputKind: kind, Ref: ref, Name: in.Name}
+		out[i] = derivInput{InputKind: kind, Ref: ref, Name: in.Name, Crate: in.Crate}
 	}
 	return out
 }

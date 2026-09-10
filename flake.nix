@@ -279,7 +279,11 @@
               # triples and versions is unbounded. These cover what the
               # examples and common autotools/cmake probes actually
               # invoke; add more if a real project needs them.
-              for t in ar c++ cc g++ gcc ranlib clang clang++ ld ld.bfd ld.gold ld.lld; do
+              # objtool is not a compiler: it is a per-object
+              # rewriter, reached only when a caller points the build's
+              # `objtool=` make variable here (nothing resolves it via
+              # PATH). Linked anyway so that pointing at it works.
+              for t in ar c++ cc g++ gcc ranlib clang clang++ ld ld.bfd ld.gold ld.lld objtool objcopy rustc; do
                 ln -s ../bin/nixgg $out/shims/$t
               done
               for t in gcc g++ cc c++ ar ranlib ld; do
@@ -878,9 +882,31 @@
               dir = ./examples/linux-kernel;
               args = { inherit (pkgs) stdenv flex bison elfutils pkg-config bc; src = linux-src; };
             };
+            # Out-of-tree kernel module — the cheap kbuild probe that
+            # stands in for the NixOS kernel. See its docstring for
+            # what it does and does not cover. Not in smoke.sh's QUICK
+            # set until it passes.
+            kmod = {
+              dir = ./examples/kmod;
+              args = {
+                inherit (pkgs) kmod stdenv;
+                kernel = pkgs.linuxPackages.kernel;
+                src = ./examples/kmod/mod;
+              };
+            };
             # Two sources, no single `src`: phase 1 builds the codegen
             # tool, phase 2 execs it mid-build. Smoke test for the
             # phase-chaining pattern examples/llvm relies on.
+            # Two Rust crates built by make and bare rustc — the shape
+            # kbuild uses, and the only one the rustc shim models. See
+            # its docstring for what it covers that nothing else does.
+            rustc = {
+              dir = ./examples/rustc;
+              args = {
+                inherit (pkgs) rustc;
+                src = ./examples/rustc;
+              };
+            };
             two-phase = {
               dir = ./examples/two-phase;
               args = {
@@ -997,10 +1023,31 @@
           # shape directly.
           exampleResults = builtins.mapAttrs (_: e: e.package) examples;
           exampleShells = pkgs.lib.mapAttrs' (n: e: pkgs.lib.nameValuePair "${n}-shell" e.shell) examples;
+
+          # `.#<name>-shared` is the same example definition with
+          # sharedStaging flipped on — staged source trees become symlink
+          # farms into per-file store objects instead of per-TU copies.
+          #
+          # Generated rather than hand-written so these cannot drift from
+          # the definitions above, and wrapped at the mkNixggBuild seam so
+          # each example keeps its own args untouched.
+          #
+          # These exist for tests/shared-closure.sh, which has to build for
+          # real: the property it checks (that `nix store add --scan`
+          # records symlink targets as references) is unobservable outside
+          # a recursive-nix builder. They are ordinary derivations, so
+          # they are also the way to try shared staging on any example.
+          sharedExamples = pkgs.lib.mapAttrs'
+            (n: def: pkgs.lib.nameValuePair "${n}-shared"
+              (import def.dir ({
+                mkNixggBuild = args: mkNixggBuild (args // { sharedStaging = true; });
+              } // def.args)).package)
+            exampleDefs;
         in
         toolchain
         // exampleResults   # .#hello .#lua .#fmt .#mosh .#redis .#ffmpeg .#gcc .#two-phase .#llvm
         // exampleShells    # .#<name>-shell for each of the above
+        // sharedExamples   # .#<name>-shared: same, with sharedStaging on
         // dynDrvExamples   # .#hello-dyndrv .#mosh-dyndrv .#zstd-dyndrv
         // configureCacheExamples   # .#hello-cache .#zstd-cache .#hello-cache-filtered .#fmt-cache-filtered
         // dynDrvConfigureCacheExamples   # .#hello-dyndrv-configure-cached .#mosh-dyndrv-configure-cached .#zstd-dyndrv-configure-cached .#gdbm-dyndrv-configure-cached

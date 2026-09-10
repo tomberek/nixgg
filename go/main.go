@@ -42,21 +42,38 @@ func run() error {
 		return err
 	}
 
-	// Expand @rspfiles once at the top so every downstream parser sees
-	// the flattened form.
-	args := dispatch.ExpandRspfiles(os.Args[1:])
+	// Expand @argfiles once at the top so every downstream parser sees
+	// the flattened form. rustc's file format differs from the compiler
+	// drivers' — see ExpandRustArgfiles.
+	var args []string
+	if tool == dispatch.ToolRustc {
+		args = dispatch.ExpandRustArgfiles(os.Args[1:])
+	} else {
+		args = dispatch.ExpandRspfiles(os.Args[1:])
+	}
 
 	switch tool {
 	case dispatch.ToolAR:
 		return shim.Archive(args, cfg, l)
 	case dispatch.ToolLD:
-		// Raw `ld` (Kbuild's cmd_ld: `$(LD) $(ld_flags) $(real-prereqs)
-		// -o $@`) is always link-shaped — there's no compile mode to
-		// dispatch on the way cc/g++ have. Link's own parser already
-		// handles ld's bare (non `-Wl,`-wrapped) flag spellings, since
-		// it was written flag-family-agnostic from the start (bare -T,
-		// bare --start-group/--end-group).
-		return shim.Link(tool, args, cfg, l)
+		// `ld -r` (partial link: several objects in, one object out) has
+		// its own model — see shim.LD. A kernel emits ~2,000 of them,
+		// and they are not link-shaped: the output is an object that
+		// later archives and links consume.
+		//
+		// Everything else IS link-shaped (Kbuild's cmd_ld: `$(LD)
+		// $(ld_flags) $(real-prereqs) -o $@`), and shim.LD hands those
+		// to Link, whose parser already handles ld's bare (non
+		// `-Wl,`-wrapped) flag spellings — it was written
+		// flag-family-agnostic from the start (bare -T, bare
+		// --start-group/--end-group).
+		return shim.LD(args, cfg, l)
+	case dispatch.ToolObjtool:
+		return shim.Objtool(args, cfg, l)
+	case dispatch.ToolObjcopy:
+		return shim.Objcopy(args, cfg, l)
+	case dispatch.ToolRustc:
+		return shim.Rustc(args, cfg, l)
 	case dispatch.ToolRanlib:
 		// ranlib on our thunk/store outputs would need to open+modify a
 		// file we don't own. Real ranlib on a real .a would be

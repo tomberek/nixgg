@@ -67,38 +67,52 @@ type Result struct {
 //   - source: caller's source file (relative to cwd is fine)
 //   - flags: everything else on argv (no -c/-o).
 //
-// Uses the cache under l.Scans if all deps' mtimes match.
+// Uses the cache under l.Scans if all deps mtimes match.
 func Run(l paths.Layout, cc, source string, flags []string) (*Result, error) {
 	if err := os.MkdirAll(l.Scans, 0o755); err != nil {
 		return nil, err
 	}
 	key := cacheKey(cc, source, flags)
-	depsPath := filepath.Join(l.Scans, key+".deps")
-	outPath := filepath.Join(l.Scans, key+".out")
-
-	if fresh, err := depsStillFresh(depsPath); err == nil && fresh {
-		if body, err := os.ReadFile(outPath); err == nil {
-			var r Result
-			if err := decodeResult(body, &r); err == nil {
-				return &r, nil
-			}
-		}
+	if r, ok := readCache(l, key); ok {
+		return r, nil
 	}
-
-	// Cache miss — do the real work.
 	r, deps, err := runScanner(cc, source, flags)
 	if err != nil {
 		return nil, err
 	}
+	writeCache(l, key, r, deps)
+	return r, nil
+}
+
+// readCache returns the memoised Result for key when every file it was
+// derived from still has the mtime the scan saw.
+func readCache(l paths.Layout, key string) (*Result, bool) {
+	if fresh, err := depsStillFresh(filepath.Join(l.Scans, key+".deps")); err != nil || !fresh {
+		return nil, false
+	}
+	body, err := os.ReadFile(filepath.Join(l.Scans, key+".out"))
+	if err != nil {
+		return nil, false
+	}
+	var r Result
+	if err := decodeResult(body, &r); err != nil {
+		return nil, false
+	}
+	return &r, true
+}
+
+// writeCache is best-effort: a scan that cannot be memoised still
+// returns its result, it just costs the same again next time. The deps
+// file is written only after the result, so a half-written cache is
+// never treated as fresh.
+func writeCache(l paths.Layout, key string, r *Result, deps []depEntry) {
 	body, err := encodeResult(r)
 	if err != nil {
-		return nil, err
+		return
 	}
-	// Write cache best-effort. If it fails we still return the result.
-	if err := writeAtomic(outPath, body); err == nil {
-		_ = writeAtomic(depsPath, encodeDeps(deps))
+	if err := writeAtomic(filepath.Join(l.Scans, key+".out"), body); err == nil {
+		_ = writeAtomic(filepath.Join(l.Scans, key+".deps"), encodeDeps(deps))
 	}
-	return r, nil
 }
 
 // depEntry is one line in the .deps file: <abs>\t<mtime-nsec>.
@@ -375,12 +389,13 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 // before -isystem ones. Every TU reaching SmallVector-style code failed
 // with "'struct tm' has no member".
 //
-// "-I." is always first so the staged root is on the include path.
-// Results are deduped by rel path, so a caller's `-I.` (== cwd == root)
-// or a repeated dir does not emit twice.
+// -I order is semantics, not style: the first directory containing
+// the named file wins, so reordering changes which header a TU
+// compiles against. Emit the caller's dirs in their original order,
+// appending a synthetic -I. only if they never named the root.
 func stagedIFlags(projectRoot string, callerDirs []string) []string {
-	iflags := []string{"-I."}
-	seenRel := map[string]bool{".": true}
+	var iflags []string
+	seenRel := map[string]bool{}
 	for _, p := range callerDirs {
 		rel := "."
 		if p != projectRoot {
@@ -394,9 +409,13 @@ func stagedIFlags(projectRoot string, callerDirs []string) []string {
 			continue
 		}
 		seenRel[rel] = true
-		if rel != "." {
-			iflags = append(iflags, "-I"+rel)
-		}
+		iflags = append(iflags, "-I"+rel)
+	}
+	// The staged root has to be reachable even when the caller never
+	// named it — a bare `cc -c foo.c` relies on it. Last, so it cannot
+	// shadow a directory the caller did name.
+	if !seenRel["."] {
+		iflags = append(iflags, "-I.")
 	}
 	return iflags
 }
@@ -461,20 +480,64 @@ func extractForceIncludes(flags []string) []string {
 	return out
 }
 
-func stripDepFlags(flags []string) []string {
-	var out []string
-	oneArg := map[string]bool{"-M": true, "-MM": true, "-MG": true, "-MP": true, "-MD": true, "-MMD": true}
-	twoArg := map[string]bool{"-MF": true, "-MT": true, "-MQ": true}
-	for i := 0; i < len(flags); i++ {
-		f := flags[i]
-		if oneArg[f] {
+var depOneArg = map[string]bool{"-M": true, "-MM": true, "-MG": true, "-MP": true, "-MD": true, "-MMD": true}
+var depTwoArg = map[string]bool{"-MF": true, "-MT": true, "-MQ": true}
+
+// StripWpDep removes dependency-generation directives from a `-Wp,…`
+// preprocessor-passthrough flag, returning the remainder and whether
+// anything survived.
+//
+// A `-Wp,-MMD,<file>` redirects dependency output to that file, which
+// silences the scanner's own `-M -MG -MF -`. It is equally invalid
+// inside the derivation, for the reason parseCompileArgs documents for
+// the bare -MD/-MMD forms.
+//
+// Shared with the compile shim so the two cannot disagree about which
+// flags are dependency plumbing.
+func StripWpDep(f string) (string, bool) {
+	const pfx = "-Wp,"
+	if !strings.HasPrefix(f, pfx) {
+		return f, true
+	}
+	// Inside -Wp, the filename is a comma element rather than a separate
+	// argv token, so -MD/-MMD take a value here even though their bare
+	// argv spellings do not. Check the takes-a-value set first.
+	wpTwoArg := map[string]bool{"-MMD": true, "-MD": true, "-MF": true, "-MT": true, "-MQ": true}
+	wpOneArg := map[string]bool{"-M": true, "-MM": true, "-MG": true, "-MP": true}
+
+	parts := strings.Split(f[len(pfx):], ",")
+	var kept []string
+	for i := 0; i < len(parts); i++ {
+		p := parts[i]
+		if wpTwoArg[p] {
+			i++ // the filename rides along as the next comma element
 			continue
 		}
-		if twoArg[f] {
+		if wpOneArg[p] {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if len(kept) == 0 {
+		return "", false
+	}
+	return pfx + strings.Join(kept, ","), true
+}
+
+func stripDepFlags(flags []string) []string {
+	var out []string
+	for i := 0; i < len(flags); i++ {
+		f := flags[i]
+		if depOneArg[f] {
+			continue
+		}
+		if depTwoArg[f] {
 			i++ // skip the value too
 			continue
 		}
-		out = append(out, f)
+		if kept, ok := StripWpDep(f); ok {
+			out = append(out, kept)
+		}
 	}
 	return out
 }

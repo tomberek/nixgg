@@ -722,6 +722,11 @@ func TestOutSubdirAgreesWithInputSubdirFor(t *testing.T) {
 		// A shared library is a link output; bin/ is where the link drv
 		// puts whatever it was told to produce.
 		{KindLink, "libfoo.so"},
+		// A rustc crate's artifacts stay flat, like a compile's: both
+		// the object and the .rmeta its dependents resolve against are
+		// intermediates, not installables.
+		{KindRustc, "kernel.o"},
+		{KindRustc, "libkernel.rmeta"},
 	} {
 		producer := (&Derivation{Kind: tc.kind, OutName: tc.name}).outSubdir()
 		consumer := inputSubdirFor(tc.name)
@@ -806,5 +811,105 @@ func TestScriptCreatesTheDirectoryItWritesTo(t *testing.T) {
 				"fails with a missing-directory error, not a test failure:\n%s",
 				d.Kind, made, want, s)
 		}
+	}
+}
+
+// TestRustcScriptResolvesExternsAndEmits pins the two things the rustc
+// script does that no other Kind does.
+//
+// Externs: the caller's bare `--extern kernel` searches `-L` dirs, which
+// inside the sandbox do not exist. Every extern must come out as an
+// explicit `<crate>=<path>` binding pointing at the producing
+// derivation's output, or the crate compiles against nothing and the
+// dependency edge Nix enforces is a lie.
+//
+// Emits: one invocation, several artifacts. Dropping an emit yields a
+// derivation that builds cleanly and silently omits the .rmeta every
+// dependent crate resolves against — a failure that surfaces one crate
+// later, naming the wrong file.
+func TestRustcScriptResolvesExternsAndEmits(t *testing.T) {
+	d := &Derivation{
+		Kind:      KindRustc,
+		Name:      "rs-kernel.o",
+		System:    "x86_64-linux",
+		Bash:      "/nix/store/bbb-bash",
+		Coreutils: "/nix/store/ccc-coreutils",
+		RustcBin:  "/nix/store/rrr-rustc/bin/rustc",
+		SrcStore:  "/nix/store/sss-rs-kernel",
+		Source:    "rust/kernel/lib.rs",
+		Flags:     []string{"--crate-type", "rlib", "--edition=2021"},
+		Inputs: []derivInput{
+			{InputKind: "nix", Ref: "/nix/store/ddd-rs-ffi.o.drv", Name: "libffi.rmeta", Crate: "ffi"},
+			{InputKind: "store", Ref: "/nix/store/eee-prebuilt", Name: "libpin_init.rmeta", Crate: "pin_init"},
+		},
+		Emits: []RustEmit{
+			{Kind: "obj", Name: "kernel.o"},
+			{Kind: "metadata", Name: "libkernel.rmeta"},
+		},
+	}
+	script := d.script()
+
+	for _, want := range []string{
+		"--extern 'ffi=" + caOutputPlaceholder("/nix/store/ddd-rs-ffi.o.drv", "out") + "/libffi.rmeta'",
+		"--extern 'pin_init=/nix/store/eee-prebuilt/libpin_init.rmeta'",
+		`"--emit=obj=$out/kernel.o"`,
+		`"--emit=metadata=$out/libkernel.rmeta"`,
+		`--out-dir "$out"`,
+		`cd "$src"`,
+		`"$source"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("rustc script missing %q\n--- script ---\n%s", want, script)
+		}
+	}
+	// A bare extern reaching the sandbox means -L resolution was relied
+	// on, which cannot work there.
+	if strings.Contains(script, "--extern 'ffi'") || strings.Contains(script, "--extern ffi ") {
+		t.Errorf("rustc script emitted an unresolved extern\n%s", script)
+	}
+}
+
+// A crate's own dependencies travel in its metadata, not on the command
+// line: a kernel driver names two externs and rustc then loads ten
+// crates, resolving the rest from `-L`. Every input therefore needs a
+// search path, or the compile dies on a transitive dependency nothing
+// on the command line ever mentioned.
+func TestRustcScriptEmitsSearchPathPerInput(t *testing.T) {
+	d := &Derivation{
+		Kind: KindRustc, Name: "rs-drm_panic_qr.o", System: "x86_64-linux",
+		Bash: "/nix/store/bbb-bash", Coreutils: "/nix/store/ccc-coreutils",
+		RustcBin: "/nix/store/rrr-rustc/bin/rustc",
+		SrcStore: "/nix/store/sss-crate", Source: "drm_panic_qr.rs",
+		Inputs: []derivInput{
+			// Named on the command line.
+			{InputKind: "nix", Ref: "/nix/store/ddd-rs-kernel.o.drv", Name: "libkernel.rmeta", Crate: "kernel"},
+			// Never named: reached only through the search path.
+			{InputKind: "nix", Ref: "/nix/store/eee-rs-uapi.o.drv", Name: "libuapi.rmeta"},
+			{InputKind: "store", Ref: "/nix/store/fff-macros", Name: "libmacros.so"},
+		},
+		Emits: []RustEmit{{Kind: "obj", Name: "drm_panic_qr.o"}},
+	}
+	script := d.script()
+
+	for _, want := range []string{
+		"-L '" + caOutputPlaceholder("/nix/store/ddd-rs-kernel.o.drv", "out") + "'",
+		"-L '" + caOutputPlaceholder("/nix/store/eee-rs-uapi.o.drv", "out") + "'",
+		"--extern 'kernel=" + caOutputPlaceholder("/nix/store/ddd-rs-kernel.o.drv", "out") + "/libkernel.rmeta'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("rustc script missing %q\n--- script ---\n%s", want, script)
+		}
+	}
+	// An unnamed input must NOT get an --extern: rustc rejects a crate
+	// bound to a name the source never refers to.
+	if strings.Contains(script, "--extern '=") {
+		t.Errorf("search-path-only input got an empty --extern binding\n%s", script)
+	}
+	// A store input sits FLAT — the shape storeAddLooseFile produces for
+	// a proc-macro left as a real file. Only a sibling drv places its
+	// artifact under an FHS subdir, so applying it to both would send
+	// the search path into a bin/ that does not exist.
+	if !strings.Contains(script, "-L '/nix/store/fff-macros'") {
+		t.Errorf("search path for a store input must not gain an FHS subdir\n%s", script)
 	}
 }

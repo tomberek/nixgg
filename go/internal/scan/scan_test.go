@@ -228,8 +228,20 @@ func TestStagedIFlags(t *testing.T) {
 		{
 			// Only reachable if projectRoot computation already went
 			// wrong; a visibly-broken flag beats a silently wrong one.
+			// The synthetic "-I." lands LAST here because the caller
+			// never named the root.
 			"dir outside root becomes ..-relative",
-			"/p/sub", []string{"/p/other"}, []string{"-I.", "-I../other"},
+			"/p/sub", []string{"/p/other"}, []string{"-I../other", "-I."},
+		},
+		{
+			// Include ORDER is semantics. kbuild passes the root LAST
+			// (-I../include ... -I../. -I.) so that include/net/nfc/nfc.h
+			// wins over net/nfc/nfc.h. Hoisting "-I." to the front
+			// inverted that and broke net/nfc/af_nfc.c 19,000 compiles
+			// into a kernel build.
+			"caller order is preserved, root stays last",
+			"/p", []string{"/p/include", "/p/net/nfc", "/p"},
+			[]string{"-Iinclude", "-Inet/nfc", "-I."},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -382,5 +394,35 @@ func TestRunScannerFindsIncbinTargets(t *testing.T) {
 	}
 	if !found {
 		t.Errorf(".incbin target blob.bin missing from scan result headers: %+v", r.Headers)
+	}
+}
+
+// The kbuild case. `-Wp,-MMD,<file>` redirects dependency output to a
+// file, so a scanner running `gcc -M -MG -MF -` alongside it gets an
+// EMPTY stdout and concludes the TU has no headers. The symptom is a
+// staging tree containing only the .c, and a missing-header error from
+// inside the inner derivation — a long way from the cause.
+func TestStripWpDep(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+		keep bool
+	}{
+		{"kbuild depfile", "-Wp,-MMD,./.helper.o.d", "", false},
+		{"MD form", "-Wp,-MD,dep.d", "", false},
+		{"MF form", "-Wp,-MF,dep.d", "", false},
+		{"valueless forms", "-Wp,-MM,-MG", "", false},
+		{"non-dep -Wp survives", "-Wp,-DFOO=1", "-Wp,-DFOO=1", true},
+		{"mixed keeps the remainder", "-Wp,-MMD,dep.d,-DBAR", "-Wp,-DBAR", true},
+		{"non--Wp flag untouched", "-O2", "-O2", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := StripWpDep(tc.in)
+			if ok != tc.keep || (ok && got != tc.want) {
+				t.Errorf("StripWpDep(%q) = (%q, %v), want (%q, %v)",
+					tc.in, got, ok, tc.want, tc.keep)
+			}
+		})
 	}
 }

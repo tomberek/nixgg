@@ -30,6 +30,35 @@ const (
 	KindCompile Kind = iota // per-TU compile: builder.nix
 	KindLink                // linker step: linker.nix
 	KindArchive             // ar step: archiver.nix
+	// KindTransform: rewrite one existing object in place.
+	//
+	// Sandbox mode only — there is no native-mode helper for it, since
+	// the tools that need it (objtool, and `ld -r` for partial links)
+	// only appear in builds that already require the sandbox.
+	//
+	// Unlike the other three this produces no new artifact: it consumes
+	// one object and emits the same object, modified. Keeping it a
+	// separate derivation rather than folding it into the compile is
+	// deliberate — the compile stays cacheable independently of the
+	// transform's flags, so changing e.g. objtool's arguments rebuilds
+	// only this thin layer.
+	KindTransform
+	// KindPartialLink: `ld -r` — combine several objects into one
+	// object (not an executable, not an archive).
+	//
+	// Sandbox mode only, same as KindTransform. Reached when a build:
+	// `cmd_ld_multi_m` fuses a multi-object module's parts, and
+	// `cmd_ld_single` runs it over a single-object module on its own.
+	KindPartialLink
+	// KindRustc: one rustc crate compile.
+	//
+	// Sandbox mode only. Unlike KindCompile this is not one source in,
+	// one object out: a crate is a whole source TREE, and a single
+	// invocation can emit several artifacts from it (an object, the
+	// .rmeta its dependents resolve `--extern` against). They share a
+	// derivation because rustc produces them from one front-end run —
+	// splitting them would compile the crate twice.
+	KindRustc
 )
 
 // Derivation is the intermediate representation both serializers
@@ -180,6 +209,29 @@ type Derivation struct {
 	AbsFilePath    string
 	AbsFileContent string
 
+	// Transform-only: does the tool rewrite its operand in place
+	// (objtool: one operand) or read one file and write another
+	// (objcopy: `objcopy <flags> <in> <out>`)? In-place needs the input
+	// copied out of its read-only store path first; in/out does not.
+	ToolInPlace bool
+
+	// Transform-only: absolute /nix/store/… path of the binary that
+	// rewrites the object. Not taken from PATH like the compiler and
+	// `ar`, because this tool is built by the wrapped project itself
+	// (the build compiles it in its own prepare step) and reaches the
+	// store only because the shim adds it there — see
+	// shim.storeAddTool.
+	ToolBin string
+
+	// Rustc-only: the absolute /nix/store/… path of the real rustc.
+	// Not taken from PATH like the compiler, because a Rust build pins
+	// its toolchain and a crate compiled by a different rustc cannot be
+	// loaded by one that was not — rustc rejects mismatched metadata.
+	RustcBin string
+
+	// Rustc-only: the artifacts this invocation emits, in the caller's
+	// order. Each becomes an `--emit=<kind>=$out/<name>` argument.
+	Emits []RustEmit
 	// /nix/store/… roots referenced by Flags or WrapperEnv content;
 	// must be mounted in the sandbox. Serialized as _storeDeps env var
 	// (colon-joined) and threaded into inputs.srcs (JSON mode) /
@@ -189,6 +241,14 @@ type Derivation struct {
 	// Nix's gcc-wrapper env (NIX_CFLAGS_COMPILE, NIX_LDFLAGS, etc.).
 	// Preserved verbatim in the env dict.
 	WrapperEnv map[string]string
+}
+
+// RustEmit is one artifact a rustc invocation produces: the `--emit`
+// kind rustc knows it by ("obj", "metadata", "link"), and the filename
+// it lands under inside $out.
+type RustEmit struct {
+	Kind string
+	Name string
 }
 
 // derivInput is the internal per-input record used by Derivation's
@@ -209,6 +269,10 @@ type derivInput struct {
 	// producing derivation puts its artifact under one — see
 	// inputSubdirFor.
 	Name string
+	// Crate: KindRustc only. The name the consuming crate refers to
+	// this dependency by, which is not derivable from the filename —
+	// a crate's lib name and its `--crate-name` need not match.
+	Crate string
 }
 
 // inputSubdirFor returns the FHS subdirectory a sibling derivation's
@@ -260,6 +324,12 @@ func ArtifactSubdir(name string) string {
 		return ""
 	case strings.HasSuffix(base, ".a"):
 		return "lib"
+	case strings.HasSuffix(base, ".rmeta"), strings.HasSuffix(base, ".rlib"):
+		// Rust artifacts stay flat for the same reason .o does: a
+		// crate's metadata is an intermediate only the next rustc
+		// reads, not something buildEnv or `nix profile install` looks
+		// for.
+		return ""
 	}
 	return "bin"
 }
@@ -550,6 +620,122 @@ mkdir -p "%s"
 mkdir -p "%s"
 ar D%s "%s" %s
 `, pathPrefix, d.outDir(), d.ARFlags, d.outPath(), inputs())
+	case KindPartialLink:
+		// `-r` is supplied by the caller's own flag list, not added
+		// here: it is what identified this invocation as a partial link
+		// in the first place, so re-adding it would be a second source
+		// of truth.
+		return fmt.Sprintf(
+			`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "%s"
+"%s" %s -o "%s" %s
+`, coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), d.outPath(), inputs())
+	case KindRustc:
+		// One front-end run, several artifacts. `--out-dir` is set even
+		// though every emit is named explicitly: rustc drops temporaries
+		// in the CURRENT directory otherwise, and the current directory
+		// here is the read-only staged source tree.
+		//
+		// Every input contributes a `-L dependency=` search path, and
+		// those named by the caller also get an explicit
+		// `--extern <crate>=<path>`. Both are needed, for different
+		// reasons.
+		//
+		// The explicit extern is what turns a filesystem search into a
+		// derivation input: the caller's bare `--extern <crate>` searches
+		// `-L` dirs that are the build tree, which the sandbox does not
+		// have and which hold drvref stubs outside it.
+		//
+		// The search paths are for the crates the caller never named. A
+		// crate's own dependencies travel in its metadata and rustc loads
+		// them from `-L` — a kernel driver names two externs and rustc
+		// then loads ten crates. Without a search path for each, the
+		// compile dies on a transitive dependency the command line never
+		// mentioned.
+		var parts []string
+		seenDir := map[string]bool{}
+		for _, in := range d.Inputs {
+			ref := in.Ref
+			name := in.Name
+			dir := ref
+			if in.InputKind == "store" {
+				if !strings.HasPrefix(ref, "/nix/store/") {
+					ref = "/nix/store/" + ref
+					dir = ref
+				}
+			} else {
+				ref = caOutputPlaceholder(in.Ref, "out")
+				dir = ref
+				// Only a sibling DRV places its artifact under an FHS
+				// subdir; a store input sits flat, the shape
+				// storeAddLooseFile produces. Applying the subdir to both
+				// would send the search path into a bin/ that does not
+				// exist.
+				if sub := inputSubdirFor(in.Name); sub != "" {
+					name = sub + "/" + name
+					dir = ref + "/" + sub
+				}
+			}
+			// Plain `-L`, not `-L dependency=`. The narrower kind only joins
+			// the search for a crate's own dependencies, and rustc looks for
+			// `core` — which a kernel compiles itself and passes here like
+			// any other crate — in the unrestricted path. Measured against
+			// the kernel's real artifacts, one directory per crate: with
+			// `dependency=` the compile dies on
+			//
+			//	error[E0463]: can't find crate for `core`
+			//
+			// and with plain `-L` it produces the object.
+			if !seenDir[dir] {
+				seenDir[dir] = true
+				parts = append(parts, fmt.Sprintf("-L '%s'", dir))
+			}
+			if in.Crate != "" {
+				parts = append(parts, fmt.Sprintf("--extern '%s=%s/%s'", in.Crate, ref, name))
+			}
+		}
+		for _, e := range d.Emits {
+			// Double quotes, not single: $out has to expand. Single
+			// quotes sent rustc a literal "$out/…" and it died trying to
+			// create a temp dir under a path with a dollar sign in it.
+			// Safe because both fields are a rustc emit kind and a
+			// basename this shim chose, never caller text.
+			parts = append(parts, fmt.Sprintf(`"--emit=%s=$out/%s"`, e.Kind, e.Name))
+		}
+		return fmt.Sprintf(
+			`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "$out"
+cd "$src"
+"%s" %s %s --out-dir "$out" "$source"
+`, coreutils, d.RustcBin, shellQuoteFlags(d.Flags), strings.Join(parts, " "))
+	case KindTransform:
+		// PATH carries coreutils only — no compiler is involved, and the
+		// transform binary is invoked by absolute path.
+		if !d.ToolInPlace {
+			// `tool <flags> <in> <out>` — objcopy's shape. Nothing to
+			// copy: the tool reads the store path and writes $out.
+			return fmt.Sprintf(
+				`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "%s"
+"%s" %s %s "%s"
+`, coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags),
+				inputs(), d.outPath())
+		}
+		// In-place tools (objtool) rewrite their operand, so the input
+		// has to be copied out of its read-only store path first. chmod
+		// because store paths arrive without write permission.
+		return fmt.Sprintf(
+			`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "%s"
+cp %s "%s"
+chmod u+w "%s"
+"%s" %s "%s"
+`, coreutils, d.outDir(), inputs(), d.outPath(), d.outPath(),
+			d.ToolBin, shellQuoteFlags(d.Flags), d.outPath())
 	}
 	return ""
 }
@@ -792,12 +978,17 @@ func (d *Derivation) envDict() map[string]string {
 	// (that's what builder.nix's script consults — see the
 	// `cd "$src"` / `"$source"` / `"$outName"` in script()). Link
 	// derivations reuse the same "src" slot for InlineFilesStore, when
-	// set — see inlineFilesScript's own docstring.
+	// set — see inlineFilesScript's own docstring. A rustc crate uses
+	// the same staged-tree slot as a compile, minus outName: its
+	// artifacts are named by the --emit flags, not by one output.
 	switch {
 	case d.Kind == KindCompile:
 		env["src"] = d.SrcStore
 		env["source"] = d.Source
 		env["outName"] = d.OutName
+	case d.Kind == KindRustc:
+		env["src"] = d.SrcStore
+		env["source"] = d.Source
 	case d.Kind == KindLink && d.InlineFilesStore != "":
 		env["src"] = d.InlineFilesStore
 	}

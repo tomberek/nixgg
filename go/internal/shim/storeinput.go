@@ -10,6 +10,7 @@ import (
 	"github.com/tbereknyei/nixgg/internal/classify"
 	"github.com/tbereknyei/nixgg/internal/expr"
 	"github.com/tbereknyei/nixgg/internal/members"
+	"github.com/tbereknyei/nixgg/internal/mode"
 	"github.com/tbereknyei/nixgg/internal/paths"
 	"github.com/tbereknyei/nixgg/internal/sandbox"
 	"github.com/tbereknyei/nixgg/internal/toolchain"
@@ -159,13 +160,31 @@ func classifyInputs(
 	seenLink := map[string]bool{}
 	seenJSON := map[string]bool{}
 	archKeys := map[string]bool{}
-	for _, in := range inputs {
+
+	// A worklist rather than a range, because expanding a FOREIGN thin
+	// archive — one nixgg did not produce, so it has no members sidecar
+	// and arrives as classify.Regular (see thinar.go) — appends its
+	// members back onto the list, and those can themselves be thin
+	// archives. Archives nixgg DID produce take the sidecar path
+	// instead, via expandMembers below; the two are disjoint.
+	//
+	// `expanded` guards ONLY the members synthesised here, so a nested
+	// archive reached twice, or a cycle, cannot loop. It deliberately
+	// does not cover the caller's own inputs: link order is significant
+	// and repeats are meaningful there.
+	pending := append([]string(nil), inputs...)
+	expanded := make(map[string]bool)
+	for len(pending) > 0 {
+		in := pending[0]
+		pending = pending[1:]
+
 		if batchpending.Is(in) {
 			if err := ResolvePendingMember(cfg, l, in); err != nil {
 				logf("%s passthrough: resolving deferred batch member %s: %v", logPrefix, in, err)
 				return classifiedInputs{}, passthrough(), false
 			}
 		}
+
 		c := classify.Target(in, altPrefix, l)
 		switch c.Kind {
 		case classify.Store:
@@ -206,6 +225,58 @@ func classifyInputs(
 				Kind: "drv", Ref: c.Ref, Name: name,
 			})
 			expandMembers(l, expr.StoreBasename(c.Ref), &ci.ExtraLink, &ci.ExtraJSON, seenLink, seenJSON, archKeys)
+		case classify.Regular:
+			// A real file nixgg did not produce — a project may compile
+			// some objects with a tool the shims do not cover.
+			//
+			// Bailing is not a local decision: an unmodellable input makes
+			// THIS archive passthrough, hence a plain file, which makes its
+			// parent unmodellable in turn, all the way up. So store the
+			// file and depend on its content instead.
+			//
+			// Sandbox mode only. Native mode has no cascade to break, and a
+			// store round-trip there would change drv content for builds
+			// that work today.
+			if !sandbox.Enabled() {
+				logf("%s passthrough: can't model input %s (%s)", logPrefix, in, c.Reason())
+				return classifiedInputs{}, passthrough(), false
+			}
+			// A thin archive is a list of PATHS, not bytes, so storing
+			// the file alone loses everything it points at — see
+			// thinar.go. Expand it and depend on the members instead.
+			if members, isThin, parsed := thinArchiveMembers(in); isThin {
+				if !parsed {
+					// Thin, but the member table would not parse. Storing
+					// it is the one thing we must not do: it holds paths,
+					// not bytes, so its members would vanish silently and
+					// surface as undefined references at the final link.
+					logf("%s passthrough: unparseable thin archive %s", logPrefix, in)
+					return classifiedInputs{}, passthrough(), false
+				}
+				logf("  %s: expanding thin archive %s (%d members)", logPrefix, in, len(members))
+				// Only expanded members are deduped, and only against
+				// other expanded members: a nested archive can be
+				// reached twice (a diamond) or cycle. The caller's own
+				// input list must keep every occurrence — `-lfoo … -lfoo`
+				// is the standard circular-archive idiom and dropping the
+				// repeat loses symbol resolution.
+				for _, m := range members {
+					if expanded[m] {
+						continue
+					}
+					expanded[m] = true
+					pending = append(pending, m)
+				}
+				continue
+			}
+			sp, err := storeAddLooseFile(cfg, in)
+			if err != nil {
+				logf("%s passthrough: store-add %s failed: %v", logPrefix, in, err)
+				return classifiedInputs{}, passthrough(), false
+			}
+			appendJSONDedup(&ci.JSON, seenJSON, expr.JSONDrvInput{
+				Kind: "src", Ref: filepath.Base(sp), Name: filepath.Base(in),
+			})
 		default:
 			logf("%s passthrough: can't model input %s (%s)", logPrefix, in, c.Reason())
 			return classifiedInputs{}, passthrough(), false
@@ -409,4 +480,44 @@ func multiTargetName(path string) string {
 		return ""
 	}
 	return os.Getenv("name") + "-" + strings.TrimSuffix(key, ".drv")
+}
+
+// storeAddLooseFile puts a single build-tree file into the store as a
+// DIRECTORY containing it.
+//
+// `nix store add <file>` would give a store path that IS the file, but
+// both serializers render an input's argv token as Ref+"/"+Name and
+// expect Ref to be a directory — the shape every drv output already
+// has. Staging into a one-file directory keeps that invariant instead
+// of special-casing the emitters, which are the byte-identity-critical
+// part of the codebase.
+func storeAddLooseFile(cfg *toolchain.Config, path string) (string, error) {
+	base := filepath.Base(path)
+	tmp, err := os.MkdirTemp(os.Getenv("NIX_BUILD_TOP"), "gg-loose-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(tmp, base), src, 0o444); err != nil {
+		return "", err
+	}
+	return sandbox.StoreAddScan(cfg, base, tmp)
+}
+
+// carvedOut reports whether a subtree is excluded from modelling.
+//
+// A declared subtree means "nixgg models nothing here", so every shim
+// that produces an artifact has to honour it directly rather than
+// inherit it from its inputs. Inheriting only worked while unmodellable
+// inputs made the whole subtree bail together; once those are
+// store-added instead, a shim can model an artifact inside a subtree
+// whose siblings were passed through, and the two halves no longer
+// agree.
+func carvedOut(path string) bool {
+	return mode.For(path) == mode.Passthrough
 }
