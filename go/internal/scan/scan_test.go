@@ -374,9 +374,17 @@ func TestRunScannerFindsIncbinTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runScanner: %v", err)
 	}
+	// Abs, not Rel: a real system gcc's own implicit predef header
+	// (e.g. glibc's stdc-predef.h) can land outside projectRoot and
+	// widen it all the way to "/", which shifts Rel unpredictably —
+	// harmless for staging (Abs is what's actually copied) and never
+	// happens with nixgg's own hermetic gcc-wrapper (its implicit
+	// headers all live under /nix/store), but it did make this
+	// assertion flaky on CI's system gcc. Abs is what this test
+	// actually needs to prove: the .incbin target was discovered.
 	found := false
 	for _, h := range r.Headers {
-		if h.Rel == "blob.bin" {
+		if h.Abs == blob {
 			found = true
 		}
 	}
