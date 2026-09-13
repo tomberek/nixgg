@@ -8,12 +8,6 @@
 //	internal/classify  Target            — reads it to classify Kind.Drv
 //	internal/shim      resolveLibFlag    — reads it to claim a -l archive
 //
-// It used to be the literal "#!nixgg-drvref\n" hardcoded in all three,
-// with nothing keeping them in sync. A one-sided edit would have made
-// the writer and readers disagree, and the symptom would be remote from
-// the cause: outputs silently classifying as Regular, which makes the
-// link shim fall back to Passthrough and quietly stop accelerating.
-//
 // # Why a file and not a symlink
 //
 // builder-rpc-v0 registers .drv files with the daemon but does not

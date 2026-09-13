@@ -1,40 +1,33 @@
-// Package expr's batch-archive emitters: a NEW derivation shape that
-// combines N compiles + 1 archive into ONE derivation, for a same-
-// group batch (see internal/batch). Purely additive — does not touch
-// Derivation, Kind, buildScript, ToNix, or toJSON, to keep zero risk
-// of perturbing the byte-pinned output of the three existing Kinds
-// (KindCompile/KindLink/KindArchive), which tests/drv-equivalence.sh
-// depends on matching exactly across every existing fixture.
+// Package expr's batch-archive emitters: a derivation shape that
+// combines N compiles + 1 archive into ONE derivation, for a
+// same-group batch (see internal/batch). Purely additive — does not
+// touch Derivation, Kind, buildScript, ToNix, or toJSON, keeping the
+// byte-pinned output of the three existing Kinds
+// (KindCompile/KindLink/KindArchive) untouched, since
+// tests/drv-equivalence.sh depends on it matching exactly.
 //
-// Unlike every existing Kind, this derivation's inputs are never a
-// not-yet-realized sibling drv/thunk — by construction, the caller
-// (internal/shim's tryBatchArchive) only reaches this once every
-// input is confirmed to be a plain staged source tree belonging to
-// the same batch group. So none of internal/expr's own
-// @NIXGG_*@-marker / native-mode resolve-script.nix substitution
-// machinery applies here.
+// Unlike every existing Kind, this derivation's inputs are never an
+// unrealized sibling drv/thunk: the caller (internal/shim's
+// tryBatchArchive) only reaches this once every input is confirmed to
+// be a plain staged source tree in the same batch group. So none of
+// internal/expr's own @NIXGG_*@-marker / native-mode
+// resolve-script.nix substitution machinery applies here.
 //
 // Sandbox mode's script is fully-resolved text, same as any Kind's
-// own script() with tag=="". Native mode splits differently from
-// every other Kind: Go renders each member's compile line as PLAIN,
-// already shell-quoted text (compileLine, via shellQuoteFlags — same
-// escaping every other Kind's Flags gets) but leaves the member's
-// own srcTree as a Nix path literal for nix/batchArchiver.nix ITSELF
-// to interpolate into the final script, the same way builder.nix
-// already interpolates its own single srcTree. Go never sees the
-// resolved store path; Nix never re-quotes shell text. This is the
-// one place a batch-archive derivation's construction is genuinely
-// split between Go and Nix rather than "Go renders complete text" —
-// see BatchArchive's own docstring for why.
+// own script() with tag=="". Native mode splits differently: Go
+// renders each member's compile line as plain, already shell-quoted
+// text (memberCompileLine), but leaves the member's own srcTree as a
+// Nix path literal for nix/batchArchiver.nix itself to interpolate at
+// eval time, the same way builder.nix interpolates its own srcTree.
+// Go never sees the resolved store path; Nix never re-quotes shell
+// text.
 //
 // Named "batch-<outName>" rather than "ar-<outName>", deliberately:
-// tests/drv-equivalence.sh's own existing filter
-// (^[a-z0-9]+-(tu-|ar-|bin-)) is regex-based and would otherwise see
-// this as an ar-produced drv with no native-mode counterpart of the
-// SAME shape, and report a false-positive-looking "only in sandbox"
-// mismatch. The "batch-" prefix is invisible to that filter by
-// construction — tests/batch-drv-equivalence.sh is this shape's own,
-// separate equivalence check.
+// tests/drv-equivalence.sh's filter (^[a-z0-9]+-(tu-|ar-|bin-)) is
+// regex-based and would otherwise see this as an ar-produced drv with
+// no native-mode counterpart of the SAME shape, and report a
+// false-positive "only in sandbox" mismatch. tests/batch-drv-equivalence.sh
+// is this shape's own, separate equivalence check.
 package expr
 
 import (
@@ -69,20 +62,16 @@ type BatchArchiveParams struct {
 // BatchArchive renders a native-mode `import
 // <helpers>/batchArchiver.nix { ... }` expression. Mirrors
 // Derivation.ToNix's KindArchive case in shape, but constructs the
-// call directly rather than going through Derivation, since this
-// Kind's argument shape (a members list, not a single scriptTemplate)
-// doesn't fit ToNix's existing per-Kind switch.
+// call directly since this Kind's argument shape (a members list, not
+// a single scriptTemplate) doesn't fit ToNix's per-Kind switch.
 //
-// Each member's compileLine is fully shell-quoted PLAIN TEXT (see
-// memberCompileLine) with no reference to its own srcTree at all —
+// Each member's compileLine is fully shell-quoted plain text (see
+// memberCompileLine) with no reference to its own srcTree —
 // nix/batchArchiver.nix splices `cd ${member.srcTree} && ` onto the
-// front of each compileLine itself, at eval time, the same way
-// builder.nix interpolates its own srcTree. This keeps every value
-// Go computes here shell-safe without needing this package to also
-// know Nix's own string-escaping rules for a value it never actually
-// resolves (srcTree is a bare path literal Nix resolves internally;
-// Go only ever sees the literal text of the Nix expression, never the
-// resulting store path).
+// front at eval time, the same way builder.nix interpolates its own
+// srcTree. This keeps every value Go computes here shell-safe without
+// this package needing Nix's own string-escaping rules for a value it
+// never resolves.
 func BatchArchive(p BatchArchiveParams) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "import %s/batchArchiver.nix {\n", p.Helpers)
@@ -151,22 +140,16 @@ type BatchArchiveJSONParams struct {
 
 // BatchArchiveJSON produces a JSONDrv for a combined batch-archive
 // step: N compiles then 1 archive, one derivation, one "out" output
-// (the archive itself — same single-output shape as an ordinary
-// KindArchive derivation, so downstream consumption via
-// thunk.LinkPlaceholder / sandbox.PointOutputAtDrv needs no changes).
+// (same single-output shape as an ordinary KindArchive derivation, so
+// downstream consumption needs no changes).
 //
-// The script text goes into Env["batchScript"] + passAsFile, not
-// Args, same fix and same reason as assemble.Build's own
-// Env["buildScript"]: a same-group batch large enough to matter
-// (ffmpeg's per-library archives, LLVM's libLLVMSupport) embeds one
-// full compile invocation per member in the script text, and passing
-// that as `args = ["-c", script]` makes exec's own argv block exceed
-// the kernel's ARG_MAX/MAX_ARG_STRLEN ceiling — confirmed directly
-// against both real projects ("Argument list too long" at build
-// time, past ~350 members). passAsFile writes the env var's value —
-// with CA output placeholders substituted exactly as anywhere else in
-// the derivation — to a file at build time, exposed via
-// `${name}Path`, instead of ever putting it on the builder's argv.
+// The script text goes into Env["batchScript"] + passAsFile rather
+// than Args: a same-group batch large enough to matter (ffmpeg's
+// per-library archives, LLVM's libLLVMSupport) embeds one full
+// compile invocation per member, and `args = ["-c", script]` exceeds
+// the kernel's ARG_MAX past ~350 members ("Argument list too long",
+// confirmed against real projects). passAsFile writes the env var's
+// value to a file at build time instead, exposed via `${name}Path`.
 func BatchArchiveJSON(p BatchArchiveJSONParams) JSONDrv {
 	script := batchArchiveScript(p.Coreutils, p.AR, p.ARFlags, p.OutName, p.Members)
 	srcs := append([]string{}, p.ExtraSrcs...)
@@ -221,57 +204,31 @@ func BatchArchiveJSON(p BatchArchiveJSONParams) JSONDrv {
 
 // batchArchiveScript renders the combined shell script: N compiles
 // into an objects dir, then one `ar` over all of them, in member
-// order. $objroot is captured before any `cd` so each member's own
-// -o target stays absolute regardless of which srcTree directory
-// that member's compile runs from.
+// order. $objroot is captured before any `cd` so each member's -o
+// target stays absolute regardless of which srcTree the compile runs
+// from.
 //
-// $objroot's own LOCATION depends on arFlags: a THIN archive (`T` in
-// arFlags) stores each member's file PATH rather than its bytes (see
-// internal/members' package docstring on the mechanism this exists
-// for elsewhere), so those paths must survive after THIS derivation's
-// own build sandbox is torn down — a plain build-tmp scratch dir does
-// not. Confirmed directly: a thin archive built from a tmp-relative
-// objroot broke immediately once that tmp was gone ("error opening
-// thin archive member: No such file or directory"), while one built
-// from $out/lib/.nixgg-objs/ (this derivation's own permanent store
-// output) kept working — Nix rewrites the archive's OWN self-
-// references to the final resolved store path, not a build-time
-// placeholder, confirmed via a real CA derivation that `ar --thin`s a
-// sibling file inside its own $out. This makes a thin batch archive
-// fully self-contained: the archive and its members live side by
-// side in ONE store output, so a later consumer just needs that one
-// output mounted — no members sidecar (archive.go's own non-batched
-// mechanism) is needed here at all.
-//
-// A non-thin archive keeps the original build-tmp scratch dir
-// unchanged (byte-identical to before this distinction existed): its
-// members are copied INTO the archive's own bytes by `ar` itself, so
-// nothing needs to survive after the build, and every existing batch
-// fixture's pinned output must not gain unrelated files it never had.
+// $objroot's LOCATION depends on arFlags: a THIN archive (`T`) stores
+// each member's file PATH rather than its bytes, so those paths must
+// survive after this derivation's build sandbox is torn down — a
+// build-tmp scratch dir does not, but $out/lib/.nixgg-objs/ does (Nix
+// rewrites the archive's own self-references to the final resolved
+// store path). This makes a thin batch archive fully self-contained
+// in one store output. A non-thin archive keeps the original
+// build-tmp scratch dir: `ar` copies members into its own bytes, so
+// nothing needs to survive the build.
 //
 // Compiles run with bounded concurrency, capped at $NIX_BUILD_CORES
-// (falls back to 1 if unset/unparseable — never divides by zero,
-// never runs more than requested). Folding N TUs into one derivation
-// trades away Nix's own per-derivation scheduling, which normally
-// runs many TUs' compiles concurrently across the whole build; without
-// this, EVERY member of a batch compiles strictly one at a time on a
-// single core — confirmed directly via `ps aux` while building
-// ffmpeg's libavcodec batch (~350 TUs): exactly one gcc/cc1 process
-// running at any moment, for the whole batch's duration, regardless of
-// how many cores were available. The FIFO wait below (oldest launched
-// member first, not "whichever finishes first") is a deliberate
-// choice, not an oversight: `wait -n` only reliably reports a job's
-// exit code if the job is STILL RUNNING when `wait -n` is called — a
-// background job that already finished before any wait touches it can
-// get silently reaped by the shell, and a later `wait -n` (with or
-// without an explicit pid list) then returns 127 ("no such job")
-// instead of the real exit code, LOSING a real compile failure
-// silently. `wait "$pid"` on an explicit, already-known pid does not
-// have this problem — confirmed directly (both failure modes
-// reproduced and fixed in isolation before wiring this in). The
-// tradeoff is head-of-line blocking under wildly uneven per-member
-// compile times, which real same-language same-project TUs rarely
-// exhibit to a degree that matters.
+// (falls back to 1 if unset/unparseable): folding N TUs into one
+// derivation trades away Nix's own per-derivation scheduling, so
+// without this every member compiles strictly one at a time
+// regardless of available cores (confirmed via `ps aux` on ffmpeg's
+// libavcodec batch). The FIFO wait below (oldest launched member
+// first) is deliberate: `wait -n` only reliably reports a job's exit
+// code if the job is still running when called — a job that already
+// finished can get silently reaped, and a later `wait -n` returns 127
+// instead of the real exit code, losing a real compile failure.
+// `wait "$pid"` on an explicit pid does not have this problem.
 func batchArchiveScript(coreutils, ar, arFlags, archiveOutName string, members []BatchCompileMember) string {
 	thin := strings.ContainsRune(arFlags, 'T')
 	var b strings.Builder

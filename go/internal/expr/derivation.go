@@ -1,15 +1,12 @@
 // Package expr constructs Nix derivations. A single Derivation struct
 // holds every field that both wire formats — the `.nix` thunk file
-// (native mode, run through `nix-instantiate`) and the JSON drv
-// description (sandbox mode, run through `nix derivation add`) — need
-// to agree on. Both serializers work off the same struct, so if you
-// add a new attribute you can't accidentally set it in one format and
-// forget the other.
+// (native mode, via `nix-instantiate`) and the JSON drv description
+// (sandbox mode, via `nix derivation add`) — need to agree on, so
+// adding a field can't accidentally land in only one format.
 //
-// The invariant we care about: same Derivation → same drv hash,
-// regardless of which serializer produces the wire bytes. Enforced
-// externally by tests/drv-equivalence.sh (runs both paths, compares
-// resulting drv-store-paths).
+// Invariant: same Derivation -> same drv hash, regardless of which
+// serializer produces the wire bytes. Enforced externally by
+// tests/drv-equivalence.sh (runs both paths, compares drv-store-paths).
 package expr
 
 import (
@@ -72,71 +69,51 @@ type Derivation struct {
 	Inputs []derivInput
 
 	// ExtraInputs are dependency-only: Nix must mount them into this
-	// derivation's sandbox — they go through the exact SAME
-	// dependency-declaring code paths as Inputs (derivInputsList's
-	// own rendering, interpolated by linker.nix/archiver.nix into
-	// their own `_extraInputs` env attr in native mode; toJSON's
-	// drvs/srcs maps, mirrored into envDict's own `_extraInputs` key
-	// in JSON mode — see envDict's own docstring) — but they never
-	// appear in the actual command line the way Inputs does.
+	// derivation's sandbox (same rendering path as Inputs, into
+	// linker.nix/archiver.nix's `_extraInputs` env attr / envDict's
+	// mirrored JSON-mode key), but they never appear on the actual
+	// command line.
 	//
-	// The one producer today: a thin archive (`ar T`) consumed by a
-	// LATER link/archive step. That archive's own on-disk bytes are
-	// just absolute path REFERENCES to its members, not embedded
-	// content (see internal/members' package docstring) — so the
-	// consuming derivation's sandbox needs those member paths mounted
-	// too, or the linker can't read through them. But the members are
-	// already reachable from inside the archive's own bytes; putting
-	// them a second time on the actual `cc`/`ar` command line (the
-	// same way an ordinary Inputs entry would be) makes the linker see
-	// each symbol twice — confirmed directly: an early version that
-	// merged thin-archive members into Inputs itself produced
-	// "multiple definition of `foo'" the first time a real archive
-	// exercised this path. ExtraInputs exists precisely so
-	// "must be mounted" and "must appear in argv" can be asked
-	// independently for the same input.
+	// The one producer: a thin archive (`ar T`) consumed by a later
+	// link/archive step. Its bytes are path REFERENCES to members, not
+	// embedded content, so the consumer's sandbox needs those member
+	// paths mounted too — but putting them on argv as an ordinary Input
+	// would also make the linker see each symbol twice ("multiple
+	// definition of `foo'", confirmed when an earlier version merged
+	// them into Inputs). ExtraInputs lets "must be mounted" and "must
+	// appear in argv" be answered independently per input.
 	ExtraInputs []derivInput
 
 	// Link + Compile: compiler flags. Archive uses ARFlags instead.
 	Flags []string
 
 	// GroupInputs wraps the input list in --start-group/--end-group.
-	//
-	// Set when the caller's link line had those brackets. They cannot be
-	// carried in Flags: they are positional — they bracket whatever sits
-	// BETWEEN them — and buildScript emits all flags before all inputs,
-	// which would leave the pair adjacent, spanning nothing, silently
-	// defeating ld's multi-pass rescan for circular archive deps.
+	// Set when the caller's link line had those brackets; they can't be
+	// carried in Flags because they're positional (bracket whatever's
+	// BETWEEN them) and buildScript emits all flags before all inputs.
 	//
 	// The re-emitted group spans every input rather than the caller's
-	// exact original span. Widening is safe (objects inside a group are
-	// harmless, verified against ld) and the narrow span is not
-	// expressible once inputs and flags have been separated.
+	// exact span — widening is safe (verified against ld: objects
+	// inside a group are harmless) and the narrow span can't be
+	// expressed once inputs and flags are separated.
 	GroupInputs bool
 
 	// WholeArchiveInputs names (basenames, matched against derivInput.Name)
 	// the subset of Inputs that fell between --whole-archive and
-	// --no-whole-archive on the caller's own link line. Unlike
-	// GroupInputs (one span, widened to cover every input — safe,
-	// verified against ld), --whole-archive's span CANNOT be widened
-	// the same way: it changes archive member SELECTION (every member
-	// forced in, vs. only members some other input references), not
-	// just resolution order, so wrapping an input the caller never put
-	// inside it would silently force in objects nothing needs. Confirmed
-	// directly against Linux Kbuild's own vmlinux.o link
-	// (scripts/Makefile.vmlinux_o's cmd_ld_vmlinux.o: `--whole-archive
-	// vmlinux.a --no-whole-archive --start-group $(KBUILD_VMLINUX_LIBS)
-	// --end-group`) — treating this the same as GroupInputs (one global
-	// span) put --whole-archive/--no-whole-archive adjacent with
-	// nothing between them, and vmlinux.a landed inside --start-group's
-	// span instead, producing a vmlinux.o with no sections at all
-	// (objtool/objcopy's later reads both failed).
+	// --no-whole-archive on the caller's link line. Unlike GroupInputs,
+	// this can't be widened to span every input: --whole-archive changes
+	// archive member SELECTION (forces every member in vs. only members
+	// something else references), so wrapping an unintended input would
+	// force in objects nothing needs. Confirmed against Linux Kbuild's
+	// vmlinux.o link (cmd_ld_vmlinux.o: `--whole-archive vmlinux.a
+	// --no-whole-archive --start-group $(KBUILD_VMLINUX_LIBS)
+	// --end-group`) — treating it as one global span put vmlinux.a
+	// inside --start-group's span instead, producing a vmlinux.o with no
+	// sections at all.
 	//
-	// A name list rather than a boolean per Input: --whole-archive only
-	// meaningfully applies to archives (.a), and Kbuild's own recipe
-	// wraps exactly one of several inputs, not all of them — the exact
-	// shape GroupInputs's own "harmless to widen" argument does NOT
-	// hold for.
+	// A name list rather than a boolean per Input, because
+	// --whole-archive only applies to archives (.a) and Kbuild's recipe
+	// wraps exactly one of several inputs, not all.
 	WholeArchiveInputs []string
 
 	// Archive-only: `ar` modifier string (e.g. "rcs").
@@ -148,35 +125,28 @@ type Derivation struct {
 	// earlier by an unshimmed tool (e.g. openssl's `perl
 	// util/mkdef.pl > libcrypto.ld`, referenced via
 	// `-Wl,--version-script=libcrypto.ld`). The link shim reads the
-	// content at classify time (before anything downstream could turn
-	// it into a stub), stages it via stage.ContentFiles, and passes
-	// the resulting directory here — same shape as Compile's SrcStore,
-	// just for KindLink. A real derivation input (env["src"], copied
-	// in before the link command runs), NOT text embedded in the
-	// script: a large generated linker script plus hundreds of real
-	// object-file paths on one link line can exceed the kernel's argv
-	// limit if baked into the script body directly (confirmed
-	// directly against openssl's libcrypto.so.3 — "Argument list too
-	// long").
+	// content at classify time, stages it via stage.ContentFiles, and
+	// passes the resulting directory here — same shape as Compile's
+	// SrcStore, just for KindLink. A real derivation input (env["src"],
+	// copied in before the link command runs), NOT text embedded in the
+	// script: a large generated linker script plus hundreds of object
+	// paths on one link line can exceed the kernel's argv limit if baked
+	// directly into the script body (confirmed against openssl's
+	// libcrypto.so.3 — "Argument list too long").
 	InlineFilesStore string
 
 	// Link-only: an ABSOLUTE-path linker-script reference (as opposed
-	// to InlineFilesStore's relative-path case). meson (QEMU) bakes
-	// the build tree's own absolute path into a generated file's name
-	// at configure time — e.g. `-Xlinker
+	// to InlineFilesStore's relative-path case). meson (QEMU) bakes the
+	// build tree's absolute path into a generated file's name at
+	// configure time — e.g. `-Xlinker
 	// --dynamic-list=/build/source/build/plugins/qemu-plugin.symbols`
-	// — so `cp -a "$src/." .` (InlineFilesStore's mechanism, which
-	// only reproduces paths RELATIVE to the link's own cwd) can't
-	// recreate it: the link derivation's sandbox has no
-	// "source/build/plugins/" subtree to copy into. Nix's own build
-	// sandbox always mounts the build root at a fixed "/build" for
-	// every derivation (confirmed directly — this is Nix's own
-	// convention, not something QEMU's build controls), so the
-	// generated file's content can just be written to that exact
-	// absolute path via a `mkdir -p`+heredoc fragment prepended to
-	// the script. Safe to embed literally (unlike InlineFilesStore's
-	// case): every real fixture that hits this is a small generated
-	// symbol-export list, not a large tree or hundreds of paths.
+	// — so `cp -a "$src/." .` (InlineFilesStore's mechanism, relative to
+	// the link's own cwd) can't recreate it. Nix's sandbox always mounts
+	// the build root at a fixed "/build", so the file's content can
+	// just be written to that exact absolute path via a `mkdir -p`+
+	// heredoc fragment prepended to the script. Safe to embed literally
+	// (unlike InlineFilesStore): every fixture that hits this is a small
+	// generated symbol-export list, not a large tree or hundreds of paths.
 	AbsFilePath    string
 	AbsFileContent string
 
@@ -219,6 +189,7 @@ type derivInput struct {
 // to be derivable identically on both sides. The filename is the only
 // thing both sides reliably share:
 //
+//	*-prelink.o  -> bin   (a LINK drv wrote it, see ArtifactSubdir)
 //	*.a          -> lib   (an ar drv wrote it to $out/lib/)
 //	*.o          -> ""    (compile outputs stay flat)
 //	anything else-> bin   (a link drv wrote it to $out/bin/)
@@ -256,6 +227,14 @@ func StoreBasename(p string) string {
 func ArtifactSubdir(name string) string {
 	base := StoreBasename(name)
 	switch {
+	// meson's `prelink: true` static-library convention names a
+	// partial-link object "<libname>.a.p/<name>-prelink.o" — a LINK
+	// output (shim.Link's `g++ -r`) that happens to end in ".o", same
+	// "filename lies about Kind" shape as Kbuild's vmlinux.o. Must be
+	// checked before the generic ".o" case below, or archiving this
+	// output fails looking for it flat instead of under bin/.
+	case strings.HasSuffix(base, "-prelink.o"):
+		return "bin"
 	case strings.HasSuffix(base, ".o"):
 		return ""
 	case strings.HasSuffix(base, ".a"):
@@ -323,22 +302,13 @@ func (d *Derivation) scriptTemplate() (template, tag string) {
 }
 
 // outSubdir is the FHS directory inside $out that this Kind's artifact
-// belongs in, "" for none.
+// belongs in, "" for none. Nix store paths follow FHS internally
+// (executables at bin/, libraries at lib/) — that's what makes a store
+// path installable via `nix profile install`/`nix run`/buildEnv/NixOS's
+// environment.systemPackages, all of which scan bin/, lib/, share/ etc.
 //
-// Nix store paths follow the FHS internally: an executable lives at
-// $out/bin/<name>, a library at $out/lib/<name>. That is not decoration
-// — it is what makes a store path installable. `nix profile install`,
-// `nix run`, buildEnv/symlinkJoin and NixOS's environment.systemPackages
-// all locate artifacts by scanning bin/, lib/, share/ and friends. A
-// binary sitting flat at $out/<name> is invisible to every one of them,
-// so a nixgg-built program could not be installed the way any other Nix
-// package can.
-//
-// Compile outputs stay flat, deliberately. A per-TU output holding one
-// .o is not a package and has no FHS home; relocating it would rewrite
-// every sibling reference and every drv hash in the project to move
-// files nothing user-facing ever reads. FHS matters exactly where an
-// output is consumed by a person or by Nix's own tooling.
+// Compile outputs stay flat deliberately: a per-TU .o is not a package
+// and has no FHS home.
 func (d *Derivation) outSubdir() string {
 	switch d.Kind {
 	case KindLink:
@@ -414,20 +384,12 @@ func (d *Derivation) compilerOrAR() string {
 }
 
 // isRawLinker reports whether d.Tool is a linker binary invoked
-// directly (ld — see dispatch.Tool.Basename, which always normalizes
-// ld/ld.bfd/ld.gold/ld.lld/triple-prefixed spellings to this one
-// canonical string) rather than a compiler driver (cc/gcc/clang) that
-// forwards flags to whatever linker it wraps. The two accept
-// different group-bracket spellings: `-Wl,--start-group` is a DRIVER
-// convention (it tells the driver to pass `--start-group` through to
-// ld verbatim); a raw ld invocation needs the bare form and rejects
-// `-Wl,...` outright ("unrecognized option"). Confirmed directly:
-// Linux Kbuild's own vmlinux.o link (scripts/Makefile.vmlinux_o's
-// cmd_ld_vmlinux.o) invokes `ld` raw with bare `--start-group ...
-// --end-group`, and is also the first group-bracketed link this
-// project ever routed through mode.Realise/ForLink's own carveout —
-// every other GroupInputs case up to that point happened to go
-// through a compiler driver.
+// directly (ld) rather than a compiler driver (cc/gcc/clang) that
+// forwards flags to whatever linker it wraps. The two accept different
+// group-bracket spellings: `-Wl,--start-group` is a driver convention;
+// a raw ld invocation needs the bare form and rejects `-Wl,...`
+// outright ("unrecognized option"). Confirmed against Linux Kbuild's
+// vmlinux.o link, which invokes `ld` raw with bare `--start-group`.
 func (d *Derivation) isRawLinker() bool {
 	return d.Tool == "ld"
 }
@@ -470,11 +432,9 @@ func (d *Derivation) buildScript(tag, coreutils, compiler string) string {
 			if part == "" {
 				continue
 			}
-			// --whole-archive wraps a NAMED SUBSET of inputs, unlike
-			// GroupInputs' single global span (see WholeArchiveInputs'
-			// own docstring for why widening isn't safe here) — so this
-			// wraps each matching input individually rather than the
-			// whole list once.
+			// --whole-archive wraps a NAMED SUBSET of inputs (unlike
+			// GroupInputs' single global span — see WholeArchiveInputs),
+			// so wrap each matching input individually.
 			if wholeArchive[StoreBasename(in.Name)] {
 				part = "--whole-archive " + part + " --no-whole-archive"
 			}
@@ -493,16 +453,13 @@ cd "$src"
 "%s" %s -c "$source" -o "$out/$outName"
 `, pathPrefix, d.Tool, shellQuoteFlags(d.Flags))
 	case KindLink:
-		// Split flags into non-`-l` and `-l<name>` — the classic
-		// single-pass ld resolves libraries against object files
-		// mentioned BEFORE them. Emit inputs (objects/archives)
-		// between the two groups so `-lm`/`-lc` come last, after
-		// every object/archive that might reference libm/libc.
-		// When there are no `-l` flags, fall through to the plain
-		// flags-then-inputs layout so drv content stays byte-
-		// identical to the pre-`-l`-split era (no trailing empty
-		// slot). This keeps the equivalence set for hello/lua/mosh
-		// stable — those never had `-l` flags to begin with.
+		// Split flags into non-`-l` and `-l<name>`: a single-pass ld
+		// resolves libraries against object files mentioned BEFORE
+		// them, so inputs go between the two groups, putting `-lm`/
+		// `-lc` last. With no `-l` flags, fall through to the plain
+		// flags-then-inputs layout so drv content stays byte-identical
+		// to before this split existed (hello/lua/mosh never had `-l`
+		// flags to begin with).
 		var lflags, nonLflags []string
 		for _, f := range d.Flags {
 			if strings.HasPrefix(f, "-l") && len(f) > 2 {
@@ -511,14 +468,11 @@ cd "$src"
 				nonLflags = append(nonLflags, f)
 			}
 		}
-		// Re-emit the archive group around the whole input list. Only
-		// reached when the caller asked for it, so the no-group layout
-		// below stays byte-identical for every existing derivation.
-		//
-		// Spelling depends on whether d.Tool is a compiler driver or
-		// a raw linker — see isRawLinker's own docstring for why both
-		// exist and why this project didn't need the distinction
-		// until Linux Kbuild's vmlinux.o link.
+		// Re-emit the group around the whole input list, only when the
+		// caller asked for it (GroupInputs), so the no-group layout
+		// stays byte-identical for every existing derivation. Spelling
+		// depends on whether d.Tool is a compiler driver or a raw
+		// linker — see isRawLinker.
 		inputList := inputs()
 		if d.GroupInputs && inputList != "" {
 			if d.isRawLinker() {
@@ -556,16 +510,12 @@ ar D%s "%s" %s
 
 // ToNix serialises this Derivation as an `import <helper>.nix { … }`
 // expression suitable for writing to .nixgg/thunks/<id>.nix. The
-// helper (builder.nix / linker.nix / archiver.nix, all in nix/) is
-// still what actually calls `derivation`; this emitter just fills
-// in its arguments from our shared struct — so if we add a field
-// to Derivation, both this native path and toJSON pick it up.
+// helper (builder.nix / linker.nix / archiver.nix, all in nix/) still
+// calls `derivation`; this just fills in its arguments from our
+// shared struct. helpers must be the /nix/store/…-nixgg-nix root.
 //
-// helpers must be the /nix/store/…-nixgg-nix root.
-//
-// The bytes this produces are byte-equivalent to what the pre-
-// Derivation-struct emitters produced (Compile/Link/Archive in
-// expr.go). Verified externally by tests/drv-equivalence.sh.
+// Byte-equivalent to the pre-Derivation-struct emitters; verified
+// externally by tests/drv-equivalence.sh.
 func (d *Derivation) ToNix(helpers string) string {
 	tmpl, tag := d.scriptTemplate()
 	var b strings.Builder
@@ -669,8 +619,8 @@ func jsonObjectSorted(m map[string]string) string {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		kj, _ := jsonMarshal(k)
-		vj, _ := jsonMarshal(m[k])
+		kj, _ := json.Marshal(k)
+		vj, _ := json.Marshal(m[k])
 		b.Write(kj)
 		b.WriteByte(':')
 		b.Write(vj)
@@ -678,9 +628,6 @@ func jsonObjectSorted(m map[string]string) string {
 	b.WriteByte('}')
 	return b.String()
 }
-
-// jsonMarshal is a thin wrapper for readability.
-func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 // toJSON serialises this Derivation for `nix derivation add`. The
 // caller passes extraSrcs (basenames of already-realised store paths
@@ -691,7 +638,7 @@ func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 // there regardless of whether the script text references it — but
 // (unlike Inputs) never appear in d.script()'s argv; see
 // Derivation.ExtraInputs' own docstring.
-func (d *Derivation) toJSON(extraSrcs []string, _reserved any) JSONDrv {
+func (d *Derivation) toJSON(extraSrcs []string) JSONDrv {
 	drvs := map[string]JSONDrvRef{}
 	srcs := append([]string{}, extraSrcs...)
 	seenSrc := map[string]bool{}
@@ -758,16 +705,13 @@ func (d *Derivation) envDict() map[string]string {
 		"outputHashMode": "nar",
 		"_storeDeps":     strings.Join(d.StoreDeps, ":"),
 	}
-	// Link and Archive get an `_extraInputs` key unconditionally
-	// (empty string when there are none) — mirroring linker.nix/
-	// archiver.nix's own `_extraInputs = builtins.concatStringsSep
-	// ":" (...)`, which is likewise unconditional regardless of
-	// whether `extraInputs` was passed. Both sides must agree on
-	// whether this key EXISTS, not just on its value: an earlier
-	// version left it out of envDict entirely, so every Link/Archive
-	// derivation's JSON-mode env dict had one fewer key than its
-	// native-mode counterpart and the two hashed differently even
-	// with zero ExtraInputs.
+	// Link and Archive get an `_extraInputs` key unconditionally (empty
+	// string when there are none), mirroring linker.nix/archiver.nix's
+	// own unconditional `_extraInputs`. Both sides must agree on
+	// whether the key EXISTS, not just its value — an earlier version
+	// left it out of envDict, so JSON-mode env had one fewer key than
+	// native-mode and the two hashed differently even with zero
+	// ExtraInputs.
 	switch d.Kind {
 	case KindLink, KindArchive:
 		parts := make([]string, 0, len(d.ExtraInputs))

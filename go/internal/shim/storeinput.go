@@ -30,25 +30,19 @@ import (
 // Ref stays the root because that is what `builtins.storePath` (native)
 // and inputs.srcs (sandbox) accept; neither takes a subpath.
 //
-// Shared by link.go and archive.go so the two cannot drift, and so this is
-// reachable from a test — the original bug lived in code only exercised
-// through a full build.
+// Shared by link.go and archive.go so the two cannot drift.
 func storeInput(c classify.Result, callerPath string) (expr.Input, expr.JSONDrvInput) {
 	rel := c.Sub
 	if rel == "" {
-		// No Sub means classification could not observe the artifact's
-		// position inside its store path. Two ways that happens, and they
-		// need opposite treatment:
+		// No Sub means classification couldn't observe the artifact's
+		// position inside its store path — either a foreign dependency
+		// reached through a symlink (Sub IS set there, so we never get
+		// here) or one of our own outputs that `force` promoted to a
+		// real file (the promoted registry records only the store
+		// root, so the FHS subdir has to be re-derived here).
 		//
-		//   - A foreign dependency reached through a symlink: Sub IS set
-		//     (classify resolved the link), so we never get here.
-		//   - One of OUR OWN outputs that `force` promoted to a real file:
-		//     the promoted registry records only the store ROOT, so Sub is
-		//     empty and the artifact's FHS subdir has to be re-derived.
-		//
-		// Missing the second case broke native-mode lua: liblua.a lives at
-		// <root>/lib/liblua.a but was referenced as <root>/liblua.a, and
-		// luac failed with `ld: cannot find …-ar-liblua.a/liblua.a`.
+		// Missing the second case broke native-mode lua: liblua.a lives
+		// at <root>/lib/liblua.a but was referenced as <root>/liblua.a.
 		base := filepath.Base(callerPath)
 		if sub := expr.ArtifactSubdir(base); sub != "" {
 			rel = sub + "/" + base
@@ -70,80 +64,42 @@ func storeInput(c classify.Result, callerPath string) (expr.Input, expr.JSONDrvI
 // passthrough runs the moment an input can't be modeled, and its
 // error is returned with ok=false.
 //
-// Before classifying, each input is checked against
-// batchpending.Path: if it's a still-deferred batch member (see
-// deferCompileToBatch), it's resolved into an ordinary per-TU
-// thunk/drv HERE, via ResolvePendingMember, before classify.Target
-// ever sees it. This is what makes batching safe for every consumer
-// that ISN'T a same-group archive (archive.go's own tryBatchArchive
-// checks for all-same-group-pending BEFORE calling classifyInputs at
-// all, and only reaches this prologue when that fast path didn't
-// apply): a mixed-group archive, a direct link with no archive, or
-// any other caller of this function transparently falls back to
-// today's one-derivation-per-TU behavior for that one input, with
-// classify.Target none the wiser that the input was ever deferred.
+// Each input is checked against batchpending.Is first: a still-
+// deferred batch member is resolved into an ordinary per-TU thunk/drv
+// here (ResolvePendingMember) before classify.Target ever sees it.
 //
-// A Thunk/Drv-classified input that is itself a THIN archive (see
-// members.go's own docstring) additionally needs every ONE OF ITS OWN
-// members declared as a dependency of this derivation too — Nix only
-// mounts what a derivation's own inputs.drvs/inputs.srcs declare, and
-// a thin archive's on-disk bytes are just paths, not embedded
-// content, so nothing else would make those paths resolve inside a
-// LATER, separate consumer's sandbox. expandMembers does this lookup
-// (keyed identically to how archive.go wrote the sidecar for this
-// exact archive) and recurses into any member that is itself a thin
-// archive with its own sidecar — structurally necessary for a thin
-// archive nested inside another archive, though not exercised by any
-// current fixture (archive.go's own parseARArgs only ever accepts
-// `.o` members, so an archive's OWN recorded members are always
-// object files today, never another archive — the recursion is
-// forward-looking, not dead weight, since loosening that constraint
-// later shouldn't require touching this function again).
+// A Thunk/Drv-classified input that is itself a thin archive needs
+// every one of its own members declared as a dependency too — Nix
+// only mounts what inputs.drvs/inputs.srcs declare, and a thin
+// archive's on-disk bytes are just paths, not embedded content.
+// expandMembers does this lookup and recurses into any member that is
+// itself a thin archive.
 //
-// Crucially, expandMembers' own appends go into the EXTRA slices, not
-// the primary linkInputs/jsonInputs the caller's own argv produced.
-// A thin archive's members are already referenced from inside its own
-// stored bytes (that's the entire point of `ar T` — see members.go's
-// docstring on why that stays safe under nixgg's per-derivation-
-// sandbox model); the LINK/AR step consuming that archive only needs
-// those members MOUNTED into its sandbox, never listed a second time
-// as literal argv tokens. Merging them into the rendered set produced
-// exactly that bug: `cc main.o libthin.a` where libthin.a already
-// contains path references to foo.o/bar.o, plus foo.o/bar.o appended
-// AGAIN as separate link-line arguments, made ld see each symbol
-// twice ("multiple definition of `foo'"). ExtraLink/ExtraJSON are
-// rendered into the derivation's own dependency declarations
-// (extraInputs in native mode, inputs.drvs/srcs in sandbox mode) but
-// never into the build script text — see Derivation.ExtraInputs'
-// docstring.
+// expandMembers' appends go into the EXTRA slices, never the PRIMARY
+// Link/JSON slices the caller's own argv produced: a thin archive's
+// members are already referenced from inside its own stored bytes, so
+// the consuming link/ar step only needs them MOUNTED, not listed a
+// second time as argv tokens. Merging them into the primary set
+// produced exactly that bug: `cc main.o libthin.a` where libthin.a
+// already references foo.o/bar.o, plus foo.o/bar.o appended again as
+// link-line arguments, made ld see each symbol twice ("multiple
+// definition of `foo'").
 //
-// The PRIMARY lists (Link/JSON) preserve every occurrence from the
-// caller's own argv, including repeats — deduplicating them was a
-// real regression found against a real LLVM build: CMake's own
-// generated link line for llvm-min-tblgen lists `libLLVMSupport.a
-// libLLVMTableGen.a libLLVMSupport.a` (Support repeated AFTER
-// TableGen), which is CMake's OWN answer to plain `ld`'s left-to-right,
-// no-`--start-group` archive resolution — TableGen's objects need
-// symbols FROM Support, so Support must appear again after it. Before
-// this fix, the second occurrence was silently dropped, producing
-// "undefined reference to llvm::FoldingSetBase::..." at link time —
-// wrong output, not a passthrough or an error, so it went unnoticed
-// until a real end-to-end LLVM build caught it. The PRIMARY lists are
-// keyed by (still-tracked, just never checked to skip) seenLink/
-// seenJSON maps for a different reason: expandMembers below must know
-// which entries are ALREADY explicit primary inputs, so it doesn't
-// redundantly re-declare one of them a second time as a dependency-
-// only extra — see expandMembers' own docstring on why THAT case is a
-// real bug (duplicate dependency declarations render differently
-// across native's list-based vs sandbox's map-based wire format).
+// The PRIMARY lists preserve every occurrence from the caller's argv,
+// including repeats — deduplicating them was a real regression: CMake's
+// link line for llvm-min-tblgen lists `libLLVMSupport.a
+// libLLVMTableGen.a libLLVMSupport.a` (ld's left-to-right archive
+// resolution needs Support again after TableGen), and dropping the
+// second occurrence produced "undefined reference to
+// llvm::FoldingSetBase::..." at link time. The seenLink/seenJSON maps
+// still track primary entries (just never use them to skip) so
+// expandMembers knows not to re-declare one of them as a redundant
+// dependency-only extra.
 //
-// The EXTRA lists (ExtraLink/ExtraJSON, populated only by
-// expandMembers) DO dedup — that's the one place a duplicate is
-// actually wrong: a thin archive's own member reachable through two
-// different sibling thin archives on one link line must be declared
-// as a dependency exactly once, not once per archive that references
-// it (see expandMembers' own docstring for the concrete regression
-// this prevents).
+// The EXTRA lists (populated only by expandMembers) DO dedup: a thin
+// archive's member reachable through two different sibling thin
+// archives on one link line must be declared as a dependency exactly
+// once, not once per archive that references it.
 type classifiedInputs struct {
 	Link      []expr.Input
 	ExtraLink []expr.Input
@@ -215,16 +171,13 @@ func classifyInputs(
 }
 
 // expandMembers appends every member recorded in a thin archive's own
-// members.Write sidecar (if key has one at all — a guaranteed miss
-// for any non-thin archive, which never writes one) into extraLink/
-// extraJSON — dependency-only, never the rendered argv set; see this
-// function's caller for why. Recurses into any member that is itself
-// a thin archive with its own sidecar. archKeys guards against
-// re-expanding the same archive twice (redundant work, not a
-// correctness bug on its own) and against a cycle (a real bug, though
-// not one anything in this codebase can currently construct — ar
-// refuses to nest an archive inside another archive's own members at
-// all; see this function's caller for why).
+// members.Write sidecar (a guaranteed miss for any non-thin archive)
+// into extraLink/extraJSON — dependency-only, never the primary argv
+// set (see classifyInputs' docstring for why). Recurses into any
+// member that is itself a thin archive. archKeys guards against
+// re-expanding the same archive twice and against a cycle (not
+// currently constructible — ar refuses to nest an archive inside
+// another archive's own members).
 func expandMembers(
 	l paths.Layout, key string,
 	extraLink *[]expr.Input, extraJSON *[]expr.JSONDrvInput,
@@ -309,6 +262,12 @@ func appendJSONDedup(dst *[]expr.JSONDrvInput, seen map[string]bool, in expr.JSO
 // iff path matches NIXGG_SANDBOX_TARGET, or TARGET is unset and
 // defaultSubmit is true.
 //
+// No-op unless sandbox.Enabled() is the real kind (NIXGG_SANDBOX=1) —
+// `nix store submit-output` only makes sense with a live outer
+// builder-rpc-v0 derivation. Callers reachable under sandbox.EagerDrv()
+// too call this unconditionally; this guard is what makes that safe
+// without each call site checking the distinction itself.
+//
 // linkSandbox passes defaultSubmit=true (a link is usually the final
 // artifact); archiveSandbox passes false (an archive is usually
 // intermediate, consumed by a later link — it only submits when
@@ -332,6 +291,9 @@ func appendJSONDedup(dst *[]expr.JSONDrvInput, seen map[string]bool, in expr.JSO
 //     outputKey) check has a real, matching name on the submitted
 //     side too.
 func maybeSubmit(cfg *toolchain.Config, drvPath, path string, defaultSubmit bool) {
+	if !sandbox.Enabled() {
+		return
+	}
 	outputKey := "out"
 	submit := defaultSubmit
 	if os.Getenv("NIXGG_SANDBOX_TARGET") != "" {

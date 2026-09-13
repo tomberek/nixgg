@@ -1,11 +1,9 @@
-// cmdAssemble implements `nixgg assemble <root> <name>`.
-//
-// splitStdenv's build-stage postBuild step: <root> is a tree of real
-// files interleaved with drvref stubs (one per cc/c++/ar/link call the
-// shims intercepted — see internal/drvref). Walk it, build one
-// assembly drv whose builder restores the tree and overlays each stub
-// with its resolved artifact, and submit it as the outer derivation's
-// "out" output.
+// cmdAssemble implements `nixgg assemble <root> <name>`: splitStdenv's
+// build-stage postBuild step. <root> is a tree of real files
+// interleaved with drvref stubs left by the shims (internal/drvref);
+// this walks it, builds one drv that restores the tree and overlays
+// each stub with its resolved artifact, and submits it as the outer
+// derivation's "out" output.
 package cli
 
 import (

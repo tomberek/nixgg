@@ -104,6 +104,24 @@ func TestParseARArgs(t *testing.T) {
 			name: "modifier outside the alphabet bails", args: []string{"rzz", "libfoo.a", "a.o"},
 			wantOK: false,
 		},
+		{
+			// meson's own GCC-toolchain static_library() invocation
+			// always prepends `--plugin <path-to-liblto_plugin.so>`
+			// (loading gcc's LTO plugin so `ar` can read IR-bitcode
+			// member objects), regardless of whether THIS library is
+			// itself LTO-compiled — confirmed directly against a real
+			// meson+ninja build of Nix's own libutil
+			// (examples/nix-util). Must be skipped before the
+			// modifier string is located.
+			name: "leading --plugin pair is skipped", args: []string{"--plugin", "/nix/store/x/liblto_plugin.so", "csrD", "libnixutil.a", "prelink.o"},
+			wantMods: "csrD", wantArch: "libnixutil.a", wantInputs: []string{"prelink.o"}, wantOK: true,
+		},
+		{
+			// ar allows repeating --plugin; both occurrences must be
+			// stripped, not just the first.
+			name: "repeated --plugin pairs are all skipped", args: []string{"--plugin", "/a.so", "--plugin", "/b.so", "rcs", "libfoo.a", "a.o"},
+			wantMods: "rcs", wantArch: "libfoo.a", wantInputs: []string{"a.o"}, wantOK: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, a, in, ok := parseARArgs(tc.args)

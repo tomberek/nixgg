@@ -722,6 +722,12 @@ func TestOutSubdirAgreesWithInputSubdirFor(t *testing.T) {
 		// A shared library is a link output; bin/ is where the link drv
 		// puts whatever it was told to produce.
 		{KindLink, "libfoo.so"},
+		// meson's own `prelink: true` static-library convention: a LINK
+		// output (shim.Link's `g++ -r`) named with a `.o` extension,
+		// same "filename lies about Kind" shape as Kbuild's vmlinux.o —
+		// see ArtifactSubdir's own docstring for the real build
+		// (examples/nix-util) this was found against.
+		{KindLink, "nixutil-prelink.o"},
 	} {
 		producer := (&Derivation{Kind: tc.kind, OutName: tc.name}).outSubdir()
 		consumer := inputSubdirFor(tc.name)

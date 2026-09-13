@@ -74,35 +74,28 @@ func Write(l paths.Layout, id ID, expr string) (string, error) {
 }
 
 // LinkPlaceholder replaces `output` with a symlink pointing at the
-// thunk file. Creates the parent dir if missing. Also drops any stale
-// entry from the promoted registry — the shim is authoritative about
-// what a file is now, and a re-shim invalidates the last
-// "promoted from store" record for this path.
+// thunk file, creating the parent dir if missing.
 //
-// We also touch the thunk file's mtime to `now`, whether we just
-// wrote it or reused a byte-identical one. Reason: make follows
-// symlinks with stat(2), so `util.o (follow) = thunk-mtime`. If the
-// thunk mtime never changes — because our idempotent Write is a
-// no-op when the content matches — make would see .o's target mtime
-// as ancient, treat downstream targets (hello) as already
-// up-to-date relative to it, and skip the link step. Bumping the
-// thunk mtime tells make "yes, this output was just refreshed."
+// Also bumps the thunk file's mtime to now, even when Write reused a
+// byte-identical file. make follows symlinks with stat(2), so if the
+// thunk's mtime never changes, downstream targets look up-to-date
+// relative to it and make skips the step that should have re-run.
+//
+// Also drops any stale "promoted" registry entry for output: the shim
+// is authoritative about what a file is now, and a re-shim invalidates
+// the last "promoted from store" record for this path.
 func LinkPlaceholder(l paths.Layout, output, thunkPath string) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return err
 	}
-	// os.Symlink refuses to overwrite. Best-effort remove first —
-	// a stale target from a previous build is expected.
+	// os.Symlink refuses to overwrite; a stale target from a previous
+	// build is expected here.
 	_ = os.Remove(output)
 	if err := os.Symlink(thunkPath, output); err != nil {
 		return fmt.Errorf("symlink %s -> %s: %w", output, thunkPath, err)
 	}
-	// Refresh the thunk's mtime. See docstring above.
 	now := time.Now()
 	_ = os.Chtimes(thunkPath, now, now)
-	// Drop the promoted registry entry (if any). Any future classify
-	// on `output` will resolve the symlink and see it points at a
-	// thunk file — the correct answer.
 	if abs, err := filepath.Abs(output); err == nil {
 		_ = os.Remove(filepath.Join(l.Promoted, promotedKey(abs)))
 	}

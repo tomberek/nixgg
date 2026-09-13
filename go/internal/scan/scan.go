@@ -1,17 +1,9 @@
 // Package scan enumerates the header set for a compile invocation by
 // running `<cc> -MM -MG` and parsing the emitted makefile fragment.
 //
-// Results are cached under .nixgg/scans/<key>.{deps,out} where <key> is
-// sha256(compiler + source + flags). Cache is invalidated when any
-// file in the recorded dep list has an mtime newer than what we saw.
-//
-// Two callers of this package:
-//   - The compile shim: needs the header list + the "project root" (a
-//     common ancestor of cwd + every user-supplied -I dir) to stage
-//     sources; also needs the -I flags rewritten to be relative to
-//     that project root, and the store-prefixed -I flags kept verbatim.
-//   - The scan cache itself doesn't need to be exported, but the
-//     Result type is.
+// Results are cached under .nixgg/scans/<key>.{deps,out}, keyed by
+// sha256(compiler + source + flags); the cache is invalidated when any
+// recorded dep's mtime has changed.
 package scan
 
 import (
@@ -30,9 +22,9 @@ import (
 	"github.com/tbereknyei/nixgg/internal/paths"
 )
 
-// Header is a discovered dependency: `Abs` is the current on-disk
-// location, `Rel` is where it should appear inside the staging dir
-// (relative to the project root that Sources chose).
+// Header is a discovered dependency: Abs is its current on-disk
+// location, Rel is where it should land inside the staging dir
+// (relative to Result.ProjectRoot).
 type Header struct {
 	Abs, Rel string
 }
@@ -40,34 +32,24 @@ type Header struct {
 // Result is the full output of a scan.
 type Result struct {
 	Headers []Header
-	// ProjectRoot is the common ancestor of cwd + every user -I dir.
-	// The staging dir mirrors this — headers land at
-	//   $stagingDir/<rel-to-project-root>.
+	// ProjectRoot is the common ancestor of cwd and every user -I dir;
+	// the staging dir mirrors it, so headers land at
+	// $stagingDir/<rel-to-project-root>.
 	ProjectRoot string
-	// StagedIFlags are `-I<rel>` flags to be passed to gcc inside the
-	// sandbox, relative to the staged project root. Always includes
-	// "-I." so the source directory is on the include path.
+	// StagedIFlags are `-I<rel>` flags for gcc inside the sandbox,
+	// relative to the staged project root. Always includes "-I.".
 	StagedIFlags []string
-	// StoreIFlags are `-I/nix/store/...` flags passed verbatim (system
-	// dependencies from wrapper env).
+	// StoreIFlags are `-I/nix/store/...` flags passed through verbatim.
 	StoreIFlags []string
 	// StagedIncludeFlags are `-include <rel>` flags rewritten to point
-	// at the staged copy of each force-included header, relative to the
-	// staged project root. Emitted by rewriteFlags AFTER the -I flags so
-	// the header resolves against the staged tree.
-	//
-	// A force-included header that resolves outside projectRoot (a
-	// system or store path) is passed through verbatim instead — see
-	// the loop that builds this.
+	// at the staged copy of each force-included header. A force-include
+	// that resolves outside projectRoot is passed through verbatim.
 	StagedIncludeFlags []string
 }
 
-// Run scans a single compile invocation.
-//   - cc: absolute path to the compiler (matches TOOL — cc, gcc, c++, g++)
-//   - source: caller's source file (relative to cwd is fine)
-//   - flags: everything else on argv (no -c/-o).
-//
-// Uses the cache under l.Scans if all deps' mtimes match.
+// Run scans a single compile invocation (cc, source, and flags being
+// everything else on argv besides -c/-o), using the cache under
+// l.Scans if all deps' mtimes still match.
 func Run(l paths.Layout, cc, source string, flags []string) (*Result, error) {
 	if err := os.MkdirAll(l.Scans, 0o755); err != nil {
 		return nil, err
@@ -167,27 +149,18 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	includeDirs := extractIncludeDirs(flags)
 	forceIncludes := extractForceIncludes(flags)
 
-	// The project root is the common ancestor of cwd + the source
-	// dir + every non-store include dir. Include the source dir
-	// up-front so cmake-style out-of-tree builds — `cc -c ../src/x.cc`
-	// from a `build/` directory — get a projectRoot that contains
-	// the source. Without this, `filepath.Rel(cwd, srcAbs)` returns
-	// `../src/x.cc`, which then stages the file *outside* the tuID
-	// dir and produces a broken thunk that references a path with
-	// `..` in it. We widen for headers later too.
+	// Include the source dir up-front so out-of-tree builds (`cc -c
+	// ../src/x.cc` from a build/ dir) get a projectRoot containing the
+	// source — otherwise filepath.Rel(cwd, srcAbs) returns "../src/x.cc"
+	// and the file stages outside the tuID dir with a ".." path.
 	srcAbs, err := filepath.Abs(source)
 	if err != nil {
 		return nil, nil, err
 	}
-	// callerDirs = the caller's -I/-isystem/etc dirs. Emitted as
-	// -I<rel> flags for the drv.
-	// projectRootHints = every dir that projectRoot must cover, so
-	// srcAbs's dir + cwd are included even if the caller didn't ask
-	// for them via -I. Keeping the two lists separate is important:
-	// srcDir is a projectRoot hint but must NOT become a spurious -I,
-	// or ffmpeg's `-I. -Ilibavutil` (cwd=ffmpeg-root, srcDir=libavutil)
-	// gets a bogus `-Ilibavutil` that shadows glibc's <time.h> with
-	// ffmpeg's own libavutil/time.h.
+	// callerDirs must stay separate from projectRootHints: srcDir is a
+	// root hint but must NOT become a spurious -I, or ffmpeg's `-I.
+	// -Ilibavutil` (cwd=ffmpeg-root, srcDir=libavutil) leaks a bogus
+	// `-Ilibavutil` that shadows glibc's <time.h> with ffmpeg's own.
 	callerDirs := []string{}
 	projectRootHints := []string{cwd, filepath.Dir(srcAbs)}
 	storeDirs := []string{}
@@ -209,23 +182,11 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	// supply our own -MM -MG -MF -.
 	scanFlags := stripDepFlags(flags)
 
-	// -M (not -MM): gcc's own documented distinction is that -MM omits
-	// headers it classifies as "system headers" (anything gcc's own
-	// preprocessor internally flags 3/3-4 in -E output, e.g. `# 1
-	// "lib/stddef.h" 1 3 4`) — which is exactly the gnulib
-	// substitute-header trick: a directory ahead of gcc's own
-	// system-include search order supplies e.g. lib/stddef.h in place
-	// of the real one, and the preprocessor still marks the RESULT
-	// "system" because of *where* it was found, not how it was
-	// #include-d. -MM then silently drops it, staging a source tree
-	// missing that header — confirmed directly: `-MM -MG` omitted
-	// hello's own lib/stddef.h from closeout.c's dep list (though NOT
-	// from hello.c's — a different #include chain happened to avoid
-	// the system marking there), producing "implicit declaration of
-	// function 'gl_unreachable'" three build stages removed from the
-	// real cause. -M includes every header regardless of that
-	// classification; -MG (accept a missing header as a bare name
-	// rather than erroring) still applies.
+	// -M, not -MM: -MM omits headers gcc classifies as "system" by
+	// *where* they were found, which silently drops gnulib-style
+	// substitute headers (e.g. Linux's lib/stddef.h) from the dep list
+	// even though the TU needs them staged. -M has no such exclusion;
+	// -MG still tolerates a missing header as a bare name.
 	cmd := exec.Command(cc, append([]string{"-M", "-MG", "-MF", "-", source}, scanFlags...)...)
 	cmd.Stderr = nil // best-effort — we tolerate cc's warnings
 	out, err := cmd.Output()
@@ -239,26 +200,10 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	}
 	tokens := parseMakeDeps(out)
 
-	// Assembly sources (.s/.S) can reference arbitrary build-tree files
-	// via GNU as's `.incbin "path"` directive — Linux Kbuild's own
-	// arch/x86/realmode/rmpiggy.S does exactly this, embedding a
-	// previously-linked binary blob into a later object file. `.incbin`
-	// is processed by the ASSEMBLER, after preprocessing, so gcc's own
-	// `-M`/`-MM` (which only tracks what the PREPROCESSOR consumed —
-	// #include, not .incbin) never sees it: confirmed directly, `cc -M
-	// -MG` on a .S with an .incbin produces a dependency list that
-	// silently omits the incbin'd file entirely, no warning either way.
-	//
-	// The assembler itself DOES track this, via its own, separate
-	// `--MD=<path>` flag (binutils `as`'s own dependency-output option,
-	// unrelated to gcc's `-M` family) — confirmed directly against a
-	// real fixdep-adjacent case: `gcc -c foo.S -Wa,--MD=/dev/stdout -o
-	// /dev/null` lists the .incbin target in its dependency output
-	// alongside the source itself. Real compile (not just a probe): -o
-	// /dev/null and dep output to /dev/stdout both avoid leaving files
-	// behind, at the cost of a second real compile per assembly TU (a
-	// scan.go cache hit, same as the -M/-MG pass, avoids paying this on
-	// every rebuild).
+	// Assembly sources can reference files via GNU as's `.incbin`
+	// directive (e.g. Linux's rmpiggy.S), which runs after
+	// preprocessing so gcc's -M/-MM never sees it. as's own
+	// `--MD=<path>` does track it, but only via a real compile.
 	if isAssemblySource(source) {
 		incTokens, err := scanIncbinTargets(cc, source, scanFlags)
 		if err != nil {
@@ -320,15 +265,9 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 		storeFlags = append(storeFlags, "-I"+d)
 	}
 
-	// `-include <file>` rewritten to point at the staged copy. The file
-	// itself is already in `headers` (scan's -MM -MG saw it as a
-	// dependency), so it lands in the staging tree at its
-	// projectRoot-relative path; the flag has to follow it there.
-	//
-	// A force-include resolving to /nix/store or otherwise outside
-	// projectRoot isn't staged, so pass it through verbatim — the
-	// sandbox mounts store paths, and storedeps.From will pick up the
-	// reference from the flag text.
+	// `-include <file>` rewritten to point at the staged copy (the file
+	// is already in `headers`). A force-include outside projectRoot
+	// (e.g. /nix/store) isn't staged, so it's passed through verbatim.
 	var includeFlags []string
 	for _, f := range forceIncludes {
 		abs := f
@@ -358,26 +297,15 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	}, deps, nil
 }
 
-// stagedIFlags rewrites the caller's include dirs to be relative to the
-// staged project root, and is the sole producer of Result.StagedIFlags.
-//
-// Only `callerDirs` — dirs the caller actually passed via
-// -I/-isystem/-iquote/-idirafter — may become -I flags. cwd and the
-// source's own directory are deliberately NOT included: they are
-// projectRoot *hints* (see projectRootHints in runScanner) and nothing
-// more.
-//
-// Regression origin: those two lists used to be one. Compiling
-// ffmpeg's libavutil/parseutils.c from the ffmpeg root meant srcDir was
-// libavutil/, so it leaked out as a spurious `-Ilibavutil`. Inside the
-// drv (cwd = staged root) that resolved to $src/libavutil, whose own
-// time.h then shadowed glibc's <time.h> — because -I dirs are searched
-// before -isystem ones. Every TU reaching SmallVector-style code failed
-// with "'struct tm' has no member".
+// stagedIFlags rewrites callerDirs (the caller's -I/-isystem/-iquote/
+// -idirafter dirs) relative to the staged project root. cwd and the
+// source's own directory are deliberately excluded — they are
+// projectRoot hints only, not real -I flags: leaking srcDir out as an
+// -I (e.g. ffmpeg's libavutil/ from its root) can shadow a libc header
+// with a same-named project one, since -I is searched before -isystem.
 //
 // "-I." is always first so the staged root is on the include path.
-// Results are deduped by rel path, so a caller's `-I.` (== cwd == root)
-// or a repeated dir does not emit twice.
+// Results are deduped by rel path.
 func stagedIFlags(projectRoot string, callerDirs []string) []string {
 	iflags := []string{"-I."}
 	seenRel := map[string]bool{".": true}
@@ -409,14 +337,10 @@ func statOr(abs string) depEntry {
 	return depEntry{abs: abs, mtime: info.ModTime().UnixNano()}
 }
 
-// extractIncludeDirs walks flags and pulls out user-supplied include
-// paths from all the -I family (both attached and separated forms).
-// extractIncludeDirs walks flags and pulls out user-supplied include
-// DIRECTORIES. `-include` is deliberately absent from pathFlags: its
-// value is a FILE to force-include, not a directory to search. Treating
-// it as a dir emitted a bogus `-I<file>` (gcc: "not a directory") and,
-// worse, made rewriteFlags drop the `-include` entirely — silently
-// compiling with different preprocessor state. See extractForceIncludes.
+// extractIncludeDirs pulls user-supplied include DIRECTORIES from the
+// -I family (attached and separated forms). `-include` is deliberately
+// excluded: its value is a file to force-include, not a search dir —
+// see extractForceIncludes.
 func extractIncludeDirs(flags []string) []string {
 	var out []string
 	pathFlags := map[string]bool{
@@ -437,19 +361,11 @@ func extractIncludeDirs(flags []string) []string {
 	return out
 }
 
-// extractForceIncludes pulls out `-include <file>` values — headers the
-// caller wants prepended to the TU before its own text, the standard
-// autoconf/CMake way to inject a generated `config.h` full of
-// HAVE_XXX defines.
-//
-// These must survive into the drv. The header itself is already staged
-// (scan's own `gcc -MM -MG` reports it as a dependency like any other),
-// but the FLAG has to be re-emitted pointing at the staged copy, or the
-// TU compiles without those defines and the build succeeds with the
-// wrong preprocessor state and no diagnostic at all.
-//
-// Only the separated `-include <file>` form exists; gcc has no
-// `-include<file>` spelling, so there is no attached form to handle.
+// extractForceIncludes pulls out `-include <file>` values — headers
+// prepended to the TU before its own text (the autoconf/CMake way to
+// inject a generated config.h). The flag must be re-emitted pointing
+// at the staged copy, or the TU silently compiles with different
+// preprocessor defines and no diagnostic.
 func extractForceIncludes(flags []string) []string {
 	var out []string
 	for i := 0; i < len(flags); i++ {
@@ -479,29 +395,18 @@ func stripDepFlags(flags []string) []string {
 	return out
 }
 
-// isAssemblySource matches the .s/.S extensions the compile shim's own
-// isSource (go/internal/shim/compile.go) treats as assembly — kept as
-// a separate, narrower check here rather than importing that package,
-// since scan must not depend on shim (shim already depends on scan).
+// isAssemblySource matches the .s/.S extensions the compile shim's
+// isSource treats as assembly; duplicated here (not imported) since
+// shim already depends on scan.
 func isAssemblySource(source string) bool {
 	ext := filepath.Ext(source)
 	return ext == ".s" || ext == ".S"
 }
 
-// scanIncbinTargets runs a REAL compile of an assembly source with
-// `-Wa,--MD=<path>` (binutils as's own dependency-output flag, passed
-// through by gcc's driver the same way any other `-Wa,` option is) to
-// discover any `.incbin "path"` targets, returning them as raw
-// (unresolved) tokens in the same shape parseMakeDeps produces — the
-// caller resolves them identically to ordinary header tokens.
-//
-// A REAL compile, not a probe: unlike gcc's `-M -MG`, `as` has no
-// "-MG-equivalent" tolerant mode that accepts a missing dependency as
-// a bare name — an .incbin target that doesn't exist on disk is a
-// real assembler error either way, so there is no tolerant-scan
-// option to prefer here. -o /dev/null discards the object; the
-// caller's own real compile (deferred to a derivation, same as any
-// other TU) produces the object that actually matters.
+// scanIncbinTargets runs a real compile with `-Wa,--MD=<path>` (as's
+// dependency-output flag) to discover .incbin targets, since as has no
+// -MG-tolerant mode: a missing .incbin target is a hard assembler
+// error either way. -o /dev/null discards the object.
 func scanIncbinTargets(cc, source string, flags []string) ([]string, error) {
 	args := append([]string{"-c", source, "-o", "/dev/null", "-Wa,--MD=/dev/stdout"}, flags...)
 	cmd := exec.Command(cc, args...)

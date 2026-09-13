@@ -3,9 +3,7 @@ package cli
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -76,14 +74,10 @@ func cmdForce(args []string) error {
 	altPrefix := altStorePrefix(cfg.Store)
 
 	for _, target := range targets {
-		// A still-deferred batch member (see internal/shim's
-		// deferCompileToBatch) resolved individually here — a manual
-		// `nixgg force` on such a target doesn't go through
-		// classifyInputs' own fallback prologue (link/archive shims'
-		// chokepoint), so without this it would classify as Regular
-		// below ("not a nixgg symlink") and silently fail to
-		// accelerate, rather than resolving into the ordinary
-		// per-TU thunk/drv it would have been without batching.
+		// A still-deferred batch member (deferCompileToBatch, in
+		// internal/shim) skips classifyInputs' own fallback prologue
+		// when forced manually, so without this it would classify as
+		// Regular below and silently fail to accelerate.
 		if err := shim.ResolvePendingMember(cfg, l, target); err != nil {
 			return err
 		}
@@ -168,29 +162,6 @@ func findRootTargets(l paths.Layout) ([]string, error) {
 	return targets, nil
 }
 
-// nixBuildFile invokes `nix build --file <path>` against the configured
-// store and returns the resulting store path. Wraps the daemon call —
-// only used by tests / dev-mode single-thunk realise.
-func nixBuildFile(cfg *toolchain.Config, thunkPath string) (string, error) {
-	cmd := exec.Command(cfg.Nix, "build", "-L", "--no-link", "--print-out-paths", "--file", thunkPath)
-	cmd.Env = append(os.Environ(),
-		"NIX_REMOTE=",
-		"NIX_CONFIG=experimental-features = nix-command flakes ca-derivations\nstore = "+cfg.Store+"\n",
-	)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("nix build --file %s: %w", thunkPath, err)
-	}
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if lines[i] != "" {
-			return lines[i], nil
-		}
-	}
-	return "", fmt.Errorf("nix build produced no output")
-}
-
 // altStorePrefix returns the on-disk root for a `local?root=<path>`
 // store URL (empty string for the canonical /nix/store).
 func altStorePrefix(storeURL string) string {
@@ -200,6 +171,3 @@ func altStorePrefix(storeURL string) string {
 	}
 	return ""
 }
-
-// silence unused-import warnings when a helper drops out temporarily.
-var _ = io.EOF

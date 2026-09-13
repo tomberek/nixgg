@@ -52,24 +52,12 @@ func realToolFor(cfg *toolchain.Config, tool dispatch.Tool) string {
 // is what gets baked into the derivation's compile command, so
 // `cc -c foo.c` produces a "cc" invocation inside the sandbox, not g++.
 func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layout) error {
-	// Passthrough targets the sibling binary matching argv[0]:
-	// cc→cc/gcc (C mode), c++→c++/g++ (C++ mode). Using
-	// NIXGG_REAL_CC blindly would send `.c` compiles through g++,
-	// which cc-wrapper's line-30 self-check maps to C++ mode and
-	// breaks C-only build systems (redis's deps/hiredis: alloc.c
-	// under g++ fails `-std=c99` + designated-initializer parsing).
 	realTool := realToolFor(cfg, tool)
 	if bypassed() {
-		// No logf here: bypass mode exists for configure/cmake probes
-		// that capture stderr byte-for-byte (autoconf's
-		// ac_fn_c_check_header_preproc treats ANY non-empty stderr
-		// from `gcc -E` as a failed check, exit code notwithstanding).
-		// A "[nixgg] ..." diagnostic line here was silently flipping
-		// HAVE_LIMITS_H/HAVE_FCNTL_H/etc. to "no" for every libiberty
-		// probe even though gcc exited 0 — Passthrough's own contract
-		// is that stdin/stdout/stderr stay untouched; logging here
-		// broke that contract for exactly the callers that most need
-		// it honored.
+		// No logf here: configure/cmake probes (autoconf's
+		// ac_fn_c_check_header_preproc) treat ANY stderr output as a
+		// failed check regardless of exit code, so a "[nixgg] ..."
+		// line here silently flips HAVE_*_H results to "no".
 		return Passthrough(realTool, args)
 	}
 	source, output, depfile, flags, ok := parseCompileArgs(args)
@@ -82,68 +70,15 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		return Passthrough(realTool, args)
 	}
 
-	// Linux Kbuild's scripts/mod/empty.o: an empty TU compiled solely
-	// so mk_elfconfig can read its raw ELF header bytes off disk
-	// (`elfconfig.h: empty.o mk_elfconfig FORCE`) to detect the
-	// target's ELF class. Same PROBE shape as an autoconf conftest or
-	// cmake compiler-detection file — but unlike those, it isn't run
-	// under a configure-time NIXGG_BYPASS, so it reaches this shim on
-	// every normal `make vmlinux`/`make modules` invocation
-	// (hostprogs-always-y forces it every time).
-	//
-	// A plain Passthrough, not mode.Realise's synchronous-build
-	// carveout: this probe has no headers, no interesting flags, and
-	// nothing about it benefits from CA-hashing or caching (it reruns
-	// unconditionally regardless). mode.Realise's own `nix build
-	// --file` (needed for a REAL project's probe, which DOES need the
-	// sandboxed build's exact flags/headers to answer correctly) is
-	// also fundamentally incompatible with sandbox mode — the
-	// builder-rpc-v0 protocol has no "build this now and give me
-	// output" operation, only "register for later" — confirmed
-	// directly: this exact probe, routed through mode.Realise, failed
-	// inside a real sandboxed build with "no substituter" errors from
-	// a nested, network-isolated `nix build` that could never have
-	// worked there. Passthrough has no such problem: it's a plain
-	// `syscall.Exec`, identical in both modes, and correct here
-	// because this probe needs nothing from nixgg's own graph at all.
-	if isKbuildElfProbe(source) {
-		return Passthrough(realTool, args)
-	}
-
-	// Linux Kbuild's arch/x86/realmode/rm/{header,trampoline_32,
-	// trampoline_64,stack,reboot}.o: before realmode.elf even links,
-	// `scripts/Kbuild.include`'s own `cmd_pasyms` rule runs `nm`
-	// directly on these same objects to generate pasyms.h's physical-
-	// address symbol aliases — synchronous, same recipe, same "read
-	// the just-compiled TU's raw bytes back immediately" shape as
-	// scripts/mod/empty.o above. Confirmed directly against a real
-	// sandboxed build: routed through mode.Realise (as these were
-	// originally, see mode.go's own now-stale isKbuildRealmodeObj
-	// history), this hits the identical "no substituter" failure
-	// empty.o did — mode.Realise's `nix build --file` mechanism is
-	// incompatible with sandbox mode categorically, not just for that
-	// one probe. These objects have no headers worth CA-hashing either
-	// (tiny, hostprogs-always-y-style always-rebuilt .S sources), so
-	// Passthrough loses nothing here, same reasoning as isKbuildElfProbe.
-	if isKbuildRealmodeObj(source) {
-		return Passthrough(realTool, args)
-	}
-
-	// Linux Kbuild's arch/x86/entry/vdso/vdso32/{note,system_call,
-	// sigreturn,vclock_gettime,vgetcpu}.o: these are vdso32.so.dbg's
-	// OWN link inputs (arch/x86/entry/vdso/Makefile's vobjs32-y). Once
-	// isKbuildVDSODbg's own link carveout (mode.ForLink) turned out to
-	// share mode.Realise's sandbox-mode incompatibility, this compile-
-	// side fix became the one that actually matters: with these five
-	// objects Passthrough'd (real files, not nixgg thunks/drvrefs),
-	// vdso32.so.dbg's link falls to RealiseThunkArgsAndPassthrough's
-	// own Passthrough — a real, unshimmed `ld` producing real ELF
-	// bytes — the same emergent fix that already made realmode.elf's
-	// own link succeed once its sibling .o's got this same treatment,
-	// confirmed directly against a real sandboxed build. No separate
-	// link-side fix needed for vdso32.so.dbg once this compile-side
-	// one is in place.
-	if isKbuildVDSO32Obj(source) {
+	// Kbuild probes/objects that get read back synchronously in the
+	// same recipe (mk_elfconfig on empty.o, cmd_pasyms's `nm` on the
+	// realmode objects, vdso32.so.dbg's own link inputs). mode.Realise's
+	// `nix build --file` can't serve these under sandbox mode — the
+	// builder-rpc-v0 protocol only supports "register for later", not
+	// "build now and give me output" — so a plain Passthrough (real
+	// files on disk) is required here, confirmed against real sandboxed
+	// kernel builds.
+	if isKbuildElfProbe(source) || isKbuildRealmodeObj(source) || isKbuildVDSO32Obj(source) {
 		return Passthrough(realTool, args)
 	}
 
@@ -196,20 +131,15 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		return err
 	}
 
-	// Opt-in batch classification (see internal/batch's package
-	// docstring for the mechanism). Deferred to step 5 below, after
-	// mode.For(source) is known — a conftest/cmake-probe TU
-	// (mode.Realise) must never be deferred, since it needs a
-	// synchronous, real build right now.
+	// Opt-in batch classification, deferred until mode.For(source) is
+	// known below — a conftest/cmake-probe TU must never be deferred,
+	// it needs a synchronous real build now.
 	//
-	// Classify sees srcAbs (the TU's absolute path), NOT srcRel:
-	// srcRel is relative to scanResult.ProjectRoot, which is
-	// recomputed per compile call (see scan.go) and can collapse down
-	// to a TU's own directory when nothing widens it — confirmed
-	// directly against a real redis build, where compiling from
-	// inside deps/hiredis/ made srcRel just "sds.c", never matching
-	// "deps/**/*.c". Classify's own unanchored search only works if
-	// it's given the real, full path to search within.
+	// Classify on srcAbs, NOT srcRel: srcRel is relative to
+	// scanResult.ProjectRoot, which can collapse to just the TU's own
+	// directory when nothing widens it (e.g. compiling from inside
+	// redis's deps/hiredis/ makes srcRel just "sds.c", never matching
+	// "deps/**/*.c").
 	batchGroup, batched := cfg.BatchGroups.Classify(srcAbs)
 
 	entries := make([]stage.Entry, 0, 1+len(scanResult.Headers))
@@ -217,15 +147,12 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 	for _, h := range scanResult.Headers {
 		entries = append(entries, stage.Entry{Abs: h.Abs, Rel: h.Rel})
 	}
-	// The tu_id must uniquely identify this compile across the whole
-	// project so cross-directory calls with the same output basename
-	// (redis src/sds.o vs deps/hiredis/sds.o) don't collide on the
-	// staging dir. Feed TUID the output path *relative to the
-	// workspace root* — that captures the project-local ambiguity
-	// without leaking the absolute path prefix into the drv hash.
-	// Absolute prefixes differ between native (user's cwd) and
-	// sandbox (/build/work) mode even for identical source; the
-	// relative path is the same in both.
+	// tuID must be unique project-wide so same-basename outputs in
+	// different dirs (redis src/sds.o vs deps/hiredis/sds.o) don't
+	// collide on the staging dir. Keyed on the output path relative to
+	// the workspace root, not absolute — the absolute prefix differs
+	// between native (cwd) and sandbox (/build/work) mode for identical
+	// source, which would otherwise diverge the drv hash.
 	absOut, err := filepath.Abs(output)
 	if err != nil {
 		return err
@@ -283,11 +210,12 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 			srcTreeLiteral, sandboxFlags, storeDeps, wrapperEnv)
 	}
 
-	// Sandbox mode: submit a JSON drv directly to the outer daemon,
-	// symlink the output at the returned drv path. No .nix thunk on
-	// disk. Downstream link/archive shims will resolve this via
-	// classify.Drv and reference it in inputs.drvs.
-	if sandbox.Enabled() {
+	// Sandbox mode (or EagerDrv, its unrestricted-daemon variant —
+	// see sandbox.EagerDrv): submit a JSON drv directly to the daemon
+	// and symlink/stub the output at the returned drv path. No .nix
+	// thunk on disk; downstream link/archive shims resolve this via
+	// classify.Drv.
+	if sandbox.Enabled() || sandbox.EagerDrv() {
 		return compileSandbox(cfg, l, tool, tuID, filepath.Base(output), output, srcRel, sandboxFlags, storeDeps, wrapperEnvJSON)
 	}
 
@@ -326,21 +254,21 @@ func submitCompileThunk(l paths.Layout, e, output string) (thunkPath string, err
 // this compile, hand it to `nix derivation add`, symlink the output
 // at the returned drv path.
 //
-// The staged src tree lives at l.Srcs/<tuID> on disk. In sandbox
-// mode we still write it there (via stage.Sources earlier), then
-// upload it to the store via `nix store add --scan` so the resulting
-// store path is a self-contained input. See #14.
+// The staged src tree is uploaded via a plain (non-scanning) `nix
+// store add` so its store path matches native mode's plain Nix
+// path-literal import byte-for-byte (sandbox.StoreAddDirectory) — a
+// scanning add would pick up any /nix/store/... substring in staged
+// content as a NAR reference, diverging the store path from native
+// mode for identical bytes. See #14/ARCHITECTURE.md.
 func compileSandbox(
 	cfg *toolchain.Config, l paths.Layout,
 	tool dispatch.Tool, tuID, outName, output, srcRel string,
 	flags []string, storeDeps []string, wrapperEnvJSON string,
 ) error {
-	// Upload the staged src tree to the store. Use `tuID` as the
-	// store-path name so this matches what native mode produces when
-	// its .nix thunk gets instantiated — same content, same name,
-	// same store path, same drv hash. See ARCHITECTURE.md on drv
-	// equivalence between modes.
-	srcStore, err := sandbox.StoreAddScan(cfg, tuID, filepath.Join(l.Srcs, tuID))
+	// tuID as the store-path name matches what native mode's .nix
+	// thunk produces for the same content — same store path, same drv
+	// hash.
+	srcStore, err := sandbox.StoreAddDirectory(cfg, tuID, filepath.Join(l.Srcs, tuID))
 	if err != nil {
 		return fmt.Errorf("stage src to store: %w", err)
 	}
@@ -627,40 +555,20 @@ func rewriteFlags(caller, staged, store, forceInc []string) []string {
 }
 
 // realiseAndLink is the (rare) realise-mode carveout: build the thunk
-// synchronously via `nix build --file <tmp>.nix` and re-target output
-// at a real, writable copy of the result. Used for autoconf
-// conftests, cmake probes, and (via mode.ForLink, called from
-// link.go) Kbuild's own realmode.elf/vmlinux.o/vmlinux, whose build
-// reaches this same function through a link, not a compile.
+// synchronously via `nix build --file` and re-target output at a real,
+// writable copy of the result. Used for autoconf conftests, cmake
+// probes, and (via mode.ForLink, from link.go) Kbuild's own
+// realmode.elf/vmlinux.o/vmlinux.
 //
-// subdir is the caller's own knowledge of where its OWN Kind writes
-// this artifact (outSubdir()'s value) — NOT re-derived from output's
-// filename here. expr.ArtifactSubdir(name) guesses from the name's
-// suffix (".o" => flat, ".a" => lib, else => bin), which is right for
-// compile.go's own callers (always producing a genuine compile .o,
-// always flat) and right for realmode.elf/vdso32.so.dbg/modpost (none
-// end in .o/.a) — but WRONG for Kbuild's own vmlinux.o, a LINK output
-// that happens to be named like a compile one: guessing from the name
-// alone put every KindLink caller's own real bin/ placement at risk
-// of collision with compile.go's flat convention, confirmed directly
-// (`vmlinux.o` link: "expected .../vmlinux.o after build" — the real
-// file was at bin/vmlinux.o, ArtifactSubdir guessed flat). Passing the
-// subdir explicitly means each caller states what its OWN Kind
-// actually does, with no naming coincidence load-bearing.
+// subdir is the caller's own knowledge of where its Kind places this
+// artifact — NOT re-derived from output's name here, because
+// expr.ArtifactSubdir's name-based guess is wrong for vmlinux.o (a
+// LINK output that happens to be named like a compile one, so it
+// guesses flat instead of bin/).
 //
-// A real copy (via realise.PromoteToStoreSubdir), not a symlink: this
-// used to symlink output at the store path directly, which worked for
-// every carveout that's only ever READ back (realmode.elf, empty.o-
-// style probes) but broke Kbuild's own vmlinux — scripts/
-// link-vmlinux.sh's `sorttable vmlinux` opens the file for IN-PLACE
-// WRITING (rewriting sorted-table sections), and a symlink into the
-// read-only Nix store fails "Permission denied". Same fix
-// realise.Realise's own force-promotion already uses for the
-// identical reason (see PromoteToStore's own docstring on Nix's
-// pinned 1969 mtimes AND store-path read-only permissions) — applying
-// it uniformly here, not just for vmlinux, keeps every realise-mode
-// carveout on one code path rather than branching on which ones
-// happen to need write access today.
+// Copies the result rather than symlinking it: link-vmlinux.sh's
+// `sorttable` rewrites vmlinux in place, which fails "Permission
+// denied" through a symlink into the read-only store.
 func realiseAndLink(exprBody, output, subdir string, cfg *toolchain.Config, l paths.Layout) error {
 	// Write to a tempfile alongside the real thunks so relative-path
 	// imports resolve. Reuse the id-based path to keep the file if the
@@ -756,37 +664,18 @@ func isHeaderLang(lang string) bool {
 }
 
 // isKbuildElfProbe matches Linux Kbuild's scripts/mod/empty.o: an
-// empty TU compiled solely so mk_elfconfig can read its raw ELF
-// header bytes off disk (`elfconfig.h: empty.o mk_elfconfig FORCE` in
-// scripts/mod/Makefile) to detect the target's ELF class. See this
-// function's own call site in Compile for why it gets a plain
-// Passthrough rather than mode.Realise's synchronous-build carveout
-// (sandbox-mode incompatibility, and nothing here benefits from
-// nixgg's own graph anyway).
-//
-// Matched on the Kbuild-specific path suffix, not the bare basename
-// "empty.c"/"empty.o" — those are generic enough that an unrelated
-// project could legitimately name a real TU that, and this package's
-// own philosophy (matching mode.go's) is narrow, project-confirmed
-// patterns over broad guesses.
+// empty TU mk_elfconfig reads back to detect the target's ELF class.
+// Matched on the Kbuild-specific path suffix, not the bare basename —
+// "empty.c"/"empty.o" is generic enough a real project could name a
+// TU that.
 func isKbuildElfProbe(source string) bool {
 	return strings.HasSuffix(source, "scripts/mod/empty.c") ||
 		strings.HasSuffix(source, "scripts/mod/empty.o")
 }
 
-// isKbuildRealmodeObj matches Linux Kbuild's
+// isKbuildRealmodeObj matches Linux Kbuild's fixed
 // arch/x86/realmode/rm/{header,trampoline_32,trampoline_64,stack,
-// reboot}.o — the fixed member list `arch/x86/realmode/rm/Makefile`'s
-// own `realmode-y` builds (all `.S` sources). See this function's own
-// call site in Compile for why it gets a plain Passthrough rather
-// than mode.Realise's synchronous-build carveout (sandbox-mode
-// incompatibility, and nothing here benefits from nixgg's own graph
-// anyway — same reasoning as isKbuildElfProbe above).
-//
-// Matched on the fixed, Kbuild-specific path suffixes (not a directory
-// prefix + any object) since this is the exact, small member list
-// `realmode-y` names — narrower than a directory-wide match, same
-// philosophy as isKbuildElfProbe's own suffix match.
+// reboot}.o member list (arch/x86/realmode/rm/Makefile's realmode-y).
 func isKbuildRealmodeObj(source string) bool {
 	base := filepath.Base(source)
 	if !strings.Contains(source, "arch/x86/realmode/rm/") {
@@ -800,16 +689,12 @@ func isKbuildRealmodeObj(source string) bool {
 	return false
 }
 
-// isKbuildVDSO32Obj matches Linux Kbuild's arch/x86/entry/vdso/
-// vdso32/{note,system_call,sigreturn,vclock_gettime,vgetcpu}.o — the
-// fixed member list arch/x86/entry/vdso/Makefile's own `vobjs32-y`
-// builds. See this function's own call site in Compile for why it
-// gets a plain Passthrough (same sandbox-mode reasoning as
-// isKbuildElfProbe/isKbuildRealmodeObj above, plus the emergent fix
-// this gives vdso32.so.dbg's own link — see the call site).
-//
-// Matched on the fixed, Kbuild-specific member list under vdso32/,
-// same philosophy as isKbuildRealmodeObj's own fixed-member match.
+// isKbuildVDSO32Obj matches Linux Kbuild's fixed
+// arch/x86/entry/vdso/vdso32/{note,system_call,sigreturn,
+// vclock_gettime,vgetcpu}.o member list (vdso/Makefile's vobjs32-y) —
+// vdso32.so.dbg's own link inputs. Passthrough'ing these lets its
+// link fall to RealiseThunkArgsAndPassthrough's own passthrough with
+// real files on disk; no separate link-side fix needed.
 func isKbuildVDSO32Obj(source string) bool {
 	if !strings.Contains(source, "arch/x86/entry/vdso/vdso32/") {
 		return false
@@ -823,18 +708,13 @@ func isKbuildVDSO32Obj(source string) bool {
 	return false
 }
 
-// writeSynthesizedDepfile writes a genuine Makefile dependency rule
-// at depfile — `<output>: <source> <header1> <header2> ...` with
-// backslash line continuations — built from scan's own header list.
-//
-// This stands in for a real `-MD`/`-Wp,-MMD,...` compiler-produced
-// depfile so that a caller expecting one right after this shim
-// returns (Kbuild's `cmd_and_fixdep`, which invokes `fixdep` on it
-// synchronously, same recipe) finds a real file rather than failing
-// outright. Every path listed is real and on-disk (scan.Run only
-// ever resolves headers that exist), which is all a consumer like
-// fixdep requires — it doesn't distinguish a synthesized rule from
-// genuine compiler output.
+// writeSynthesizedDepfile writes a Makefile dependency rule at
+// depfile — `<output>: <source> <header1> <header2> ...` — built from
+// scan's own header list. Stands in for a real `-MD`-produced depfile
+// so Kbuild's synchronous `cmd_and_fixdep`/`fixdep` step (which runs
+// right after this shim returns, same recipe) finds a real file;
+// fixdep doesn't distinguish a synthesized rule from genuine compiler
+// output.
 func writeSynthesizedDepfile(depfile, output, source string, headers []scan.Header) error {
 	if err := os.MkdirAll(filepath.Dir(depfile), 0o755); err != nil {
 		return err

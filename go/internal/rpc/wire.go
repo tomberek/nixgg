@@ -36,10 +36,8 @@ func (w *wire) readUint64() (uint64, error) {
 	return binary.LittleEndian.Uint64(buf[:]), nil
 }
 
-// maxStringLen bounds a single string read. Nothing this client reads
-// (a store path, an error message, a NAR chunk's own length prefix is
-// read separately) should ever legitimately exceed this; it exists so
-// a protocol desync produces a clear error instead of an OOM attempt.
+// maxStringLen bounds a single string read so a protocol desync
+// produces a clear error instead of an OOM attempt.
 const maxStringLen = 256 * 1024 * 1024
 
 func (w *wire) writeString(s string) error {
@@ -107,10 +105,8 @@ func (w *wire) readStrings() ([]string, error) {
 }
 
 // writeFramed uploads data as a sequence of (len, bytes) frames
-// terminated by a zero-length frame — src/libutil FramedSink's own
-// wire shape. One frame is enough for anything nixgg uploads (a
-// derivation's ATerm text or one staged source tree's NAR dump); no
-// need to chunk.
+// terminated by a zero-length frame. One frame is enough for anything
+// nixgg uploads; no need to chunk.
 func (w *wire) writeFramed(data []byte) error {
 	if len(data) > 0 {
 		if err := w.writeUint64(uint64(len(data))); err != nil {
@@ -123,11 +119,8 @@ func (w *wire) writeFramed(data []byte) error {
 	return w.writeUint64(0)
 }
 
-// protoError mirrors src/libutil/serialise.cc's readError: the
-// structured error format daemons speak from protocol 1.26 onward
-// (every daemon this client talks to is >= 1.38). Deliberately not
-// "type string + level + name + msg" read ad hoc inline at each call
-// site — every op's STDERR_ERROR case needs the identical shape.
+// protoError is the structured error format daemons speak from
+// protocol 1.26 onward (type string + level + name + msg + trace).
 type protoError struct {
 	level int32
 	msg   string
@@ -199,10 +192,8 @@ func (w *wire) readProtoError() (*protoError, error) {
 
 // drainStderr reads STDERR_* messages until STDERR_LAST, discarding
 // logging/activity noise, and returns the daemon error if one arrived.
-// Every op in this package is request/response (no interactive
-// STDERR_READ/STDERR_WRITE payload exchange — those are for
-// recursive-nix builder callbacks, which nixgg's shims never trigger),
-// so unlike src/libstore's own processStderr this never needs a sink.
+// No STDERR_READ/STDERR_WRITE handling: those are for recursive-nix
+// builder callbacks, which nixgg's shims never trigger.
 func (w *wire) drainStderr() error {
 	for {
 		msg, err := w.readUint64()

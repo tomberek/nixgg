@@ -173,29 +173,17 @@ func listAllRelFiles(root string) ([]string, error) {
 }
 
 // hardlinkOrCopy tries os.Link first, falls back to a byte copy if the
-// filesystems differ (EXDEV) or hardlinks are otherwise forbidden.
-// We intentionally do NOT chmod the result — it's hardlinked to the
+// filesystems differ (EXDEV) or hardlinks are otherwise forbidden. We
+// intentionally do NOT chmod the result — it's hardlinked to the
 // original, so mode changes would affect the working tree.
 //
-// src is resolved through any symlink chain first (filepath.
-// EvalSymlinks) — the destination always ends up a real regular
-// file, never a symlink. A staged symlink's relative target text is
-// only correct from its ORIGINAL absolute location; once staged
-// under a project root at a different depth than the original (a
-// narrower root is common — the scanner's own projectRoot is the
-// common ancestor of cwd + -I dirs, not necessarily the repo root),
-// that same text resolves to a path the staged tree never contains.
-// Confirmed directly building PostgreSQL's src/backend: `./configure`
-// creates `src/include/pg_config_os.h -> ../../src/include/port/
-// linux.h`; staged under a narrower root, the compile failed with a
-// plain "No such file or directory" on the header, because the
-// symlink's TARGET was never staged as its own entry (the scanner
-// only ever recorded the symlink's own path as a dependency). Since
-// the compiler only needs real byte content at the header's expected
-// path — never the symlink itself as a filesystem object — resolving
-// to the real file up front sidesteps needing the scanner to also
-// discover and stage the target separately, and needs no change
-// there at all.
+// src is resolved through any symlink chain first, so the destination
+// is always a real regular file. A staged symlink's relative target
+// text is only correct from its original location; staged under a
+// narrower project root, the same text can point outside the staged
+// tree (confirmed on PostgreSQL: pg_config_os.h -> ../../src/include/
+// port/linux.h fails "No such file or directory" once staged, because
+// the scanner only records the symlink's own path, not its target).
 func hardlinkOrCopy(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err

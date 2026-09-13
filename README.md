@@ -8,7 +8,7 @@ Turn each invocation into a content-addressed Nix derivation. Nix
 decides what's cached and what needs building — nixgg just
 constructs the expressions.
 
-Two modes for producing derivations, same drv-hashes either way:
+Three modes for producing derivations, same drv-hashes either way:
 
 - **Native** — shims write `.nix` thunk files on disk, one `nix build`
   at the end. Works with any recent Nix daemon.
@@ -17,6 +17,13 @@ Two modes for producing derivations, same drv-hashes either way:
   derivation's output. `nix build .#hello` Just Works, and so does
   `nix run .#hello` — the flake exposes a real derivation, not just
   a resolvable string.
+- **Eager drv** (`NIXGG_EAGER_DRV=1`) — sandbox mode's own drv-emission
+  path (`nix derivation add`, immediately, per shim call), but from an
+  ordinary, unrestricted daemon connection instead of inside a live
+  sandbox. Each output is a real symlink straight to its `/nix/store/
+  …-<name>.drv` — inspect it with `nix derivation show` on the spot,
+  no `nix build`/`nix eval` round trip needed first. Opt-in, off by
+  default: see "Same drv, three ways to look at it" below.
 
 ## Try it
 
@@ -35,6 +42,17 @@ nix build .#hello
 # or just:
 nix run .#hello
 
+# 3b. Eager drv: same source, one more time — no sandbox, real .drv
+#     symlinks you can inspect immediately.
+cd example && make clean
+export NIXGG_EAGER_DRV=1
+make
+readlink hello
+# -> /nix/store/nnqm05dmf86frhbl0mp36gk8z3405i9k-nixgg-hello-hello.drv
+nix derivation show "$(readlink hello)"   # a real drv, right now
+nix build --no-link --print-out-paths "$(readlink hello)^out"
+unset NIXGG_EAGER_DRV
+
 # 4. Real projects, sandbox mode, out-of-tree sources pinned in flake.lock.
 nix build .#lua         # lua 5.4.7 — 32 TUs, 1 archive, 1 link
 nix build .#fmt         # {fmt} 11.0.2 — cmake + ninja + libfmt.a
@@ -43,14 +61,35 @@ nix build .#postgresql  # postgresql 17.2 — src/backend only, autoconf + recur
 nix build .#qemu        # qemu 9.2.0 — meson + ninja, ~1700 steps, thin (`ar T`) archives
 ```
 
-Both modes produce byte-identical `.drv` files, by construction: the
-build command is rendered once, in Go, and sandbox mode bakes it into
-a JSON drv while native mode passes the same text through a thunk for
-`nix/resolve-script.nix` to fill in the few values only Nix knows at
-eval time. `nix build .#lua` gets an instant cache hit from an earlier
-native build in an extracted lua source tree, and vice versa — see
-ARCHITECTURE.md's "Corollary: dev-shell and pure-build derivations are
-interchangeable" for the mechanism and a directly-measured example.
+### Same drv, three ways to look at it
+
+All three modes above build `example/hello`'s link step into the
+EXACT same derivation — confirmed directly, not just asserted:
+`nixgg-hello-hello.drv`, byte-identical `args`/`env`/`inputs.drvs`,
+regardless of which mode produced it. What differs is only how the
+caller-visible `hello` path represents "not built yet, but here's
+what will build it":
+
+| Mode | `hello` on disk, before realizing | How to see the real drv |
+|---|---|---|
+| Native (default) | symlink → a `.nix` thunk file | `nix eval --impure --file <thunk> drvPath` |
+| Sandbox (`nix build .#hello`) | a small stub file (magic header + drv path) — never a symlink, since `builder-rpc-v0` doesn't materialise `.drv` files into the live sandbox | read the stub, or just let `.#hello`'s own `builtins.outputOf` resolve it |
+| Eager drv (`NIXGG_EAGER_DRV=1`) | symlink → the real `/nix/store/…-hello.drv`, already registered | `nix derivation show "$(readlink hello)"` — no round trip |
+
+Eager drv exists for exactly this: inspecting the dynamic-derivation
+graph a real build produces without a sandbox, an `outputOf` walk, or
+a thunk-eval hop in the way — same drvs, most direct path to them. See
+ARCHITECTURE.md's "Flow: EagerDrv mode" for the mechanism.
+
+All three stay byte-identical by construction, not by coincidence: the
+build command is rendered once, in Go, and every mode bakes that same
+text into a JSON drv (sandbox and eager drv directly; native through a
+thunk for `nix/resolve-script.nix` to fill in the few values only Nix
+knows at eval time). `nix build .#lua` gets an instant cache hit from
+an earlier native build in an extracted lua source tree, and vice
+versa — see ARCHITECTURE.md's "Corollary: dev-shell and pure-build
+derivations are interchangeable" for the mechanism and a directly-
+measured example.
 
 Several tests, covering different failure modes:
 

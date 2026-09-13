@@ -21,29 +21,17 @@ import (
 // every one of ar's own inputs is a still-pending member of the SAME
 // batch group (see deferCompileToBatch), it combines all of them plus
 // this archive step into ONE derivation instead of N+1. Runs BEFORE
-// classifyInputs, so on any failure to qualify — a foreign/regular
-// input, a mismatched group, or (sandbox mode) this archive being the
-// build's own submission target — nothing has been touched yet, and
-// Archive's own unmodified classifyInputs path runs exactly as if
-// tryBatchArchive didn't exist, resolving each pending member
-// individually via its own fallback prologue.
+// classifyInputs, so on any failure to qualify, nothing has been
+// touched yet and Archive's normal path runs as if this didn't exist.
 //
-// handled=false (with a nil error) means "did not apply, fall
-// through to Archive's normal path" — the ONLY other case that
-// matters for correctness. handled=true always carries either a
-// non-nil error (a real failure — submitting the combined
-// derivation, for instance) or nil (fully submitted).
+// handled=false (nil error) means "fall through to Archive's normal
+// path". handled=true carries either a real error or nil (submitted).
 func tryBatchArchive(cfg *toolchain.Config, l paths.Layout, archive, modifiers string, inputs []string) (handled bool, err error) {
 	// Never batch the archive that IS this build's own submission
-	// target: submit-output's own naming contract requires the
-	// submitted drv's own name to match outputPathName($name,
-	// outputKey) exactly (see storeinput.go's multiTargetName
-	// docstring) — a "batch-"-named drv here would violate that and
-	// fail the build. See go/internal/batch's own package docstring /
-	// this feature's design notes for why this is a known, narrow
-	// gap: whichever archive happens to be one of the build's own
-	// targets never benefits from batching, for a reason unrelated to
-	// its own group membership.
+	// target: submit-output requires the drv's name to match
+	// outputPathName($name, outputKey) exactly, and a "batch-"-named
+	// drv would violate that. Known gap: such an archive never
+	// benefits from batching regardless of group membership.
 	if sandbox.Enabled() && targetOutputKey(archive) != "" {
 		return false, nil
 	}
@@ -56,11 +44,9 @@ func tryBatchArchive(cfg *toolchain.Config, l paths.Layout, archive, modifiers s
 	return true, submitCombinedArchive(cfg, l, archive, modifiers, members)
 }
 
-// collectSameGroupMembers reads every input's batch-pending record,
-// in ar's own argv order, and reports ok=false the moment ANY input
-// isn't a pending member at all, or belongs to a different group than
-// the first — either case means this archive isn't a pure same-group
-// batch, and the caller must fall through to per-input resolution.
+// collectSameGroupMembers reads every input's batch-pending record, in
+// argv order, and reports ok=false the moment any input isn't a
+// pending member or belongs to a different group than the first.
 func collectSameGroupMembers(inputs []string) (members []batchmember.MemberRecord, ok bool) {
 	if len(inputs) == 0 {
 		return nil, false
@@ -87,21 +73,17 @@ func collectSameGroupMembers(inputs []string) (members []batchmember.MemberRecor
 }
 
 // submitCombinedArchive builds and submits the combined derivation
-// covering every member's compile plus this archive step, then
-// reuses the EXACT SAME post-build calls Archive's own non-batched
-// path already makes for its output — so the resulting archive
-// classifies downstream (via classify.Target) as an ordinary
-// Thunk/Drv, identical to any other archive's output. Nothing in
-// link.go needs to know this archive was ever batched.
+// covering every member's compile plus this archive step, then reuses
+// the same post-build calls Archive's non-batched path makes for its
+// output, so downstream classification treats it as an ordinary
+// Thunk/Drv regardless of batching.
 func submitCombinedArchive(cfg *toolchain.Config, l paths.Layout, archive, modifiers string, members []batchmember.MemberRecord) error {
 	outName := filepath.Base(archive)
 	members = disambiguateOutNames(members)
 
-	// Wrapper env is computed fresh, once, here — not reconciled from
-	// each member's own snapshot. They should always agree (one
-	// ambient build-wide env); a single authoritative computation
-	// avoids ever needing to detect/merge a disagreement. Matches
-	// Archive's own non-batched path, which does the same.
+	// Computed fresh here rather than reconciled from each member's
+	// own snapshot: all members share one ambient build-wide env, so
+	// there's nothing to merge.
 	wrapperEnvJSON, err := wrapperenv.JSON()
 	if err != nil {
 		return err
@@ -111,13 +93,9 @@ func submitCombinedArchive(cfg *toolchain.Config, l paths.Layout, archive, modif
 		return err
 	}
 
-	// Union of every member's own StoreDeps plus the archive's own —
-	// same computation Archive's non-batched path makes for its own
-	// StoreDeps, unioned across members since the combined derivation
-	// is one set of inputs.srcs for all of them together.
 	storeDeps := unionStoreDeps(members, storedeps.From(nil, wrapperEnvJSON, cfg.KnownStorePaths))
 
-	if sandbox.Enabled() {
+	if sandbox.Enabled() || sandbox.EagerDrv() {
 		return submitCombinedArchiveSandbox(cfg, archive, outName, modifiers, members, storeDeps, wrapperEnv)
 	}
 	return submitCombinedArchiveNative(cfg, l, archive, outName, modifiers, members, storeDeps, wrapperEnv)
@@ -126,32 +104,22 @@ func submitCombinedArchive(cfg *toolchain.Config, l paths.Layout, archive, modif
 // disambiguateOutNames renames any member whose OutName collides with
 // an earlier member's own — same basename, different subdirectory
 // (e.g. libavutil/cpu.c and libavutil/x86/cpu.c both compiling to
-// "cpu.o") is a real, common shape in C projects with per-arch/per-
-// backend variant files, not a hypothetical.
+// "cpu.o"), which is common in C projects with per-arch/per-backend
+// variant files.
 //
 // batchArchiveScript writes every member's compiled object into ONE
-// shared "$objroot" directory, keyed only by OutName (see
-// go/internal/expr/batcharchive.go's memberCompileLine/
-// batchArchiveScript) — unlike nixgg's ordinary per-TU path, where
-// each compile gets its own store output and a name collision is
-// impossible by construction. Without this, a later member's object
-// silently overwrites an earlier one's before `ar` ever runs: no
-// build error, just an archive quietly missing one implementation.
-// Confirmed directly against a real ffmpeg build — batching
-// libavutil this way dropped libavutil/x86/cpu.c's object, and the
-// final link failed with "undefined reference to `av_get_cpu_flags'"
-// (defined only in the x86 variant); batching libswscale "succeeded"
-// but `ar t` showed swscale.o/rgb2rgb.o/yuv2rgb.o each listed twice —
-// silently missing their own plain (non-x86) implementations.
+// shared "$objroot" directory keyed only by OutName, so a name
+// collision silently overwrites an earlier member's object before
+// `ar` ever runs — no build error, just a quietly incomplete archive.
+// Confirmed against a real ffmpeg build: batching libavutil this way
+// dropped libavutil/x86/cpu.c's object, breaking the final link with
+// "undefined reference to `av_get_cpu_flags'".
 //
-// Renaming is order-stable and deterministic: the FIRST member to use
-// a basename keeps it; every subsequent collision gets "-2", "-3", ...
-// inserted before the extension (cpu.o, cpu-2.o, cpu-3.o, ...). This
-// changes the resulting archive's own member names relative to the
-// per-TU (unbatched) path — expected and harmless, since nothing
-// downstream of the archive (the link step, any consumer) looks up an
-// object by name inside it; `ar`/the linker only care about the
-// symbols each member defines, which this fix is what makes correct.
+// Renaming is order-stable: the first member to use a basename keeps
+// it, later collisions get "-2", "-3", ... before the extension. This
+// changes the archive's own member names relative to the unbatched
+// path, which is harmless since nothing downstream looks up an object
+// by name inside the archive.
 func disambiguateOutNames(members []batchmember.MemberRecord) []batchmember.MemberRecord {
 	seen := make(map[string]int, len(members))
 	out := make([]batchmember.MemberRecord, len(members))
@@ -281,12 +249,10 @@ func submitCombinedArchiveSandbox(cfg *toolchain.Config, archive, outName, modif
 		"archive": archive, "drv": drvPath, "members": len(members),
 	})
 
-	// See maybeSubmit's own comment — an archive only submits when
-	// NIXGG_SANDBOX_TARGET names it explicitly (a static-lib-only
-	// build). tryBatchArchive already refused to batch the actual
-	// target archive, so defaultSubmit=false here is never reached
-	// via a mismatched-but-still-target path — this mirrors
-	// archiveSandbox's own call exactly for defensiveness.
+	// See maybeSubmit's own comment: an archive only submits when
+	// NIXGG_SANDBOX_TARGET names it explicitly. tryBatchArchive already
+	// refused to batch the actual target archive, so defaultSubmit=false
+	// mirrors archiveSandbox's call for defensiveness only.
 	maybeSubmit(cfg, drvPath, archive, false)
 	return nil
 }

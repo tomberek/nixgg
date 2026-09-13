@@ -123,6 +123,30 @@ fi
 if [[ -z "${ONLY:-}" || "$ONLY" == "gcc" ]]; then
   run_fixture "gcc" "gcc-src" "" || fail=1
 fi
+# linux-kernel is two-phase (phase1 = mkNixggBuild, phase2 = a plain
+# stdenv.mkDerivation with zero nixgg shims — nothing for this check
+# to compare there). Only phase1 fits run_fixture's single-src,
+# single-mkNixggBuild-call shape, exposed at the top-level attr
+# "linux-kernel-phase1"/"linux-kernel-phase1-shell" (flake.nix's own
+# "Extras" block) the same way llvm's own tblgen phases are. Not in
+# the default set — real linux-6.12 source, ~2800 real compiles
+# natively, several minutes even on a warm cache; opt in via
+# ONLY=linux-kernel-phase1.
+if [[ "${ONLY:-}" == "linux-kernel-phase1" ]]; then
+  run_fixture "linux-kernel-phase1" "linux-src" "" || fail=1
+fi
+# nix-full builds ALL of Nix itself (24 real Meson subprojects/
+# targets, ~700 TUs) from the nix-15793 flake input — real, but far
+# too slow for the default set (many minutes even warm). "nix-15793"
+# resolves via equiv_resolve_native_src's generic non-"example" branch
+# exactly like lua-src/fmt-src/gcc-src do: `builtins.fetchTree` on a
+# locked GitHub node fetches only that node's own tree, never chasing
+# the flake's OWN sub-inputs (nixpkgs, flake-parts, etc.) — confirmed
+# directly, same call other fixtures already make. Opt in via
+# ONLY=nix-full.
+if [[ "${ONLY:-}" == "nix-full" ]]; then
+  run_fixture "nix-full" "nix-15793" "" || fail=1
+fi
 
 echo
 if (( fail )); then

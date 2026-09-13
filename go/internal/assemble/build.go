@@ -29,20 +29,11 @@ type BuildParams struct {
 // (expr.ArtifactSubdir, keyed on the stub's basename): flat for a .o,
 // lib/ for a .a, bin/ for anything else.
 //
-// The script text goes into Env["buildScript"] + passAsFile, not
-// Args, once there are enough stubs: a large build (openssl: 2230
-// stubs) makes a `cp -a <placeholder> "$out/<relpath>"` line per
-// stub, and passing the resulting multi-hundred-KB string as
-// `args = ["-c", script]` makes exec's own argv+envp block exceed the
-// kernel's ARG_MAX — confirmed directly ("Argument list too long").
-// passAsFile is a core Nix mechanism for exactly this (see the Nix
-// manual's "advanced attributes"): it writes an env var's value —
-// with any CA output placeholders inside it substituted exactly as
-// they would be anywhere else in the derivation — to a file at build
-// time and exposes that file's path via `${name}Path`, instead of
-// ever putting the value on the builder's argv. Args itself now
-// carries only a short, fixed `source "$buildScriptPath"` regardless
-// of stub count.
+// The script goes into Env["buildScript"] + passAsFile rather than
+// Args: a large build (openssl: 2230 stubs) makes a multi-hundred-KB
+// script, and passing that via `args = ["-c", script]` overflows
+// ARG_MAX ("Argument list too long"). Args itself stays a fixed-size
+// `source "$buildScriptPath"` regardless of stub count.
 func Build(p BuildParams) expr.JSONDrv {
 	drvs := map[string]expr.JSONDrvRef{}
 	srcs := []string{expr.StoreBasename(p.Bash), expr.StoreBasename(p.Coreutils), p.TreeSrc}

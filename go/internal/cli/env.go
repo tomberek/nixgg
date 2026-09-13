@@ -6,35 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
-// cmdEnv prints shell `export` lines that a caller can `eval` to fully
-// bootstrap nixgg from a plain shell:
-//
-//	eval "$(/path/to/nixgg/bin/nixgg env)"
-//	cd my-project && nixgg build --target foo -- make
-//
-// What's set:
-//   - NIXGG_ROOT and PATH prepended with shims/ (so make → cc → us).
-//   - NIXGG_REAL_CC, NIXGG_NIX, NIXGG_NIX_HELPERS, NIXGG_COMPILER_ROOT,
-//     NIXGG_BASH_ROOT, NIXGG_COREUTILS_ROOT — the toolchain roots that
-//     every shim needs. Bootstrapped from the flake's `env-shell` output
-//     if not already set (idempotent — respects env if you sourced
-//     env-shell yourself).
-//   - NIXGG_STORE (default `local?root=/tmp/nixgg-store`, override with
-//     $NIXGG_STORE or --store).
-//   - CC=cc, CXX=c++ (so recipes that consult $CC find our shims by
-//     the argv[0] name we understand).
-//
-// Flags:
-//
-//	--store <url>       override the default alt store URL
-//	--print-only        don't try to bootstrap missing vars via nix build
-//
-// The intended use is `eval $(nixgg env)` from your shell, or sourcing
-// the printed lines into a script — everything a wrapper like lua.sh
-// would set up manually.
+// cmdEnv prints shell `export` lines that bootstrap nixgg: NIXGG_ROOT
+// and PATH (shims/ prepended), the NIXGG_* toolchain roots (from the
+// flake's env-shell if not already set), NIXGG_STORE, and CC/CXX.
+// Intended use: `eval "$(nixgg env)"`.
 func cmdEnv(args []string) error {
 	var (
 		storeOverride string
@@ -95,13 +74,9 @@ what it already knows and errors out if anything's missing.
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()
 	fmt.Fprintf(w, "export NIXGG_ROOT=%s\n", shellQuote(root))
-	// PATH order matters — first entries win:
-	//  1. bin/    — for the `nixgg` CLI itself
-	//  2. shims/  — for `cc`, `gcc`, `c++`, `g++`, `ar`, `ranlib`, `ld`
-	//  3. toolchain bins from env-shell — real `ar`, `nm`, `strings`
-	//     etc that aren't shimmed. Also gnumake+coreutils, so a plain
-	//     `nixgg env` from an empty shell is enough to run `make`.
-	//  4. the caller's existing $PATH
+	// PATH order matters (first entry wins): bin/ (nixgg CLI), shims/
+	// (cc/gcc/c++/g++/ar/ranlib/ld), then toolchain bins (unshimmed
+	// tools + gnumake/coreutils so plain `make` works), then $PATH.
 	bin := filepath.Join(root, "bin")
 	toolchainBins := toolchainBinDirs(env)
 	pathParts := []string{shellQuote(bin), shellQuote(shims)}
@@ -117,7 +92,7 @@ what it already knows and errors out if anything's missing.
 	for k := range env {
 		keys = append(keys, k)
 	}
-	sortStrings(keys)
+	sort.Strings(keys)
 	for _, k := range keys {
 		fmt.Fprintf(w, "export %s=%s\n", k, shellQuote(env[k]))
 	}
@@ -156,9 +131,7 @@ func loadToolchainEnv(root string, printOnly bool) (map[string]string, error) {
 		return nil, fmt.Errorf("missing env: %v (run without --print-only to bootstrap from flake)", missing)
 	}
 
-	// Bootstrap. Locate the flake next to us; run
-	//   nix build <flake>#env-shell --no-link --print-out-paths
-	// then parse the resulting shell fragment.
+	// Bootstrap: nix build <flake>#env-shell and parse its export lines.
 	flake, err := findFlake(root)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap: %w", err)
@@ -322,15 +295,4 @@ func toolchainBinDirs(env map[string]string) []string {
 	// lookups. We don't actively need it on PATH.
 	add(env["NIXGG_BASH_ROOT"])
 	return out
-}
-
-// sortStrings is a tiny wrapper we keep local to avoid importing "sort"
-// twice (main.go, force.go, this file). Not performance-critical.
-func sortStrings(xs []string) {
-	// insertion sort; slices are tiny (<20 entries).
-	for i := 1; i < len(xs); i++ {
-		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
-			xs[j-1], xs[j] = xs[j], xs[j-1]
-		}
-	}
 }

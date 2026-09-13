@@ -50,9 +50,8 @@ func (t Tool) Basename() string {
 	return ""
 }
 
-// FromArgv0 classifies argv[0] (usually a symlink name like "cc"). We
-// look at the file basename, not the target of the symlink.
-// FromArgv0 classifies the tool role from the name we were invoked as.
+// FromArgv0 classifies the tool role from argv[0] (the basename of a
+// symlink like "cc", not its target).
 //
 // Beyond the six canonical names, real build systems invoke compilers
 // under target-triple and version decorations:
@@ -69,13 +68,13 @@ func (t Tool) Basename() string {
 //
 // Widening the INPUT side cannot change derivation content: every
 // accepted spelling maps onto one of the six roles, and Tool.Basename()
-// — which is what the drv's compile command invokes — returns one of the
-// same six canonical strings it always did. `gcc-15` is dispatched as
+// — what the drv's compile command invokes — returns one of the same
+// six canonical strings it always did. `gcc-15` is dispatched as
 // ToolGCC and the drv still says "gcc", so the sandbox resolves the
-// pinned compiler rather than the caller's versioned one. That is
-// deliberate: the drv must name a tool that exists inside it.
+// pinned compiler rather than the caller's versioned one; the drv must
+// name a tool that exists inside it.
 //
-// clang/clang++ map onto the gcc/g++ roles for the same reason. nixgg
+// clang/clang++ map onto the gcc/g++ roles for the same reason: nixgg
 // pins its own compiler, so the role only selects C vs C++ mode.
 func FromArgv0(argv0 string) Tool {
 	base := filepath.Base(argv0)
@@ -128,17 +127,8 @@ func stripVersionSuffix(base string) string {
 	return base[:i]
 }
 
-// Action is what a compiler-family shim decides to do based on argv.
-type Action int
-
-const (
-	ActionCompile Action = iota // has -c
-	ActionLink                  // no -c, produces an executable/shared lib
-)
-
-// IsCompile returns true iff argv contains -c (or -E/-S which we treat
-// as passthrough, but the shim never gets called for those in practice
-// since they're rare and we can leave passthrough logic to each driver).
+// IsCompile returns true iff argv contains -c. (-E/-S are treated as
+// passthrough; the shim doesn't get called for those in practice.)
 func IsCompile(argv []string) bool {
 	for _, a := range argv {
 		if a == "-c" {
@@ -203,27 +193,17 @@ func readRspfile(path string) ([]string, error) {
 }
 
 // splitRspLine tokenises one response-file line: whitespace separates
-// arguments, but not inside quotes.
-//
-// This used to be `strings.Fields` followed by a per-token unquote, which
-// is the wrong order. A quoted argument containing a space — which is the
-// only reason to quote in the first place — was split at that space
-// before unquoting ever ran, so
-//
-//	"-DGREETING=hello world"
-//
-// became the two argv entries `"-DGREETING=hello` and `world"`, each
-// carrying a stray quote character. cmake and ninja emit exactly this
-// shape for defines with spaces, and ExpandRspfiles runs on every shim
-// invocation, so the flag reached the compiler corrupted.
+// arguments, but not inside quotes. Splitting on whitespace first and
+// unquoting per-token afterward (e.g. via strings.Fields) breaks on
+// `"-DGREETING=hello world"`, which cmake/ninja emit for defines
+// containing spaces — the space inside the quotes would already have
+// split the token before unquoting ran.
 //
 // Both quote styles are handled, and a quote can open mid-token
-// (`-DX="a b"`) as the drivers allow. A backslash escapes the next
-// character inside double quotes only — matching GCC's documented
-// behaviour, where single quotes are literal throughout. An unterminated
-// quote yields what has accumulated rather than an error: the compiler
-// would reject the flag anyway, and failing here would turn a bad flag
-// into a nixgg crash.
+// (`-DX="a b"`). A backslash escapes the next character inside double
+// quotes only, matching GCC's behavior (single quotes are literal
+// throughout). An unterminated quote yields what has accumulated
+// rather than erroring — the compiler would reject the flag anyway.
 func splitRspLine(line string) []string {
 	var (
 		out   []string

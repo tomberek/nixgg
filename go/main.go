@@ -50,18 +50,12 @@ func run() error {
 	case dispatch.ToolAR:
 		return shim.Archive(args, cfg, l)
 	case dispatch.ToolLD:
-		// Raw `ld` (Kbuild's cmd_ld: `$(LD) $(ld_flags) $(real-prereqs)
-		// -o $@`) is always link-shaped — there's no compile mode to
-		// dispatch on the way cc/g++ have. Link's own parser already
-		// handles ld's bare (non `-Wl,`-wrapped) flag spellings, since
-		// it was written flag-family-agnostic from the start (bare -T,
-		// bare --start-group/--end-group).
+		// Raw ld is always link-shaped (no -c mode like cc/g++); Link's
+		// parser already handles ld's bare, non-`-Wl,`-wrapped flags.
 		return shim.Link(tool, args, cfg, l)
 	case dispatch.ToolRanlib:
-		// ranlib on our thunk/store outputs would need to open+modify a
-		// file we don't own. Real ranlib on a real .a would be
-		// meaningful, but our archives are already indexed (`ar` inside
-		// the sandbox handles `s`), so ranlib is a no-op.
+		// Our archives are already indexed (ar handles `s` in the
+		// sandbox), so ranlib on them is a no-op.
 		return nil
 	case dispatch.ToolCC, dispatch.ToolGCC, dispatch.ToolCXX, dispatch.ToolGXX:
 		if dispatch.IsCompile(args) {

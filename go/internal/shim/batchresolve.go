@@ -11,22 +11,19 @@ import (
 
 // ResolvePendingMember is the safe fallback for a deferred batch
 // member (see deferCompileToBatch) that ends up NOT part of a
-// successful combined-archive submission: any consumer other than a
-// same-group archive (a mixed-group archive, a direct link with no
-// archive, a foreign -l reference, a manual `nixgg force`) resolves
-// the member individually here, into exactly the ordinary per-TU
-// thunk symlink / drvref stub Compile's own non-batched path would
-// have written — after which output is indistinguishable from a TU
-// that was never batched at all.
+// successful combined-archive submission: any other consumer (a
+// mixed-group archive, a direct link with no archive, a foreign -l
+// reference, a manual `nixgg force`) resolves the member here into
+// the ordinary per-TU thunk symlink / drvref stub Compile's
+// non-batched path would have written.
 //
 // Idempotent (thunk.Write and sandbox.PointOutputAtDrv already are),
-// so it's safe to call from more than one place — the classifyInputs
+// so it's safe to call from multiple places: the classifyInputs
 // fallback prologue, resolveLibFlag, and cli/force.go's per-target
 // loop all reach it.
 //
-// output is unchanged (still a batch-pending stub) if this returns
-// an error, or if output does not reference a pending member at all
-// (returns nil, a no-op).
+// output is unchanged if this returns an error, or if output does
+// not reference a pending member at all (returns nil, a no-op).
 func ResolvePendingMember(cfg *toolchain.Config, l paths.Layout, output string) error {
 	recordPath := batchpending.Path(output)
 	if recordPath == "" {
@@ -36,7 +33,7 @@ func ResolvePendingMember(cfg *toolchain.Config, l paths.Layout, output string) 
 	if err != nil {
 		return err
 	}
-	if sandbox.Enabled() {
+	if sandbox.Enabled() || sandbox.EagerDrv() {
 		return submitCompileSandboxDrv(cfg, m.Tool, m.OutName, output, m.Source, m.SrcStore,
 			m.Flags, m.StoreDeps, m.WrapperEnv)
 	}

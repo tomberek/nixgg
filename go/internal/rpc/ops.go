@@ -3,25 +3,15 @@ package rpc
 import "fmt"
 
 // AddDerivation registers a derivation's ATerm text with the daemon,
-// replacing `nix --offline derivation add`'s fork+exec. Mirrors
-// RemoteStore::addCAToStore's protocol >= 1.25 branch specialised to
-// the one shape nixgg needs: content-addressed as text, no references
-// beyond the drv's own srcs/drv inputs (already folded into `refs` by
-// the caller — see internal/expr's own reference-collection logic),
-// never repairing.
+// replacing `nix --offline derivation add`'s fork+exec. Content-addressed
+// as text, with the drv's own srcs/drv-input references (already
+// collected by the caller), never repairing.
 //
-// contents is the drv's ATerm-format text (what Store::writeDerivation
-// hashes and uploads) — the same bytes `nix derivation add` would send,
-// computed by the caller from the same JSON->Derivation parse nixgg's
-// existing expr package already does for the CLI path.
-//
-// Deliberately does not replicate Store::writeDerivation's own
-// isValidPath-before-upload short-circuit: getting Nix's exact
-// makeStorePath/compressHash formula wrong would silently upload every
-// time instead of failing loudly, and the daemon's own LocalStore does
-// the equivalent check server-side regardless (addToStoreFromDump ->
-// LocalStore's CA short-circuit) — this client only pays one avoidable
-// round trip per call, not a correctness risk.
+// Deliberately skips Store::writeDerivation's own isValidPath
+// short-circuit: getting Nix's makeStorePath/compressHash formula wrong
+// would silently upload every time instead of failing loudly, and the
+// daemon does the equivalent check server-side anyway — this client
+// only pays one avoidable round trip per call, not a correctness risk.
 func (c *Conn) AddDerivation(name string, contents []byte, refs []string) (storePath string, err error) {
 	if err := c.w.writeUint64(uint64(opAddToStore)); err != nil {
 		return "", fmt.Errorf("rpc: AddDerivation: write op: %w", err)
@@ -57,14 +47,10 @@ func (c *Conn) AddDerivation(name string, contents []byte, refs []string) (store
 // scan it for references to already-present store objects — the
 // builder-rpc-v0/recursive-nix-only op behind `nix store add --scan`.
 // Requires the daemon to have advertised the add-to-store-scanning
-// handshake feature; returns an error immediately if not, same as the
-// real client does before ever writing the request.
+// handshake feature; errors immediately if not, same as the real
+// client does before writing the request.
 //
-// narDump must already be a complete NAR-format dump of the directory
-// (see internal/stage or wherever nixgg currently shells out `nix
-// store add --scan` from — it already has the staged directory on
-// disk and needs a NAR encoder, not a new one written from scratch
-// here; this function only owns the wire protocol).
+// narDump must already be a complete NAR-format dump of the directory.
 func (c *Conn) AddToStoreScanning(name string, narDump []byte) (storePath string, err error) {
 	if !c.hasFeature(featureAddToStoreScanning) {
 		return "", fmt.Errorf("rpc: AddToStoreScanning: daemon does not support add-to-store-scanning (not in a builder-rpc-v0/recursive-nix derivation?)")
@@ -93,13 +79,48 @@ func (c *Conn) AddToStoreScanning(name string, narDump []byte) (storePath string
 	return c.readValidPathInfoPath()
 }
 
+// AddDirectory uploads a directory as a NAR via the plain
+// (non-scanning) AddToStore op, content-addressed as "fixed:r:sha256"
+// with an empty reference set — the sandbox-mode analogue of
+// `nix-store --add` (no `--scan`), matching what native mode's plain
+// `srcTree = ../srcs/<tu-id>;` path-literal import produces so both
+// modes land on the same store path for identical bytes.
+//
+// narDump must already be a complete NAR-format dump of the directory.
+func (c *Conn) AddDirectory(name string, narDump []byte) (storePath string, err error) {
+	if err := c.w.writeUint64(uint64(opAddToStore)); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: write op: %w", err)
+	}
+	if err := c.w.writeString(name); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: write name: %w", err)
+	}
+	if err := c.w.writeString(contentAddressFixedRecursive); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: write cam: %w", err)
+	}
+	if err := c.w.writeStrings(nil); err != nil { // refs: none
+		return "", fmt.Errorf("rpc: AddDirectory: write refs: %w", err)
+	}
+	if err := c.w.writeUint64(0); err != nil { // repair: false
+		return "", fmt.Errorf("rpc: AddDirectory: write repair: %w", err)
+	}
+	if err := c.w.flush(); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: flush request: %w", err)
+	}
+	if err := c.w.writeFramed(narDump); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: upload NAR: %w", err)
+	}
+	if err := c.w.flush(); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: flush upload: %w", err)
+	}
+	if err := c.w.drainStderr(); err != nil {
+		return "", fmt.Errorf("rpc: AddDirectory: %w", err)
+	}
+	return c.readValidPathInfoPath()
+}
+
 // readValidPathInfoPath reads a ValidPathInfo response (StorePath +
-// UnkeyedValidPathInfo, per src/libstore/worker-protocol.cc's own
-// Serialise<ValidPathInfo>/Serialise<UnkeyedValidPathInfo>::read) and
-// returns just the path — every other field (deriver, narHash,
-// references, registrationTime, narSize, ultimate, sigs, ca) is
-// daemon bookkeeping neither AddDerivation nor AddToStoreScanning's
-// caller needs.
+// UnkeyedValidPathInfo) and returns just the path; every other field
+// is daemon bookkeeping the caller doesn't need.
 func (c *Conn) readValidPathInfoPath() (string, error) {
 	path, err := c.w.readString() // StorePath: plain printed path text
 	if err != nil {
@@ -112,8 +133,7 @@ func (c *Conn) readValidPathInfoPath() (string, error) {
 }
 
 // skipUnkeyedValidPathInfo discards deriver, narHash, references,
-// registrationTime, narSize, and (protocol >= 1.16, true for every
-// daemon this client talks to) ultimate/sigs/ca.
+// registrationTime, narSize, ultimate, sigs, and ca.
 func (c *Conn) skipUnkeyedValidPathInfo() error {
 	if _, err := c.w.readString(); err != nil { // deriver (optional StorePath, "" if none)
 		return fmt.Errorf("rpc: read deriver: %w", err)
@@ -143,18 +163,15 @@ func (c *Conn) skipUnkeyedValidPathInfo() error {
 }
 
 // SubmitOutput registers drvPath as the currently-running outer
-// derivation's `output` (always "out" for nixgg's own use — mirrors
-// go/internal/sandbox's existing SubmitOutput signature), replacing
-// `nix store submit-output`'s fork+exec. Only valid inside a
-// builder-rpc-v0 sandbox with the outer drv's requiredSystemFeatures
-// set accordingly; the daemon enforces this itself and returns a
-// protocol error if not, same as the CLI would.
+// derivation's `output`, replacing `nix store submit-output`'s
+// fork+exec. Only valid inside a builder-rpc-v0 sandbox with the outer
+// drv's requiredSystemFeatures set accordingly; the daemon enforces
+// this and returns a protocol error otherwise.
 //
 // path is always sent as SingleDerivedPath::Opaque (tag 0) — a plain
 // already-built .drv StorePath. nixgg never submits a Built path (a
 // "drv^output" reference to another not-yet-resolved derivation's
-// output); if a future caller needs that, it needs its own tagged
-// encoding, not a silent fallthrough here.
+// output); a future caller needing that needs its own tagged encoding.
 func (c *Conn) SubmitOutput(drvPath, output string) error {
 	if !c.hasFeature(featureSubmitOutput) {
 		return fmt.Errorf("rpc: SubmitOutput: daemon does not support submit-output (not in a derivation with the builder-rpc-v0 feature?)")
@@ -177,9 +194,9 @@ func (c *Conn) SubmitOutput(drvPath, output string) error {
 	if err := c.w.drainStderr(); err != nil {
 		return fmt.Errorf("rpc: SubmitOutput: %w", err)
 	}
-	// RemoteStore::submitOutput reads a trailing readInt() after
-	// STDERR drains clean — an unused result code (upstream's own
-	// C++ client discards it too; see remote-store.cc's call site).
+	// RemoteStore::submitOutput reads a trailing result code after
+	// STDERR drains clean; unused, but must be read to stay in sync
+	// with the daemon (upstream's own client discards it too).
 	if _, err := c.w.readUint64(); err != nil {
 		return fmt.Errorf("rpc: SubmitOutput: read result: %w", err)
 	}

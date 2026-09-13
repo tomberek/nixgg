@@ -70,6 +70,11 @@ SLOW=(
   "llvm|bin/llc|%s --version"
   "postgresql|bin/postgres|%s --version"
   "qemu|bin/qemu-system-x86_64|%s --version"
+  # nix-full builds Nix itself; its default target (bare "nix-full")
+  # is libnixutil, a library, so the runnable target is addressed
+  # explicitly via .packages.nix — the check_example harness accepts
+  # any dotted flake attr, not just a bare example name.
+  "nix-full.packages.nix|bin/nix|%s --version"
 )
 
 # splitAtBuild-only examples (nix/splitStdenv.nix) — an existing

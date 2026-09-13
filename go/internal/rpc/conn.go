@@ -8,12 +8,10 @@ import (
 
 // Conn is one worker-protocol session with a Nix daemon, reached over
 // the Unix socket a builder-rpc-v0 sandbox exposes via NIX_REMOTE
-// (unix://<path>) — the same socket `nix --offline ...` connects to
-// when shelled out. Not pooled or reused across processes; nixgg's
-// shim is a fresh OS process per compile, so one Conn's lifetime is
-// one shim invocation. Still saves the CLI's own process-startup +
-// config-load + connect cost on every call (measured ~20-30ms even
-// for a no-op invocation) versus fork+exec'ing `nix` per operation.
+// (unix://<path>). Not pooled or reused across processes; nixgg's shim
+// is a fresh OS process per compile, so one Conn's lifetime is one shim
+// invocation — still saves the CLI's process-startup/config-load/connect
+// cost (~20-30ms) versus fork+exec'ing `nix` per operation.
 type Conn struct {
 	nc       net.Conn
 	w        *wire
@@ -25,12 +23,10 @@ type Conn struct {
 // the full client handshake (magic, version, feature exchange,
 // affinity/reserve-space stubs, daemon version + trust status).
 //
-// remote must be "unix://<path>" — the only form builder-rpc-v0
-// sandboxes set (see src/libstore/unix/build/derivation-builder.cc's
-// own env["NIX_REMOTE"] = "unix://" + socketPath). Any other scheme
-// (empty, "daemon", "auto") means this isn't running inside a sandbox
-// that speaks the raw protocol on a known path, and callers should
-// fall back to the nix CLI instead of calling Dial at all.
+// remote must be "unix://<path>" — the only form a builder-rpc-v0
+// sandbox sets. Any other scheme means this isn't running inside a
+// sandbox that speaks the raw protocol, and callers should fall back
+// to the nix CLI instead of calling Dial at all.
 func Dial(remote string) (*Conn, error) {
 	path, ok := strings.CutPrefix(remote, "unix://")
 	if !ok {
@@ -51,12 +47,10 @@ func Dial(remote string) (*Conn, error) {
 func (c *Conn) Close() error { return c.nc.Close() }
 
 // handshake replicates WorkerProto::BasicClientConnection::handshake +
-// postHandshake exactly, client side: write our magic+version, flush,
-// read daemon magic+version, exchange feature lists if both sides are
-// >= 1.38, then (still part of the same round trip) write the two
-// obsolete affinity/reserve-space stub values postHandshake sends,
-// flush, and read back ClientHandshakeInfo (daemon version string +
-// trust flag).
+// postHandshake, client side: write magic+version, exchange feature
+// lists if both sides are >= 1.38, write the two obsolete
+// affinity/reserve-space stub values, then read back
+// ClientHandshakeInfo (daemon version string + trust flag).
 func (c *Conn) handshake() error {
 	if err := c.w.writeUint64(workerMagic1); err != nil {
 		return fmt.Errorf("rpc: write client magic: %w", err)
@@ -91,13 +85,10 @@ func (c *Conn) handshake() error {
 	c.version = negotiated
 
 	if negotiated >= featureMinVersion {
-		// The negotiated feature set is intersect(ours, daemon's) —
-		// src/libstore/remote-store.cc's own RemoteStore::initConnection
-		// explicitly adds add-to-store-scanning/submit-output to its
-		// local feature set for exactly this reason (they aren't in
+		// Must advertise these explicitly: they aren't in
 		// WorkerProto::latest by default, only added conditionally on
-		// the daemon side). Advertising nothing here would negotiate
-		// them away even if the daemon supports both.
+		// the daemon side, so omitting them here would negotiate them
+		// away even if the daemon supports both.
 		ourFeatures := []string{featureAddToStoreScanning, featureSubmitOutput}
 		if err := c.w.writeStrings(ourFeatures); err != nil {
 			return fmt.Errorf("rpc: write feature list: %w", err)
@@ -118,8 +109,7 @@ func (c *Conn) handshake() error {
 	}
 
 	// postHandshake's two obsolete stub writes (CPU affinity, reserve
-	// space) — every protocol version this client supports is well
-	// past both thresholds (1.14, 1.11), so always send them.
+	// space); every supported protocol version is past both thresholds.
 	if err := c.w.writeUint64(0); err != nil { // affinity: none
 		return fmt.Errorf("rpc: write affinity stub: %w", err)
 	}
@@ -130,11 +120,7 @@ func (c *Conn) handshake() error {
 		return fmt.Errorf("rpc: flush post-handshake: %w", err)
 	}
 
-	// ClientHandshakeInfo: daemon version string (>= 1.33), then
-	// optional trust flag (>= 1.35) as a readNum<uint8_t> tag: 0 =
-	// unknown, 1 = trusted, 2 = not trusted. Every daemon we talk to
-	// is well past both gates; read unconditionally rather than
-	// threading the same two version checks through again.
+	// ClientHandshakeInfo: daemon version string, then trust flag.
 	if _, err := c.w.readString(); err != nil { // daemon version string, unused
 		return fmt.Errorf("rpc: read daemon version string: %w", err)
 	}
@@ -142,25 +128,19 @@ func (c *Conn) handshake() error {
 		return fmt.Errorf("rpc: read trust flag: %w", err)
 	}
 
-	// RemoteStore::initConnection drains one more STDERR sequence
-	// right after postHandshake (conn.processStderrReturn()) before
-	// the connection is usable for any op — skipping this left the
-	// daemon's post-handshake STDERR_LAST sitting unread, silently
-	// shifting every subsequent read by one message.
+	// RemoteStore::initConnection drains one more STDERR sequence right
+	// after postHandshake before the connection is usable — skipping
+	// this leaves the daemon's post-handshake STDERR_LAST unread,
+	// silently shifting every subsequent read by one message.
 	if err := c.w.drainStderr(); err != nil {
 		return fmt.Errorf("rpc: post-handshake stderr: %w", err)
 	}
 
-	// SetOptions is deliberately never sent. On an ordinary daemon
-	// connection RemoteStore::initConnection sends it unconditionally
-	// (unless disable-set-options is negotiated, which this client
-	// never requests) — but every real caller of this package IS a
-	// builder-rpc-v0 sandbox's RecursiveSubmitted daemon, and
-	// SetOptions isn't on that daemon's fixed op allowlist at all
-	// (src/libstore/daemon.cc's own performOp throws "Operation 19
-	// not allowed inside derivation" — confirmed directly against a
-	// real sandbox build). Sending it would make every call fail, not
-	// just this one being skippable as an optimization.
+	// SetOptions is deliberately never sent: the real daemon connection
+	// this client talks to (a builder-rpc-v0 sandbox's
+	// RecursiveSubmitted daemon) doesn't allow it — sending it fails
+	// every call, confirmed against a real sandbox build
+	// ("Operation 19 not allowed inside derivation").
 
 	return nil
 }

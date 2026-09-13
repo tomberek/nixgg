@@ -14,17 +14,17 @@ import (
 // deferCompileToBatch is Compile's deferral path for a TU that
 // matched an opt-in batch group (cfg.BatchGroups.Classify). Instead
 // of submitting its own derivation now, it snapshots everything
-// needed to build it later — either standalone (ResolvePendingMember,
-// the safe fallback for any consumer that isn't a same-group
-// archive) or as one member of a combined batch-archive derivation
-// (tryBatchArchive, in batcharchive.go) — and writes a
-// batchpending stub at output instead of today's thunk symlink /
-// drvref stub.
+// needed to build it later — either standalone (ResolvePendingMember)
+// or as one member of a combined batch-archive derivation
+// (tryBatchArchive, in batcharchive.go) — and writes a batchpending
+// stub at output instead of today's thunk symlink / drvref stub.
 //
 // Staging (stage.Sources, called by Compile before this) and, in
-// sandbox mode, the src tree's upload via sandbox.StoreAddScan both
-// stay unconditional — only the final "build+submit a derivation"
-// step is deferred, matching compileSandbox's own upload timing.
+// sandbox mode, the src tree's upload via sandbox.StoreAddDirectory
+// stay unconditional; only the final build+submit step is deferred.
+// StoreAddDirectory (not the scanning StoreAddScan) matches
+// compileSandbox's own upload so this deferred member's store path
+// agrees with native mode's plain path-literal import.
 func deferCompileToBatch(
 	cfg *toolchain.Config, l paths.Layout, group, tuID string,
 	toolName, output, srcRel, srcTreeLiteral string,
@@ -39,8 +39,8 @@ func deferCompileToBatch(
 		StoreDeps:  storeDeps,
 		WrapperEnv: wrapperEnv,
 	}
-	if sandbox.Enabled() {
-		srcStore, err := sandbox.StoreAddScan(cfg, tuID, filepath.Join(l.Srcs, tuID))
+	if sandbox.Enabled() || sandbox.EagerDrv() {
+		srcStore, err := sandbox.StoreAddDirectory(cfg, tuID, filepath.Join(l.Srcs, tuID))
 		if err != nil {
 			return err
 		}
@@ -67,9 +67,8 @@ func deferCompileToBatch(
 
 // writeBatchPendingStub replaces output with a batch-pending stub —
 // the deferred-compile analogue of thunk.LinkPlaceholder /
-// sandbox.PointOutputAtDrv. A regular file, not a symlink, for the
-// same reason drvref/batchpending's own docstrings give: nothing
-// exists yet at any target a symlink could safely point to.
+// sandbox.PointOutputAtDrv. A regular file, not a symlink, since
+// nothing exists yet at any target a symlink could point to.
 func writeBatchPendingStub(output, recordPath string) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return err

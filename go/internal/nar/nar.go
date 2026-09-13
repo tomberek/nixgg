@@ -1,16 +1,13 @@
 // Package nar encodes a directory tree into Nix's NAR (Nix ARchive)
-// format — the same bytes `nix store add --scan` computes internally
-// before uploading, and the exact payload
-// internal/rpc.Conn.AddToStoreScanning's framed upload expects.
+// format — the same bytes `nix store add --scan` computes internally,
+// and the exact payload internal/rpc.Conn.AddToStoreScanning expects.
 //
-// Every rule here was read directly out of the pinned nix-15793
-// source (NixOS/nix@8307c48): src/libutil/archive.cc's
-// SourceAccessor::dumpPath (the NAR writer) and
-// src/libutil/serialise.cc's writeString/writePadding (the string
-// framing every NAR field uses — length-prefixed, 8-byte zero-padded,
-// same shape internal/rpc's own wire.go implements for the worker
-// protocol, kept as a separate small copy here rather than an
-// unexported cross-package import).
+// Mirrors the pinned nix-15793 source (NixOS/nix@8307c48):
+// src/libutil/archive.cc's SourceAccessor::dumpPath and
+// src/libutil/serialise.cc's writeString/writePadding — the same
+// length-prefixed, 8-byte-padded string framing internal/rpc's
+// wire.go uses for the worker protocol, duplicated here as a small
+// unexported copy rather than a cross-package import.
 package nar
 
 import (
@@ -26,10 +23,7 @@ import (
 const magic = "nix-archive-1"
 
 // narWriter buffers NAR-format field writes: length-prefixed,
-// 8-byte-zero-padded strings — writeString's own shape in
-// serialise.cc, reused verbatim (not the worker protocol's uint64
-// LITTLE-endian length prefix by coincidence: it's the same
-// `writeString` function in the same codebase, called from both).
+// 8-byte-zero-padded strings.
 type narWriter struct {
 	w   *bufio.Writer
 	err error
@@ -64,12 +58,9 @@ func putUint64LE(b []byte, v uint64) {
 }
 
 // Dump encodes root (a regular file, directory, or symlink) as a NAR
-// and writes it to w. Mirrors SourceAccessor::dumpPath exactly,
-// including its directory-entry sort order (lexicographic by name —
-// archive.cc iterates a std::map<std::string,std::string>) and its
-// depth cap (64, matching narMaxDepth — nixgg's own staged source
-// trees never approach this, but an unbounded recursion here would be
-// a real DoS surface for anything that does).
+// and writes it to w. Directory entries sort lexicographically by
+// name, matching Nix's own writer. Depth is capped at maxDepth as a
+// guard against unbounded recursion.
 func Dump(w io.Writer, root string) error {
 	bw := bufio.NewWriter(w)
 	nw := &narWriter{w: bw}

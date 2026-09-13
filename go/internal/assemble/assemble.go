@@ -1,10 +1,8 @@
 // Package assemble walks a build tree left behind by a splitStdenv
 // build-stage buildPhase and finds every drvref stub the nixgg shims
-// wrote in place of a real artifact.
-//
-// splitStdenv's build stage (unlike mkNixggBuild) has no single
-// target — the tree can have dozens of shimmed outputs — so stubs are
-// discovered by walking, not by argument parsing.
+// wrote in place of a real artifact. splitStdenv's build stage (unlike
+// mkNixggBuild) has no single target — stubs are discovered by
+// walking, not by argument parsing.
 package assemble
 
 import (
@@ -79,16 +77,16 @@ func Walk(root string) ([]Stub, error) {
 // (".gg-stage"), excluding skipNames entries, and returns the staged
 // path.
 //
-// Must be inside root, not under an os.MkdirTemp("", ...) dest:
-// $TMPDIR inside a builder-rpc-v0 sandbox resolves under root, so an
+// Must be inside root, not an os.MkdirTemp("", ...) dest: $TMPDIR
+// inside a builder-rpc-v0 sandbox resolves under root, so an
 // externally-supplied dest could itself be a descendant of root,
 // making the copy recurse into itself. A fixed, excluded name directly
-// under root can't be an ancestor of root, so this can't happen.
+// under root can't be an ancestor of root, so that can't happen.
 //
-// `nix store add --scan` also can't ingest root directly: it leaves a
-// live .nix-socket (NIX_REMOTE points at it) that --scan rejects, and
-// that socket can't be deleted first — the caller's own subsequent
-// nix store add/derivation add/submit-output calls go through it.
+// `nix store add --scan` can't ingest root directly either: it leaves
+// a live .nix-socket (NIX_REMOTE points at it) that --scan rejects,
+// and the socket can't be deleted first since the caller's own
+// subsequent store calls go through it.
 func StageForScan(root string) (string, error) {
 	staged := filepath.Join(root, ".gg-stage")
 	if err := os.MkdirAll(staged, 0o755); err != nil {
@@ -125,16 +123,11 @@ func copyRecursive(src, dst string) error {
 		}
 		return os.Symlink(target, dst)
 	case info.IsDir():
-		// Owner-writable regardless of src's own mode: src may be an
-		// untouched subtree still carrying its Nix-store read-only
-		// bits (e.g. an unmodified cmake/ dir under a build's source
-		// tree), and MkdirAll below would otherwise create dst with
-		// that same read-only mode — then the recursive copyRecursive
-		// calls a few lines down can't create any entries inside it.
-		// dst is disposable scratch space consumed only by `nix store
-		// add --scan`, which assigns its own final store permissions,
-		// so the exact mode copied here doesn't matter beyond letting
-		// this function populate it.
+		// Force owner-writable regardless of src's mode: src may still
+		// carry Nix-store read-only bits, and MkdirAll would otherwise
+		// create dst read-only too, blocking the recursive copies into
+		// it below. dst is disposable scratch for `nix store add
+		// --scan`, which assigns its own final permissions.
 		if err := os.MkdirAll(dst, info.Mode().Perm()|0o200); err != nil {
 			return err
 		}

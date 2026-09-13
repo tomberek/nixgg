@@ -170,6 +170,30 @@
           nixStoreC = nix-15793.packages.${system}.nix-store-c;
           nixUtilC = nix-15793.packages.${system}.nix-util-c;
 
+          # examples/nix's own buildInputs: nix-15793's OWN
+          # devShell package set, UNFILTERED (already resolved against
+          # whatever nixpkgs pin nix-15793 itself uses), rather than
+          # reaching into THIS flake's own `pkgs` for boost/openssl/etc.
+          # — avoids any ABI/version mismatch between two different
+          # nixpkgs pins for libraries Nix's own C++ headers are
+          # sensitive to. Unfiltered because this fixture configures
+          # the WHOLE top-level meson.build (see examples/nix's
+          # own docstring for why), which resolves every declared
+          # subproject's own `dependency()` calls at configure time —
+          # confirmed directly: a real, unshimmed `meson setup` of the
+          # whole tree needs boost/openssl/libarchive/libsodium/
+          # brotli/zstd/libcpuid/nlohmann_json/libblake3 (libutil/
+          # libstore), curl/sqlite3/libseccomp/aws-crt-cpp (libstore),
+          # bdw-gc/toml11 (libexpr), lowdown/editline (libcmd),
+          # mimalloc (nix CLI) — i.e. nearly this whole devShell's own
+          # list — even though only two ninja targets (libutil,
+          # libstore) actually get BUILT.
+          nixBuildInputs =
+            let
+              shell = nix-15793.devShells.${system}.default;
+            in
+            (shell.buildInputs or [ ]) ++ (shell.propagatedBuildInputs or [ ]);
+
           # The nix/ helper directory (builder.nix, linker.nix,
           # archiver.nix, pure-store-path.nix) imported into the store
           # once so drivers can `import` them by absolute store path
@@ -817,6 +841,49 @@
                 src = qemu-src;
               };
             };
+            # Nix's own C++ source (the nix-15793 flake input already
+            # pinned above for patched-nix/nix-store-c/nix-util-c —
+            # previously consumed only as pre-built binaries, never
+            # built from source through nixgg). Builds all 15 real
+            # production subprojects (libutil, libstore, libfetchers,
+            # libexpr, libflake, libmain, libcmd, their 6 `-c` C-API
+            # wrappers, the `nix` CLI, and nswrapper) PLUS all 8 real
+            # unit-test subprojects (libutil/libstore/libexpr's own
+            # -test-support libraries, and the 5 *-tests gtest
+            # binaries) PLUS clang-tidy-plugin (needs `llvm` on PATH
+            # via nativeBuildInputs, not just buildInputs) — see
+            # examples/nix-full's own docstring for the dependency
+            # chain, the whole-tree-configure design (no phase split
+            # needed — meson's own subproject dependency resolution
+            # handles it), and the confirmed `prelink: true` mechanism
+            # (a link output as an archive's sole member) this fixture
+            # exercises for the first time in this repo. Named
+            # `nix-full`, not `nix-util` and not bare `nix`: the
+            # fixture started as a libutil-only slice (hence the
+            # original name) but now builds all of Nix, so the flake
+            # attr was renamed to match once the scope did — bare
+            # `nix` was ruled out because `toolchain.nix` (this same
+            # `packages` output, `nix = pkgs.nixVersions.stable`)
+            # already claims that name.
+            nix-full = {
+              dir = ./examples/nix-full;
+              args = {
+                inherit (pkgs) meson ninja cmake bison flex busybox lsof;
+                # llvm specifically from nix-15793's OWN devShell, not
+                # pkgs.llvm: nixpkgs' own default llvm output has no
+                # llvm-config (that's the "dev" output) — reusing the
+                # exact package nix-15793's devShell already resolved
+                # to "dev" avoids re-deriving that output selection
+                # here and matches nixBuildInputs' own "reuse
+                # nix-15793's own devShell set" rationale below.
+                llvm = builtins.head (
+                  builtins.filter (p: (p.pname or "") == "llvm") nix-15793.devShells.${system}.default.nativeBuildInputs
+                );
+                pkgConfig = pkgs.pkg-config;
+                buildInputs = nixBuildInputs;
+                src = nix-15793;
+              };
+            };
             # Same fixture, batchGroups covering libqemuutil.a's own
             # 450 members (util/, stubs/, qobject/, qapi/, crypto/,
             # trace/, plus meson's generated build/qapi/ and
@@ -1016,6 +1083,19 @@
           llvm-min-tblgen-batch = examples.llvm-batch.llvm-min-tblgen.package;
           llvm-tblgen-batch = examples.llvm-batch.llvm-tblgen.package;
           two-phase-codegen = examples.two-phase.codegen.package;
+          # linux-kernel's own phase1 (the real, single-src mkNixggBuild
+          # call — phase2 is a plain stdenv.mkDerivation with no shims,
+          # nothing for drv-equivalence to compare) exposed the same
+          # way llvm's own tblgen phases are: the full mkNixggBuild
+          # attrset (not just .package), since
+          # tests/drv-equivalence.sh's equiv_sandbox_drvs needs
+          # "<attr>.drv.outputs" at this exact top-level name to
+          # exercise it like any other single-mkNixggBuild-call
+          # fixture. exampleShells only covers top-level example
+          # names, not phase extras, so its own -shell is added here
+          # too.
+          linux-kernel-phase1 = examples.linux-kernel.linux-kernel-phase1;
+          linux-kernel-phase1-shell = examples.linux-kernel.linux-kernel-phase1.shell;
           # mosh's second multi-target output (mosh's default .package
           # is mosh-server, the first entry in examples/mosh/
           # default.nix's own targets list) — see mkNixggBuild.nix's

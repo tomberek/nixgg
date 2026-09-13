@@ -1,49 +1,24 @@
-// Package members defines the on-disk sidecar an archive shim writes
-// when it builds a THIN archive (`ar --thin`/`T`) — the one archive
-// shape where the caller's own `.a` file doesn't embed its members'
-// bytes, so a later consumer (a link, or another archive) can't rely
-// on the archive's own drv output alone; it also needs each member
-// declared as one of ITS OWN inputs, or Nix won't mount that member's
-// store path into the consumer's own sandbox.
+// Package members defines the on-disk sidecar an archive shim writes for a
+// THIN archive (`ar --thin`/`T`): since a thin archive's `.a` file stores
+// only its members' paths, not their bytes, each member must also be
+// declared as an input of any derivation that consumes the archive, or Nix
+// won't mount it into that consumer's sandbox.
 //
-// # Why this is safe under nixgg's model
+// This is safe because every member path nixgg ever hands to `ar` is
+// already a permanent /nix/store/... path (or a CA placeholder Nix
+// substitutes before the build script runs — see
+// expr/derivation.go's KindArchive case), so those references stay valid
+// from any sandbox for as long as the referenced store path exists. Only a
+// RELATIVE member path would be fragile (GNU ar resolves it against the
+// archive's own location, not cwd) — nixgg never produces one.
 //
-// A thin archive stores each member's file PATH, not its bytes. Every
-// member nixgg's archive shim ever hands to `ar` — thin or not — is
-// already resolved to a permanent, immutable /nix/store/... path (or
-// a CA output-placeholder Nix substitutes for one before the build
-// script runs) before `ar` is invoked at all; see
-// go/internal/expr/derivation.go's KindArchive case. A thin archive
-// built from those same paths stores references that remain valid
-// forever, from any sandbox, for as long as the referenced store path
-// exists — which is exactly what Nix's own derivation-input
-// declaration model already guarantees for the lifetime of any build
-// that declares it as an input. Verified directly (see this
-// package's own commit message / the design doc this shipped with):
-// an absolute-path thin archive linked successfully from a completely
-// unrelated directory after the archive-creation sandbox was deleted;
-// only a RELATIVE member path is fragile (GNU ar resolves it against
-// the archive file's own location, not cwd) — and nixgg never
-// produces one.
+// This is a separate sidecar rather than an extension of internal/drvref
+// because drvref's wire format is bounded to ~4096 bytes and a thin archive
+// can have hundreds of members (QEMU's libqemuutil.a has ~280).
 //
-// # Why not extend drvref instead
-//
-// go/internal/drvref's wire format is deliberately bounded (~4096
-// bytes) and shared by three unrelated readers that all depend on it
-// staying a tiny, single-purpose marker. A thin archive can have
-// hundreds of members — QEMU's libqemuutil.a has ~280 — which would
-// blow well past that bound. This package is a separate, unbounded-
-// size sidecar instead, the same way go/internal/batchpending and
-// go/internal/batchmember are two separate formats for two separate
-// metadata shapes rather than one overloaded format.
-//
-// # Filename
-//
-// Written to .nixgg/members/<key>.json, where <key> is the SAME id
-// the archive's own thunk (native mode, thunk.Compute) or drv path
-// (sandbox mode, expr.StoreBasename) already produces — so a later
-// consumer that resolves this archive via classify.Target can compute
-// the identical lookup key with no extra state to thread through.
+// Written to .nixgg/members/<key>.json, where <key> is the same id the
+// archive's own thunk/drv path already produces, so a consumer can compute
+// the same lookup key with no extra state to thread through.
 package members
 
 import (
@@ -55,10 +30,8 @@ import (
 	"github.com/tbereknyei/nixgg/internal/paths"
 )
 
-// Record is one archive member, in the same {Kind, Ref, Name}
-// vocabulary as expr.Input (native) / expr.JSONDrvInput (sandbox) —
-// deliberately identical so a caller can convert straight from
-// whichever of those slices classifyInputs already built, with no
+// Record is one archive member, in the same {Kind, Ref, Name} shape as
+// expr.Input/expr.JSONDrvInput so a caller can convert directly with no
 // translation layer.
 type Record struct {
 	Kind string
@@ -70,10 +43,9 @@ func path(l paths.Layout, key string) string {
 	return filepath.Join(l.Members, key+".json")
 }
 
-// Write persists recs as the member list for the thin archive keyed
-// by key, using temp-file-then-rename (same idiom as thunk.Write and
-// batchmember.Write) so a half-written file is never observed by a
-// concurrent reader.
+// Write persists recs as the member list for the thin archive keyed by
+// key, using temp-file-then-rename so a half-written file is never
+// observed by a concurrent reader.
 func Write(l paths.Layout, key string, recs []Record) (string, error) {
 	if err := os.MkdirAll(l.Members, 0o755); err != nil {
 		return "", err
@@ -102,10 +74,9 @@ func Write(l paths.Layout, key string, recs []Record) (string, error) {
 	return dst, nil
 }
 
-// Read looks up the member list for key. ok is false (with a nil
-// error) iff no sidecar exists for key at all — the normal case for
-// every archive that isn't thin, and the signal classifyInputs uses
-// to decide whether an input needs member-propagation.
+// Read looks up the member list for key. ok is false (with a nil error)
+// iff no sidecar exists for key — the normal case for any archive that
+// isn't thin.
 func Read(l paths.Layout, key string) (recs []Record, ok bool, err error) {
 	body, err := os.ReadFile(path(l, key))
 	if err != nil {

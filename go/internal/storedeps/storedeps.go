@@ -19,19 +19,14 @@ import (
 // store path they mention to be an input to the drv.
 //
 // This matches mkNixggBuild.nix's exported/known-paths list verbatim
-// rather than pattern-matching arbitrary "/nix/store/..." shaped text.
-// A previous regex-based version tried to reconstruct Nix's store-path
-// grammar (32-char nix32 hash + name) directly in Go, and repeatedly
-// diverged from the real grammar at the edges — matching hash-lookalike
-// text that isn't valid nix32 (e.g. a deliberately-blanked "eeee..."
-// placeholder meant to dodge reference scanning), and over-greedily
-// swallowing trailing punctuation Nix's name grammar wouldn't accept
-// (e.g. the "=2" in "-DVERSION=/nix/store/<hash>-foo-1.0=2"). Both
-// produced strings `nix derivation add` then rejected outright. Nix's
-// own reference scanner (RefScanSink) avoids this class of bug by
-// never guessing at path shape — it substring-matches against a
-// pre-known set of hashes. Matching against the known-paths manifest
-// does the same.
+// rather than pattern-matching arbitrary "/nix/store/..." shaped text:
+// reconstructing Nix's store-path grammar (32-char nix32 hash + name)
+// with a regex is easy to get subtly wrong at the edges (matching
+// hash-lookalike text that isn't valid nix32, or swallowing trailing
+// punctuation Nix's name grammar wouldn't accept), producing strings
+// `nix derivation add` then rejects outright. Substring-matching a
+// pre-known set of hashes — like Nix's own RefScanSink — avoids that
+// whole class of bug.
 func From(flags []string, wrapperEnvJSON string, knownPaths []string) []string {
 	set := map[string]bool{}
 	for _, p := range knownPaths {
@@ -54,26 +49,4 @@ func From(flags []string, wrapperEnvJSON string, knownPaths []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// AsJSONArray formats a slice of paths as a compact JSON array of
-// strings. We do this manually — store paths have no characters
-// requiring JSON escaping (only [a-z0-9-_./]+), so a plain quote is
-// safe and cheap.
-func AsJSONArray(paths []string) string {
-	if len(paths) == 0 {
-		return "[]"
-	}
-	var b strings.Builder
-	b.WriteByte('[')
-	for i, p := range paths {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteByte('"')
-		b.WriteString(p)
-		b.WriteByte('"')
-	}
-	b.WriteByte(']')
-	return b.String()
 }

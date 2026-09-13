@@ -6,22 +6,18 @@
 // This package only answers "does this source belong to a batch, and
 // which one" — matching the shape of
 // nix/configureSrcFilterPresets.nix's includePatterns (`find
-// -path`-style globs, curated per-project or per-subtree, not
-// inferred). The actual multi-output batch derivation lives
-// elsewhere: internal/shim's deferCompileToBatch records a pending
-// member (internal/batchmember/internal/batchpending) instead of
-// submitting a per-TU derivation, and internal/shim's
+// -path`-style globs, curated per-project, not inferred). The actual
+// multi-output batch derivation lives elsewhere: internal/shim's
+// deferCompileToBatch records a pending member
+// (internal/batchmember/internal/batchpending) instead of submitting a
+// per-TU derivation, and internal/shim's
 // tryBatchArchive/submitCombinedArchive combine every pending member
-// belonging to one archive's same group into ONE derivation (N
-// compiles + 1 archive) when that archive's own `ar` invocation sees
-// them — see go/internal/expr/batcharchive.go's package docstring for
-// the derivation shape itself. See ARCHITECTURE.md's "What we don't
-// (yet) do" for the reasoning that motivated scoping batching this
-// way (batching an actively-edited directory trades saved Nix
-// per-derivation overhead for wasted real compiler time on unchanged
-// siblings; only a directory that's genuinely stable relative to how
-// often the project rebuilds is a good candidate, and that judgment
-// call belongs to the project author, not a heuristic).
+// belonging to one archive's group into ONE derivation when that
+// archive's `ar` invocation sees them. See ARCHITECTURE.md's "What we
+// don't (yet) do" for why batching stays opt-in rather than inferred
+// (batching an actively-edited directory trades saved Nix
+// per-derivation overhead for wasted compiler time on unchanged
+// siblings).
 package batch
 
 import (
@@ -32,12 +28,11 @@ import (
 // Group is one opt-in batch: a name (used to derive the eventual
 // multi-output derivation's own name) and the glob patterns matched,
 // UNANCHORED, against the TU's absolute source path — see Classify's
-// own docstring for why unanchored, not project-root-relative. Each
-// pattern is filepath.Match syntax per path segment (segments split
-// on "/"), PLUS a "**" segment meaning "zero or more path segments",
-// so "deps/**/*.c" reaches deps/hiredis/foo.c AND
-// deps/hiredis/sub/foo.c. Patterns use forward slashes regardless of
-// host OS.
+// own docstring for why unanchored. Each pattern is filepath.Match
+// syntax per path segment (segments split on "/"), plus a "**"
+// segment meaning "zero or more path segments", so "deps/**/*.c"
+// reaches deps/hiredis/foo.c and deps/hiredis/sub/foo.c. Patterns use
+// forward slashes regardless of host OS.
 type Group struct {
 	Name     string
 	Patterns []string
@@ -58,19 +53,17 @@ type Config struct {
 // path.
 //
 // Matching is UNANCHORED: a pattern like "deps/**/*.c" matches if
-// "deps/..." appears anywhere in the path's segment sequence, not
-// only from some computed root. This is deliberate, not a
-// convenience shortcut: the natural anchor — the source's path
-// relative to "the project root" — has no single stable value across
-// a build. internal/scan computes a ProjectRoot per compile call (the
-// common ancestor of that call's own cwd + -I dirs), so the same
-// logical file resolves to a DIFFERENT relative path depending on
-// which directory `make` happened to be in when it invoked the shim
-// for that particular TU — confirmed directly against a real redis
-// build, where compiling from inside deps/hiredis/ (no outside -I
-// references) collapsed ProjectRoot down to deps/hiredis itself,
-// making the "relative path" just "sds.c", not "deps/hiredis/sds.c".
-// An unanchored, absolute-path search has no such root to destabilize.
+// "deps/..." appears anywhere in the path's segment sequence. This is
+// deliberate: the natural anchor — the source's path relative to "the
+// project root" — has no single stable value across a build.
+// internal/scan computes a ProjectRoot per compile call (the common
+// ancestor of that call's own cwd + -I dirs), so the same logical file
+// can resolve to a different relative path depending on which
+// directory `make` happened to invoke the shim from — confirmed
+// against a real redis build, where compiling from inside
+// deps/hiredis/ collapsed ProjectRoot down to deps/hiredis itself,
+// making the "relative path" just "sds.c". An unanchored, absolute-
+// path search has no such root to destabilize.
 func (c Config) Classify(absPath string) (group string, ok bool) {
 	segs := strings.Split(filepath.ToSlash(absPath), "/")
 	for _, g := range c.Groups {
@@ -87,10 +80,9 @@ func (c Config) Classify(absPath string) (group string, ok bool) {
 }
 
 // matchSegs matches pat (glob segments, "**" meaning zero-or-more)
-// against name (path segments) anchored at name's own start — the
-// "unanchored" part of Classify's search comes from trying every
-// start offset into the full path at the call site, not from this
-// function itself.
+// against name (path segments) anchored at name's own start; the
+// "unanchored" search happens at the call site by trying every start
+// offset into the full path.
 func matchSegs(pat, name []string) bool {
 	if len(pat) == 0 {
 		return len(name) == 0

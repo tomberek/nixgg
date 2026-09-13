@@ -4,31 +4,23 @@
 // lives in the realised nix/ package alongside toolchain.nix which
 // supplies the pinned compiler/bash/coreutils store paths.
 //
-// The expression body is byte-deterministic: same inputs → same string
-// → same thunk id. That's what makes idempotent Write and Nix's own
-// eval cache work.
+// The expression body must be byte-deterministic: same inputs → same
+// string → same thunk id, for idempotent Write and Nix's eval cache.
 package expr
 
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"sort"
 	"strings"
 )
 
-// Compile builds a per-TU compile expression. Routes through the
-// shared Derivation struct: same struct also drives CompileJSON in
-// sandbox mode, so any field added here shows up in both wire
-// formats. See internal/expr/derivation.go on the equivalence
-// property.
+// Compile builds a per-TU compile expression via the shared
+// Derivation struct, which also drives CompileJSON in sandbox mode —
+// see derivation.go for the cross-format equivalence property.
 func Compile(p CompileParams) string {
-	d := compileDerivation(p)
-	return d.ToNix(p.Helpers)
+	return compileDerivation(p).ToNix(p.Helpers)
 }
 
-// compileDerivation is the shared "params → Derivation" builder for
-// the compile Kind. Used by Compile (→ ToNix) and CompileJSON
-// (→ ToJSON).
 func compileDerivation(p CompileParams) *Derivation {
 	return &Derivation{
 		Kind:       KindCompile,
@@ -54,8 +46,8 @@ type CompileParams struct {
 	WrapperEnv map[string]string // NIX_CFLAGS_COMPILE etc.
 }
 
-// Link builds a link expression. Same Derivation-based flow as
-// Compile — see compileDerivation.
+// Link builds a link expression via the same Derivation-based flow
+// as Compile.
 func Link(p LinkParams) string {
 	return linkDerivation(p).ToNix(p.Helpers)
 }
@@ -173,9 +165,8 @@ type Input struct {
 	Name string
 }
 
-// jsonArrayIndented renders a []string as a pretty JSON array. This is
-// what the bash driver used to embed inside a ”...” Nix string. The
-// indentation matches so thunk IDs are stable across the rewrite.
+// jsonArrayIndented renders a []string as a pretty, indented JSON
+// array — the exact indentation is load-bearing for thunk-id stability.
 func jsonArrayIndented(items []string) string {
 	if len(items) == 0 {
 		return "[]"
@@ -194,29 +185,13 @@ func jsonArrayIndented(items []string) string {
 	return b.String()
 }
 
-// SortedFlags is a defensive helper — some call sites want stable
-// ordering even when the caller passed flags in an incidental order.
-// Compile flags are typically order-sensitive so we don't use this
-// there; it's a utility for tests.
-func SortedFlags(in []string) []string {
-	out := append([]string(nil), in...)
-	sort.Strings(out)
-	return out
-}
-
 // ---------------------------------------------------------------------
-// JSON-drv emission (sandbox / dyn-drv mode)
+// JSON-drv emission (sandbox / dyn-drv mode): serializes the same shim
+// intent as above for `nix derivation add` (JSON on stdin) instead of a
+// `.nix` text file. Used when NIXGG_SANDBOX=1.
 //
-// These are byte-for-byte-different serialisations of the same shim
-// intent, targeting `nix derivation add` (which reads JSON on stdin)
-// rather than a `.nix` text file. Used when NIXGG_SANDBOX=1 — the
-// outer mkNixggBuild derivation runs the shims inside a builder-rpc-v0
-// sandbox where the only permitted store ops are add / text-add /
-// submit-output.
-//
-// The JSON we emit follows the format Nix's `derivation add` accepts,
-// which is *not* the same shape as the JSON `nix derivation show`
-// prints. Notably:
+// This JSON shape is what `nix derivation add` accepts, which is NOT
+// the same shape `nix derivation show` prints. Notably:
 //
 //   - `inputs.srcs` is an array of BASENAMES (hash+name), not full
 //     /nix/store/... paths. Full paths trigger "illegal base-32
@@ -226,9 +201,6 @@ func SortedFlags(in []string) []string {
 //   - `inputs.drvs` maps a full drv store path to `{ outputs = […]; }`
 //     — those are the drv-references we get back from previous
 //     `nix derivation add` calls.
-//
-// See nixgg/dyn-drv/NOTES.md for the exploration that established
-// this schema.
 
 // JSONDrv is the JSON shape `nix derivation add` accepts. Fields
 // mirror the Nix internal derivation type; we assemble it in-Go and
@@ -314,7 +286,7 @@ func CompileJSON(p CompileJSONParams) JSONDrv {
 		StoreDeps:  p.StoreDeps,
 		WrapperEnv: p.Env,
 	}
-	return d.toJSON(p.Srcs, nil)
+	return d.toJSON(p.Srcs)
 }
 
 // LinkJSONParams is the sandbox-mode analog of LinkParams. Inputs
@@ -396,7 +368,7 @@ func ArchiveJSON(p ArchiveJSONParams) JSONDrv {
 		StoreDeps:   p.StoreDeps,
 		WrapperEnv:  p.Env,
 	}
-	return d.toJSON(p.ExtraSrcs, nil)
+	return d.toJSON(p.ExtraSrcs)
 }
 
 // LinkJSON produces a JSONDrv for a link step. Delegates to
@@ -422,7 +394,7 @@ func LinkJSON(p LinkJSONParams) JSONDrv {
 		StoreDeps:          p.StoreDeps,
 		WrapperEnv:         p.Env,
 	}
-	return d.toJSON(p.ExtraSrcs, nil)
+	return d.toJSON(p.ExtraSrcs)
 }
 
 // inputsFromJSON translates the shim-facing JSONDrvInput type

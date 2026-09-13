@@ -6,19 +6,26 @@
 # fixture's shape.
 #
 # SCOPE, stated plainly: `make tinyconfig` (the smallest buildable
-# x86_64 config Kbuild ships), target `vmlinux` only — no modules
-# (`CONFIG_MODULES` is off in tinyconfig), no `bzImage`/install steps.
-# genksyms/modpost's own tool-dispatch situation is UNCONFIRMED for a
-# modules-enabled build; widening to full defconfig + modules is
-# deliberately a separate, later step, not attempted here.
+# x86_64 config Kbuild ships), target `vmlinux` plus a SMALL, deliberately
+# minimal set of loadable modules (`CONFIG_TEST_DHRY`, a self-contained
+# multi-object module with zero Kconfig deps, and `CONFIG_SAMPLE_KOBJECT`,
+# two single-object modules) — enough to exercise the real module compile→
+# link→modpost→.ko chain without the multi-hour build a full
+# `x86_64_defconfig` would cost. genksyms (CONFIG_MODVERSIONS) and
+# BTF-for-modules (CONFIG_DEBUG_INFO_BTF_MODULES) are both off by default
+# even with modules enabled — deliberately not exercised here; see
+# phase2's own docstring for where the module chain lives and why
+# neither of those two is a blocker for widening further.
 #
 # BOTH MODES WORK, confirmed and retested, not a guess. Native:
 # `nix develop .#linux-kernel-shell` running this fixture's own
-# buildCommand produces a real, valid ELF vmlinux. Sandbox: `nix
-# build .#linux-kernel` (mkNixggBuild's own default) ALSO succeeds —
-# confirmed via a real end-to-end sandbox build producing a real,
-# valid ELF vmlinux (`file vmlinux` → "ELF 32-bit LSB executable,
-# Intel 80386 ... statically linked, not stripped").
+# buildCommand produces a real, valid ELF vmlinux plus 3 real,
+# valid .ko modules. Sandbox: `nix build .#linux-kernel`
+# (mkNixggBuild's own default) ALSO succeeds — confirmed via a real
+# end-to-end sandbox build producing the same 4 real files
+# (`file vmlinux` → "ELF 32-bit LSB executable, Intel 80386 ...
+# statically linked, not stripped"; each .ko → "ELF 32-bit LSB
+# relocatable, Intel 80386 ... not stripped").
 #
 # Getting sandbox mode working required a two-phase split (see
 # `phase1`/`phase2` below), because a single mkNixggBuild derivation
@@ -169,6 +176,42 @@
 # `-std=gnu11` avoids GCC 15's C23-by-default `bool`/`true`/`false`
 # keyword conflict with the kernel's own pre-C23 `typedef _Bool bool`
 # compat shim in include/linux/stddef.h.
+#
+# `KBUILD_BUILD_USER`/`KBUILD_BUILD_HOST` are pinned in both phases —
+# a real drv-equivalence run (tests/drv-equivalence.sh, phase1 only,
+# native vs. sandbox) found init/version.c's own tu-version.o.drv
+# hashes genuinely diverging between the two runs, NOT because of
+# anything native/sandbox-specific: scripts/mkcompile_h bakes
+# `$(whoami)`/`uname -n` into include/generated/compile.h by default,
+# so two SEPARATE invocations (this session's native-mode run in one
+# tempdir, the sandbox build in another) produce different content
+# regardless of mode. The divergence rippled from tu-version.o.drv up
+# through init/built-in.a into arch/x86/built-in.a and the top-level
+# built-in.a (4 of ~519 total drvs) — confirmed by diffing the ATerm
+# of each mismatched pair directly, not guessed. Kbuild's own
+# KBUILD_BUILD_USER/KBUILD_BUILD_HOST env vars (scripts/mkcompile_h's
+# own override hook) close this cleanly; every other one of the ~519
+# drvs phase1 registers was already byte-identical without them.
+#
+# The same run also surfaced a benign, EXPECTED asymmetry (not a bug,
+# not fixed): native mode's own drv set includes bin-modpost.drv/
+# tu-modpost.o.drv/tu-file2alias.o.drv/etc that sandbox mode's doesn't.
+# Root cause: `$(build-dir): prepare` in the top Makefile makes `make
+# .` re-descend into `prepare0: archprepare; $(MAKE) $(build)=scripts/mod`
+# a SECOND time — harmless in Kbuild's own terms (modpost.o etc. are
+# already up to date, this is just make re-checking a prerequisite),
+# but the second descent happens OUTSIDE this fixture's own
+# `NIXGG_BYPASS=1 make prepare` pre-pass, so native mode's shim
+# intercepts it and sandbox mode's linkSandbox path apparently doesn't
+# resubmit an identical drv a second time. modpost's own host build
+# has zero connection to built-in.a/vmlinux.a (scripts/mod/Makefile's
+# `hostprogs-always-y`, never `obj-y`) — confirmed directly — so this
+# never touches the target drv hashes phase1 actually exposes
+# (results.vmlinux-a/lib-a/arch-lib-a), only inflates native mode's
+# own total drv count by a few host-tool entries. Not worth chasing
+# further: fixing it would mean making native mode's `make .` somehow
+# skip re-descending into scripts/mod, which isn't nixgg's call to
+# make — Kbuild's own Makefile decides that, not the shim.
 {
   mkNixggBuild,
   stdenv,
@@ -206,6 +249,36 @@ let
   # mPiT` reorder call (see the buildCommand's own comment on that —
   # same no-op-on-x86 reasoning as the single-phase attempt this
   # fixture's history already validated).
+  #
+  # One module .o is ALSO built here, as an extra explicit single-
+  # target alongside `.` in the SAME `make` invocation (Kbuild's own
+  # `single-goals` mechanism folds it into the one real recursive
+  # descend — confirmed directly, no separate `make modules` pass
+  # needed): `lib/test_dhry.o` (CONFIG_TEST_DHRY, a genuine multi-
+  # object module — `test_dhry-objs := dhry_1.o dhry_2.o dhry_run.o`
+  # — exercising Kbuild's own `ld -r -o $@ @$<` response-file link,
+  # already handled generically by dispatch.ExpandRspfiles). Chosen
+  # for having NO Kconfig deps/selects at all (confirmed directly:
+  # no `depends on`/`select` on this entry), keeping the config
+  # surface minimal — this is deliberately NOT a full
+  # `x86_64_defconfig`+modules build (see this file's own top
+  # docstring for why). `make .` alone does NOT build it — an obj-m
+  # entry is invisible to the bare `build-dir` target unless named
+  # explicitly (confirmed directly: without listing it, `find -name
+  # 'test_dhry.o'` comes up empty after `make .` runs).
+  #
+  # CONFIG_SAMPLE_KOBJECT (kobject-example.o/kset-example.o) is ALSO
+  # enabled here (needed so `.config`/`modules.order` know about it),
+  # but its two objects are deliberately NOT phase1 targets: each is
+  # a bare COMPILE output (no link step of its own — `obj-
+  # $(CONFIG_SAMPLE_KOBJECT) += kobject-example.o kset-example.o`,
+  # no `-objs`/`-y` combining them), and mkNixggBuild's own targets
+  # mechanism only ever submits LINK/ARCHIVE outputs (via
+  # maybeSubmit, called from link.go/archive.go — compile.go never
+  # calls it at all). Declaring a bare compile output as a target
+  # fails the whole derivation ("failed to submit output path") —
+  # confirmed directly. Phase 2 rebuilds both from `src` directly
+  # instead (cheap: 2 TUs, no acceleration needed).
   phase1 = mkNixggBuild {
     pname = "linux-kernel-phase1";
     version = "6.12";
@@ -214,15 +287,26 @@ let
       { name = "vmlinux-a"; path = "vmlinux.a"; }
       { name = "lib-a"; path = "lib/lib.a"; }
       { name = "arch-lib-a"; path = "arch/x86/lib/lib.a"; }
+      { name = "test-dhry-o"; path = "lib/test_dhry.o"; }
     ];
     nativeBuildInputs = [ flex bison pkg-config bc ];
     buildInputs = [ elfutils ];
     buildCommand = ''
+      export KBUILD_BUILD_USER=nixgg
+      export KBUILD_BUILD_HOST=nixgg
       NIXGG_BYPASS=1 make tinyconfig
+      NIXGG_BYPASS=1 cat >> .config <<'EOF'
+CONFIG_MODULES=y
+CONFIG_RUNTIME_TESTING_MENU=y
+CONFIG_TEST_DHRY=m
+CONFIG_SAMPLES=y
+CONFIG_SAMPLE_KOBJECT=m
+EOF
+      NIXGG_BYPASS=1 make olddefconfig
       NIXGG_BYPASS=1 make prepare
       make -j"$NIX_BUILD_CORES" \
         KCFLAGS="-Wno-error=unterminated-string-initialization -std=gnu11" \
-        .
+        lib/test_dhry.o .
       ar cDPrT vmlinux.a ./built-in.a
     '';
   };
@@ -317,7 +401,17 @@ let
     buildPhase = ''
       runHook preBuild
 
+      export KBUILD_BUILD_USER=nixgg
+      export KBUILD_BUILD_HOST=nixgg
       make tinyconfig
+      cat >> .config <<'EOF'
+CONFIG_MODULES=y
+CONFIG_RUNTIME_TESTING_MENU=y
+CONFIG_TEST_DHRY=m
+CONFIG_SAMPLES=y
+CONFIG_SAMPLE_KOBJECT=m
+EOF
+      make olddefconfig
       make prepare
       # vmlinux.lds is NOT produced by `make prepare` — it's a plain
       # extra-y target only reached during the FULL recursive descend
@@ -345,12 +439,52 @@ let
       nm -n vmlinux | sed -f scripts/mksysmap > System.map
       scripts/sorttable vmlinux
 
+      # Module chain, entirely OUTSIDE Kbuild's own recursive make,
+      # same rationale as vmlinux's own link above: `make modules`
+      # needs vmlinux.o — which `%.o` sitting in Kbuild's own
+      # single-targets list refuses to build directly ("No rule to
+      # make target vmlinux.o", the identical single-target-dispatch
+      # wall vmlinux.a/vmlinux.o originally hit — see this file's own
+      # top docstring), so it's linked by hand instead, replicating
+      # scripts/Makefile.vmlinux_o's own cmd_ld_vmlinux.o exactly for
+      # this config (no LTO, so no .tmp_initcalls.lds; no
+      # CONFIG_BUILTIN_MODULE_RANGES, so no -Map=). Confirmed byte-
+      # for-byte reproducible against a real, complete single-tree
+      # `make vmlinux.o` (same md5sum) before being written up here.
+      ld -m elf_i386 -z noexecstack --no-warn-rwx-segments \
+        -r -o vmlinux.o \
+        --whole-archive vmlinux.a --no-whole-archive \
+        --start-group lib/lib.a arch/x86/lib/lib.a --end-group
+
+      # `make modules` rebuilds test_dhry/kobject-example/kset-
+      # example from src directly here — NOT borrowed from phase1's
+      # own test-dhry-o result the way vmlinux.a/lib.a are borrowed
+      # above. Reason: vmlinux.a/lib.a are pure LINK INPUTS, consumed
+      # once and never handed back to `make`'s own dependency graph
+      # in this script — but a module's .o participates in `make
+      # modules`'s OWN staleness tracking (if_changed's .cmd files),
+      # and a symlinked-in .o with no matching .cmd here would read
+      # as "unknown, must rebuild" and try to re-run test_dhry.o's
+      # own `ld -r` link — which needs dhry_1.o/dhry_2.o/dhry_run.o,
+      # absent in this sparse tree (confirmed directly: exactly this
+      # failure mode, same class of problem the phase split itself
+      # exists to avoid, just at module scope). Cheap enough (5 TUs
+      # total across all 3 modules) to rebuild plain, unaccelerated —
+      # phase1's own real nixgg-shimmed build of lib/test_dhry.o
+      # already proves the multi-object module response-file link
+      # (`ld -r -o $@ @$<`) works correctly through the shim; this
+      # step doesn't need to prove it twice.
+      make -j"$NIX_BUILD_CORES" \
+        KCFLAGS="-Wno-error=unterminated-string-initialization -std=gnu11" \
+        modules
+
       runHook postBuild
     '';
     installPhase = ''
       runHook preInstall
       mkdir -p "$out"
       cp -a vmlinux System.map "$out/"
+      cp -a lib/test_dhry.ko samples/kobject/kobject-example.ko samples/kobject/kset-example.ko "$out/"
       runHook postInstall
     '';
   };

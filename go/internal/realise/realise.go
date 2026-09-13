@@ -24,20 +24,13 @@ import (
 
 // Realise builds `thunkPath`'s whole DAG in a single Nix invocation and
 // re-points every caller-visible symlink at the resulting store paths.
-// `target` is the working-tree path the caller wants materialised
-// first (a compile/link/archive output); its manifest siblings get
-// promoted too.
+// `target` is the working-tree path to materialise first (a
+// compile/link/archive output); its manifest siblings get promoted too.
 //
-// The critical optimisation vs a naïve implementation: **we call Nix
-// exactly once**, not once per intermediate thunk. Nix's eval walks the
-// `import <path>/<id>.nix` graph natively; all we do is:
-//
-//  1. Walk the graph locally to enumerate the child thunks.
-//  2. Write a helper .nix that exposes each as a named attribute.
-//  3. `nix build --file <helper> <attr>…` — Nix realises everything
-//     under one process, one eval, one daemon session.
-//  4. Parse the printed store paths, one per attr, and promote each
-//     thunk's manifest.
+// We call Nix exactly once, not once per thunk: walk the import graph
+// locally to enumerate child thunks, write a helper .nix exposing each
+// as a named attribute, then `nix build --file <helper> <attr>...` so
+// Nix realises everything under one eval/daemon session.
 func Realise(l paths.Layout, cfg *toolchain.Config, thunkPath, target string) error {
 	children, err := CollectThunks(thunkPath)
 	if err != nil {
@@ -235,37 +228,27 @@ func promoteManifest(l paths.Layout, cfg *toolchain.Config, id thunk.ID, storePa
 // equals the caller-visible symlink's basename (the shim set outName
 // that way), so we can construct the source path directly.
 //
-// We copy bytes from the store into the working tree (via reflink where
-// possible, else read+write) rather than symlinking, because:
+// We copy bytes into the working tree rather than symlinking, because:
 //
-//  1. Nix pins store-path mtimes to 1969 for reproducibility. If the
-//     caller-visible file is a symlink, make's stat(2) follows it and
-//     sees a 1969 mtime — always older than the .c source, forcing a
-//     full rebuild on every subsequent make invocation.
-//
+//  1. Nix pins store-path mtimes to 1969 for reproducibility. A symlink
+//     target's mtime (via stat(2), which make uses) would always look
+//     older than the .c source, forcing a full rebuild every `make`.
 //  2. Hardlinks avoid the mtime issue but inherit the store's 0444
 //     mode, which breaks tools that expect to overwrite (some ar/ld
 //     variants; the user's `chmod +x` scripts).
 //
-// A copy is 30-100KB per TU, ~5MB across a redis build. Cheap next to
-// the wall-clock savings from correct incremental behavior.
-//
-// Subdir is guessed from target's own filename via expr.ArtifactSubdir
-// — correct for both of this function's own callers (Realise's own
-// automatic promotion, always driven by an actual Compile/Link/Archive
-// output whose name matches its own Kind's convention) but WRONG for a
-// link output that happens to be named like a compile one (Linux
-// Kbuild's own vmlinux.o) — see PromoteToStoreSubdir for that case.
+// Subdir is guessed from target's own filename via expr.ArtifactSubdir.
+// That's correct for Realise's own automatic promotion (always driven
+// by a Compile/Link/Archive output matching its own Kind's naming
+// convention), but wrong for a link output named like a compile one
+// (Linux Kbuild's vmlinux.o) — see PromoteToStoreSubdir for that case.
 func PromoteToStore(l paths.Layout, cfg *toolchain.Config, thunkID thunk.ID, storePath, target string) error {
 	return PromoteToStoreSubdir(l, cfg, thunkID, storePath, target, expr.ArtifactSubdir(filepath.Base(target)))
 }
 
-// PromoteToStoreSubdir is PromoteToStore with an explicit subdir
-// (skipping the filename guess) — for a caller that already knows its
-// own artifact's real Kind and doesn't need to re-derive it from the
-// output's basename. See PromoteToStore's own docstring for why the
-// guess can be wrong, and shim.realiseAndLink for the caller that
-// needs this.
+// PromoteToStoreSubdir is PromoteToStore with an explicit subdir,
+// for a caller that already knows its artifact's real Kind instead of
+// re-deriving it from the output's basename (shim.realiseAndLink).
 func PromoteToStoreSubdir(l paths.Layout, cfg *toolchain.Config, thunkID thunk.ID, storePath, target, subdir string) error {
 	base := filepath.Base(target)
 	src := altStoreOnDisk(cfg.Store, storePath) + "/"

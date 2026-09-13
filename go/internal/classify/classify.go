@@ -60,27 +60,17 @@ func (k Kind) String() string {
 type Result struct {
 	Kind Kind
 	Ref  string
-	// Sub is the path of the target relative to Ref, set when
-	// Kind == Store and the target lives BELOW the store root rather
-	// than directly inside it — e.g. Ref=/nix/store/…-zlib with
-	// Sub="lib/libz.so". Empty when the target is Ref/<basename>.
-	//
-	// Callers need both halves: Ref is what `builtins.storePath` and
-	// inputs.srcs require (they take a root, not an arbitrary subpath),
-	// while Ref+"/"+Sub is what belongs on the compiler's argv.
-	// Reconstructing the argv from Ref plus the basename alone silently
-	// loses the intermediate directories — which is how LLVM's
-	// positional `…-zlib-1.3.2/lib/libz.so` became a link against a
-	// nonexistent `…-zlib-1.3.2/libz.so`.
+	// Sub is the target's path relative to Ref, set when Kind == Store
+	// and the target lives below the store root rather than directly
+	// inside it (Ref=/nix/store/…-zlib, Sub="lib/libz.so"). Empty when
+	// the target is Ref/<basename>. Ref alone is what builtins.storePath
+	// and inputs.srcs accept (a root, not an arbitrary subpath); use
+	// ArgvPath to reconstruct the full file path.
 	Sub string
-	// Err carries the reason a path could not be inspected, when Kind
-	// fell back to Regular because of an Lstat failure rather than
-	// because the file genuinely is an ordinary file nixgg doesn't own.
-	//
-	// Those two cases are behaviourally identical — both passthrough —
-	// but they need different diagnostics. EACCES on a build output or
-	// an ELOOP symlink chain reported as "isn't a nixgg symlink" sends
-	// the reader looking for an ownership problem that isn't there.
+	// Err is set when Kind fell back to Regular because Lstat/readlink
+	// failed (EACCES, ELOOP), not because the file is genuinely an
+	// ordinary file nixgg doesn't own. Both cases passthrough the same
+	// way, but the diagnostic needs to say which happened.
 	Err error
 	// ThunkID is set when Kind == Store AND we know which thunk file
 	// produced this output (only populated for promoted regular files
@@ -90,11 +80,7 @@ type Result struct {
 }
 
 // ArgvPath returns the path that belongs on a compiler/linker command
-// line for a Store result, given the caller-visible name it was found
-// under. Ref alone is a directory; Ref+Sub is the file.
-//
-// Falls back to Ref/<name> when Sub is empty, which is the shape every
-// nixgg-produced output has (a drv output dir containing one artifact).
+// line for a Store result. Falls back to Ref/<name> when Sub is empty.
 func (r Result) ArgvPath(name string) string {
 	if r.Sub != "" {
 		return r.Ref + "/" + r.Sub
@@ -115,49 +101,26 @@ func (r Result) Reason() string {
 // Target classifies a single path.
 //
 // altStorePrefix is the on-disk root of the alt store (e.g.
-// "/tmp/nixgg-store"), or "" for a system store. We strip it when
-// reporting store paths so the reference is always the canonical
-// /nix/store/... form that Nix expects.
+// "/tmp/nixgg-store"), or "" for a system store; stripped from store
+// paths so the reference is always canonical /nix/store/....
 //
-// l is the paths.Layout — needed to consult the "promoted" registry,
-// which records regular-file targets that came from a store output.
-// Force copies bytes into the working tree (rather than symlinking)
-// so make's mtime dependency check works, but downstream link/ar
-// shims still need to identify the file's store origin. Pass a
-// zero-value Layout to skip the registry check.
+// l is consulted for the "promoted" registry (regular-file targets
+// force copied from a store output, rather than symlinked, so make's
+// mtime check works). Pass a zero-value Layout to skip that check.
 func Target(path, altStorePrefix string, l paths.Layout) Result {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Result{Kind: Absent}
 		}
-		// Permission denied, symlink loop, I/O error. Treat as Regular
-		// (passthrough is the safe action) but keep the cause so the
-		// caller can say what actually happened.
 		return Result{Kind: Regular, Err: err}
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		// Regular file on disk. Could be:
-		//   1. A sandbox-mode drvref stub: magic header + drv path.
-		//      Written by sandbox.PointOutputAtDrv (see docstring).
-		//   2. A "promoted" store output (force copied bytes here).
-		//   3. A foreign dependency already living directly under
-		//      /nix/store/ — not a symlink at all, just an ordinary
-		//      file at its final resolved location. meson (QEMU) and
-		//      some CMake generators emit an absolute store path as a
-		//      literal positional link argument rather than going
-		//      through a -L/-l pair or a SONAME symlink chain — e.g.
-		//      "/nix/store/…-zlib-1.3.2-static/lib/libz.a" appearing
-		//      verbatim on the link line. Every other route to a
-		//      foreign /nix/store/ dependency (an ordinary symlink,
-		//      below) already classifies as Store; treating this one
-		//      differently just because there's no symlink hop would
-		//      silently degrade the WHOLE link to Passthrough (see
-		//      classifyInputs' own docstring on why one unmodelable
-		//      input takes down the entire step) — exactly the
-		//      failure QEMU's own libz.a hit before this case existed.
-		//   4. Genuinely a regular file (produced by some other,
-		//      unshimmed step in the caller's own build tree).
+		// Regular file, not a symlink. Could be a sandbox-mode drvref
+		// stub, a promoted store output, a foreign dependency living
+		// directly under /nix/store/ (meson/CMake sometimes emit an
+		// absolute store path as a literal link argument instead of a
+		// symlink — QEMU's libz.a did this), or a genuinely regular file.
 		if ref := drvref.Path(path); ref != "" {
 			return Result{Kind: Drv, Ref: ref}
 		}
@@ -179,22 +142,15 @@ func Target(path, altStorePrefix string, l paths.Layout) Result {
 
 	dest, err := readlinkFollow(path)
 	if err != nil {
-		// A symlink we cannot resolve at all: a loop (ELOOP), or a
-		// component we lack permission to traverse. Same shape as the
-		// Lstat failure above — keep the cause.
 		return Result{Kind: Regular, Err: err}
 	}
 
-	// Strip alt-store on-disk prefix to reveal canonical /nix/store/...
 	canonical := dest
 	if altStorePrefix != "" && strings.HasPrefix(dest, altStorePrefix+"/nix/store/") {
 		canonical = strings.TrimPrefix(dest, altStorePrefix)
 	}
-	// Sandbox-mode: symlink → /nix/store/<hash>-<name>.drv. Reported
-	// as Drv so link/archive shims include it under inputs.drvs and
-	// reference it via the CA output placeholder. Must be checked
-	// BEFORE the generic /nix/store/ branch because .drv paths *are*
-	// under /nix/store.
+	// Check .drv before the generic /nix/store/ branch below, since .drv
+	// paths are themselves under /nix/store/.
 	if strings.HasPrefix(canonical, "/nix/store/") && strings.HasSuffix(canonical, ".drv") {
 		return Result{Kind: Drv, Ref: canonical}
 	}
@@ -205,40 +161,25 @@ func Target(path, altStorePrefix string, l paths.Layout) Result {
 	if strings.HasSuffix(dest, ".nix") {
 		return Result{Kind: Thunk, Ref: dest}
 	}
-	// Sandbox mode again: the symlink resolved to one of our own drvref
-	// stubs rather than into the store. This is what a SONAME alias chain
-	// looks like — libfoo.so -> libfoo.so.1.2.3, ordinary libtool and
-	// autotools output — where the target is the stub nixgg wrote for the
-	// real link output.
-	//
-	// Without this, such an input classifies as Regular, the link shim's
-	// default case fires, and the whole link silently degrades to an
-	// unaccelerated Passthrough. The direct-regular-file branch above has
-	// always checked this; the symlink path did not.
+	// The symlink resolved to one of our own drvref stubs rather than
+	// into the store — a SONAME alias chain (libfoo.so -> libfoo.so.1.2.3)
+	// pointing at the stub nixgg wrote for the real link output.
 	if ref := drvref.Path(dest); ref != "" {
-		// Sub carries the referenced drv's REAL output basename
-		// (dest's own basename — e.g. "libcrypto.so.3"), not the
-		// caller's alias name ("libcrypto.so"). Without this, the
-		// emitted link line reaches for "<drv-out>/bin/libcrypto.so"
-		// — a file that never exists, since the drv's own output is
-		// named libcrypto.so.3 — and ld fails with "cannot find ...:
-		// No such file or directory". Confirmed directly against
-		// openssl's engines/*.so, which link against the plain
-		// `ln -s libcrypto.so.3 libcrypto.so` alias its own Makefile
-		// creates.
+		// Sub must be the drv's real output basename (dest's own
+		// basename, e.g. "libcrypto.so.3"), not the alias name
+		// ("libcrypto.so") — otherwise the emitted link line reaches
+		// for a file the drv never produced. Confirmed against
+		// openssl's engines/*.so linking through its own
+		// `ln -s libcrypto.so.3 libcrypto.so` alias.
 		return Result{Kind: Drv, Ref: ref, Sub: filepath.Base(dest)}
 	}
 	return Result{Kind: Regular}
 }
 
 // splitStorePath splits a store path into its /nix/store/<hash>-<name>
-// root — the part `builtins.storePath` and inputs.srcs accept — and the
-// remainder below it.
-//
-// sub is "" when p IS the root, and otherwise the relative path inside
-// it: ("…-zlib", "lib/libz.so") for "…-zlib/lib/libz.so". Callers that
-// put the target on a command line must use root+"/"+sub, not root plus
-// the basename; see Result.Sub.
+// root (what builtins.storePath/inputs.srcs accept) and the remainder
+// below it: ("…-zlib", "lib/libz.so") for "…-zlib/lib/libz.so". sub is
+// "" when p is itself the root.
 func splitStorePath(p string) (root, sub string) {
 	rest := strings.TrimPrefix(p, "/nix/store/")
 	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
