@@ -1,26 +1,17 @@
-# Archive CA derivation.
+# Archive CA derivation. Same `inputs`/`extraInputs` shape as linker.nix;
+# the `ar` command comes from Go — see resolve-script.nix.
 #
-# `inputs` is a native Nix list of { drv, name }. Same shape as linker.nix.
-#
-# The `ar` command comes from Go — see resolve-script.nix.
-#
-# Note `compilerRoot` here is whatever provides `ar` (binutils), not a
-# compiler. The name is historical: it is the third positional toolchain
-# root every helper takes, and this one puts it on PATH for `ar`. Go's
-# side of the same value is the Derivation.AR field.
+# `compilerRoot` here is whatever provides `ar` (binutils), not a
+# compiler — it's the third positional toolchain root every helper
+# takes. Go's side is the Derivation.AR field.
 {
   compilerRoot  ? (import ./toolchain.nix).compilerRoot,
   bashRoot      ? (import ./toolchain.nix).bashRoot,
   coreutilsRoot ? (import ./toolchain.nix).coreutilsRoot,
   outName,
-  # See linker.nix's own docstring for this param — same mechanism,
-  # default "ar-<outName>" convention preserved.
   name ? "ar-${outName}",
   inputs,
-  # Dependency-only inputs — see linker.nix's own docstring for the
-  # full mechanism (identical here: a thin archive's members must be
-  # mounted, not re-emitted into the `ar` command line).
-  extraInputs ? [ ],
+  extraInputs ? [ ],  # see linker.nix — same mount-not-relist mechanism
   scriptTemplate,
   markerTag,
   storeDepsJSON ? "[]",

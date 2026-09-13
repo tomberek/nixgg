@@ -1,36 +1,26 @@
 # Combined compile+archive CA derivation for a same-group batch (see
 # go/internal/batch and go/internal/expr/batcharchive.go).
 #
-# Unlike builder.nix/archiver.nix, this Kind never needs
-# resolve-script.nix's marker substitution: every input is a plain
-# staged source tree the caller (go/internal/shim's tryBatchArchive)
-# already confirmed belongs to this one batch — never a not-yet-
-# realized sibling drv/thunk, which is the only thing markers exist
-# to defer. Go renders each member's own compile line as fully
-# shell-quoted, already-resolved text (compileLine); the ONE thing
-# left for this file to interpolate is each member's own srcTree path
-# literal, the same way builder.nix interpolates its single srcTree —
-# Nix resolves a path literal to a store path at eval time, so Go
-# never needs to know the resolved path to reference it correctly.
+# Unlike builder.nix/archiver.nix, this Kind never needs resolve-script.nix's
+# marker substitution: go/internal/shim's tryBatchArchive already confirmed
+# every input belongs to this one batch, never a not-yet-realized sibling
+# drv/thunk. Go renders each member's compile line fully resolved
+# (compileLine); the only thing left to interpolate here is each member's
+# own srcTree path literal.
 #
-# `compilerRoot` here (as in archiver.nix) is whatever provides `ar`
-# on PATH — go/internal/expr/batcharchive.go's own BatchArchiveJSON
-# puts the SAME root on PATH for every member's own compile, matching
-# every current fixture's assumption of one toolchain per build (see
-# BatchArchiveJSONParams.AR's own docstring).
+# `compilerRoot` is whatever provides `ar` on PATH — batcharchive.go puts
+# the same root on PATH for every member's own compile (one toolchain per
+# build, see BatchArchiveJSONParams.AR).
 {
   compilerRoot ? (import ./toolchain.nix).compilerRoot,
   bashRoot ? (import ./toolchain.nix).bashRoot,
   coreutilsRoot ? (import ./toolchain.nix).coreutilsRoot,
   outName,
   arFlags,
-  # [ { srcTree, outName, compileLine } ... ], in the archive's own ar
-  # argv order — srcTree is a Nix path literal (unquoted at the Go
-  # call site, see batcharchive.go's batchMembersList), outName is
-  # this member's own object filename (matches the $objroot/<outName>
-  # compileLine already writes to), compileLine is a complete,
-  # already shell-quoted `"$tool" ...flags... -c "source" -o
-  # "$objroot/outName"` invocation missing only its own `cd`.
+  # [ { srcTree, outName, compileLine } ... ], in the archive's ar argv
+  # order. srcTree is a Nix path literal; outName is the member's object
+  # filename ($objroot/<outName>); compileLine is a complete, already
+  # shell-quoted compile invocation missing only its own `cd`.
   members,
   storeDepsJSON ? "[]",
   wrapperEnvJSON ? "{}",
@@ -44,50 +34,31 @@ let
   wrapperEnv = builtins.fromJSON wrapperEnvJSON;
 
   # One `(cd <srcTree> && <compileLine>) &` + `gg_after $!` per member,
-  # in order, then a wait-out of every still-running member, then one
-  # `ar` invocation over every member's own $objroot/<outName>. Mirrors
+  # then a wait-out of every still-running member, then one `ar`
+  # invocation over every member's own $objroot/<outName>. Mirrors
   # go/internal/expr/batcharchive.go's batchArchiveScript exactly —
-  # this file's job is ONLY to splice in each member's own srcTree,
-  # everything else (including the bounded-concurrency runner itself,
-  # gg_max/gg_pids/gg_after/gg_fail) is already-resolved text from Go,
-  # copied here verbatim so native and sandbox modes can't drift. See
-  # batchArchiveScript's own docstring for why compiles run with
-  # bounded concurrency (capped at $NIX_BUILD_CORES) instead of
-  # strictly sequentially, and why the wait strategy is FIFO
-  # (`wait "$pid"` on an explicit pid) rather than `wait -n`.
+  # everything but each member's srcTree is already-resolved text from
+  # Go, copied here verbatim so native and sandbox modes can't drift.
   #
   # Plain builtins.concatStringsSep, not lib.concatMapStrings(Sep) —
-  # this file must not depend on <nixpkgs> (see builder.nix's own
-  # docstring on why: parallel invocations racing on nixpkgs input
-  # evaluation), so it can't take `lib` as a param the way the
-  # flake-level stdenv wrappers do.
-  # Quoted exactly like go/internal/expr/batcharchive.go's own
-  # batchArchiveScript quotes its own `cd "<SrcStore>"` — an
-  # unquoted path literal here produced a byte-different script from
-  # the sandbox path (native mode's shell never needed the quotes to
-  # run correctly, since Nix path literals never contain spaces/shell
-  # metacharacters, but drv-hash EQUIVALENCE between the two modes
-  # requires identical script TEXT, not just equivalent behavior).
-  # Caught by tests/batch-drv-equivalence.sh.
+  # this file must not depend on <nixpkgs> (parallel invocations would
+  # race on nixpkgs input evaluation), so it can't take `lib` as a param.
+  #
+  # Quoted exactly like batcharchive.go quotes its own `cd "<SrcStore>"`:
+  # drv-hash equivalence between native and sandbox modes requires
+  # identical script TEXT, not just equivalent behavior (checked by
+  # tests/batch-drv-equivalence.sh).
   compileLines = builtins.concatStringsSep ""
     (map (m: "(cd \"${m.srcTree}\" && ${m.compileLine}) &\ngg_after $!\n") members);
   objList = builtins.concatStringsSep " "
     (map (m: ''"$objroot/${m.outName}"'') members);
 
-  # $objroot's own location depends on arFlags: a THIN archive (`T`)
-  # stores each member's file PATH, not its bytes, so those paths
-  # must survive after THIS derivation's own build sandbox is torn
-  # down — a build-tmp scratch dir does not. Byte-identical to
-  # go/internal/expr/batcharchive.go's own batchArchiveScript — see
-  # its docstring for the full rationale (confirmed via a real CA
-  # derivation that thin-archives a sibling file inside its own
-  # $out: Nix rewrites the archive's self-reference to the final
-  # resolved store path, making it fully self-contained with no
-  # members-sidecar mechanism needed). A non-thin archive keeps the
-  # original scratch dir unchanged — its members are copied INTO the
-  # archive's own bytes by `ar` itself, so nothing needs to survive,
-  # and every existing (non-thin) batch fixture's pinned drv hash
-  # must not change.
+  # $objroot's location depends on arFlags: a THIN archive (`T`) stores
+  # each member's file PATH, not its bytes, so those paths must survive
+  # after this derivation's build sandbox is torn down — put them under
+  # $out. A non-thin archive copies members' bytes INTO the archive
+  # itself, so a scratch dir is fine. Byte-identical to batcharchive.go's
+  # own batchArchiveScript.
   isThin = builtins.match ".*T.*" arFlags != null;
   objrootSetup =
     if isThin
@@ -100,12 +71,9 @@ let
       objroot="$PWD/.nixgg-objs"
     '';
 
-  # Byte-identical to go/internal/expr/batcharchive.go's own
-  # batchConcurrencyPreamble/batchConcurrencyDrain constants — see
-  # that file's own docstring for the full rationale. Copied verbatim
-  # rather than computed, same convention this file already uses for
-  # compileLines/objList: Go is the one place either mode's script
-  # text is authored, this file only ever splices in per-member Nix
+  # Byte-identical to batcharchive.go's own batchConcurrencyPreamble/
+  # batchConcurrencyDrain constants — Go is the one place either mode's
+  # script text is authored, this file only splices in per-member Nix
   # path literals.
   concurrencyPreamble = ''
     gg_max="''${NIX_BUILD_CORES:-1}"

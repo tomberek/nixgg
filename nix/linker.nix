@@ -1,50 +1,38 @@
 # Link CA derivation.
 #
-# `inputs` is a native Nix list of { drv, name }. Each `drv` is either
-# a derivation (thunk mode: not-yet-built, produced by `import
-# .../foo.nix`) or a `pureStorePath` result (realise mode: already in
-# the store). Either way, `${item.drv}/${item.name}` interpolates to
-# the linker CLI.
+# `inputs` is a native Nix list of { drv, name }; `drv` is either an
+# unrealised sibling derivation or a `pureStorePath` result. Either way
+# `${item.drv}/${item.name}` interpolates to the linker CLI.
 #
-# The link command itself comes from Go — see resolve-script.nix. That
-# includes the `-l`-after-inputs ordering that ffmpeg needed: this file
-# used to reimplement that split, and sandbox mode implemented it
-# separately, which is precisely the kind of duplication that produced
-# divergent drv hashes.
+# The link command (including ffmpeg's `-l`-after-inputs ordering) comes
+# from Go — see resolve-script.nix — so native and sandbox mode can't
+# diverge on flag order the way they once did.
 {
   compilerRoot  ? (import ./toolchain.nix).compilerRoot,
   bashRoot      ? (import ./toolchain.nix).bashRoot,
   coreutilsRoot ? (import ./toolchain.nix).coreutilsRoot,
   outName,
-  # The derivation's own name — defaults to today's "bin-<outName>"
-  # convention. A multi-target mkNixggBuild build overrides this to
-  # "<outerBuildName>-<targetKey>" instead, so that Nix's own
-  # outputPathName(outerName, outputKey) check (which
-  # `submit-output` enforces server-side) has a real name to match —
-  # see go/internal/shim/link.go's linkSandbox docstring for the
-  # full mechanism.
+  # Derivation's own name — a multi-target mkNixggBuild build overrides
+  # this to "<outerBuildName>-<targetKey>" to match Nix's
+  # outputPathName(outerName, outputKey) check; see
+  # go/internal/shim/link.go's linkSandbox.
   name ? "bin-${outName}",
   inputs,
   # Dependency-only inputs: same { drv, name } shape as `inputs`, but
-  # never interpolated into the script — only into the derivation's
-  # own dependency edges (via _extraInputs below). A thin archive's
-  # own members need to be MOUNTED into this derivation's sandbox
-  # (the archive stores absolute path references to them, not their
-  # bytes — see internal/members' package docstring) without being
-  # listed a second time on the actual link/ar command line, which
-  # would make the linker see each symbol twice. See
-  # expr.Derivation.ExtraInputs' own docstring for the full story.
+  # never interpolated into the script — only into this derivation's
+  # dependency edges (via _extraInputs below). A thin archive's members
+  # must be MOUNTED (the archive stores absolute path references, not
+  # bytes) without appearing a second time on the link/ar command line,
+  # which would make the linker see each symbol twice.
   extraInputs ? [ ],
   scriptTemplate,
   markerTag,
   storeDepsJSON ? "[]",
   wrapperEnvJSON ? "{}",
-  # A staged directory of local files the link command needs present
-  # before it runs (e.g. a generated linker script referenced via
-  # -Wl,--version-script=<relpath>) — see expr.Derivation's own
-  # InlineFilesStore docstring for why this can't be embedded in the
-  # script text instead. Same Nix-path-literal convention as
-  # builder.nix's srcTree; null when the link has none.
+  # Staged directory of local files the link command needs present
+  # (e.g. a generated linker script for -Wl,--version-script=<relpath>).
+  # Same Nix-path-literal convention as builder.nix's srcTree; null when
+  # the link has none.
   srcTree ? null,
 }:
 let
@@ -70,11 +58,9 @@ derivation ({
   args = [ "-c" script ];
 
   _storeDeps = builtins.concatStringsSep ":" storeDeps;
-  # Dependency-only: Nix's own string-context scan picks up each
-  # `${item.drv}/${item.name}` reference here and adds the edge to
-  # this derivation's inputDrvs/inputSrcs, exactly like _storeDeps
-  # above — but this text never reaches the script (resolve-script.nix
-  # only ever sees `inputs`, not `extraInputs`).
+  # Dependency-only: Nix's string-context scan picks up each
+  # `${item.drv}/${item.name}` reference and adds the inputDrvs/inputSrcs
+  # edge, but this text never reaches the script.
   _extraInputs = builtins.concatStringsSep ":"
     (map (i: "${i.drv}/${i.name}") extraInputs);
 } // wrapperEnv // (if srcTree == null then { } else { src = srcTree; }))
