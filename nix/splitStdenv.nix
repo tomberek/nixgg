@@ -68,6 +68,41 @@ let
   };
   inherit (shared) ggShimsOnPath submitBuildTreeScript outputPlaceholder;
 
+  # Replay the build stage's exports, gap-filling only: a variable the
+  # final stage already set always wins, so its own outputs and
+  # stdenv-managed state cannot be clobbered. Splitting one
+  # mkDerivation across two derivations splits the shell too, and
+  # packages routinely export in one stage and read in a later one
+  # (nixpkgs' kernel: configurePhase exports buildRoot, linux-config's
+  # installPhase reads it).
+  ggRestoreEnv = ''
+    if [ -f "$NIX_BUILD_TOP/.gg-env" ]; then
+      while IFS= read -r ggLine; do
+        case "$ggLine" in
+          "declare -x "*) ;;
+          *) continue ;;
+        esac
+        ggKV=''${ggLine#declare -x }
+        ggName=''${ggKV%%=*}
+        case "$ggName" in
+          PATH|PWD|OLDPWD|HOME|SHLVL|_) continue ;;
+          TMP|TMPDIR|TEMP|TEMPDIR) continue ;;
+          NIX_BUILD_TOP|NIX_STORE|NIX_BUILD_CORES|NIX_LOG_FD) continue ;;
+          out|outputs) continue ;;
+          NIXGG_*) continue ;;
+          # Phase-control attrs are exported like any other variable
+          # (dontInstall=1, etc.) — gap-filling one would make the
+          # final stage silently skip its own phase, exiting 0 having
+          # run nothing.
+          dont*|do[A-Z]*|phases|*Phase|*Phases) continue ;;
+        esac
+        if [ -z "''${!ggName+x}" ]; then
+          eval "export $ggKV"
+        fi
+      done < "$NIX_BUILD_TOP/.gg-env"
+    fi
+  '';
+
   applyExtra = hatch: finalAttrs: base: hatch finalAttrs (extraAttrs finalAttrs base);
 in
 
@@ -88,6 +123,21 @@ stdenv0.override (
         probeArgs = lib.toFunction argsOrFn { };
         drvName = if probeArgs ? name then probeArgs.name else "${probeArgs.pname}-${probeArgs.version}";
         outerName = "gg-build-${drvName}";
+
+        # Honour what the package asked for: phases written against
+        # structuredAttrs use bash array syntax, which does not exist
+        # when it is off. Default matches make-derivation.nix.
+        structuredAttrs = probeArgs.__structuredAttrs or (config.structuredAttrsByDefault or false);
+
+        # builder-rpc-v0 wants $out unset; /nonexistent keeps stdenv's
+        # _assignFirst happy while making a real write fail loudly.
+        # Under structuredAttrs only `env` reaches the derivation as
+        # environment variables, so the placeholder goes there instead.
+        nonexistentOut =
+          if structuredAttrs then
+            { env = (probeArgs.env or { }) // { out = "/nonexistent"; }; }
+          else
+            { out = "/nonexistent"; };
 
         knownStorePathsJSON = builtins.toJSON (
           map toString (
@@ -251,7 +301,6 @@ stdenv0.override (
                     # A "*.drv"-named derivation must be single-output; the
                     # final stage keeps the real `outputs`.
                     outputs = [ "out" ];
-                    out = "/nonexistent";
                     # make-derivation.nix appends "debug" to outputs at its
                     # own layer when separateDebugInfo = true (e.g. openssl),
                     # so outputs = ["out"] alone doesn't prevent it.
@@ -260,7 +309,12 @@ stdenv0.override (
                   // lib.optionalAttrs (configureStage != null) {
                     # dontConfigure alone would skip configurePhase's hooks
                     # too, so the restore needs its own always-run phase.
-                    phases = "unpackPhase patchPhase ggRestorePhase buildPhase";
+                    # ggSubmitPhase is named explicitly here — setup.sh
+                    # only splices postPhases when `phases` is UNSET, and
+                    # this branch sets it; the configureStage == null
+                    # path below leaves it unset and gets the submit via
+                    # postPhases instead.
+                    phases = "unpackPhase patchPhase ggRestorePhase buildPhase ggSubmitPhase";
                     ggRestorePhase = configureStage.restorePhase;
                   }
                   // builtins.listToAttrs (
@@ -270,7 +324,11 @@ stdenv0.override (
                     }) extraOutputs
                   )
                   // {
-                    __structuredAttrs = false;
+                    # Honoured, not forced: the package's phases may be
+                    # written against structuredAttrs. The `out`
+                    # placeholder moves into `env` to match — see
+                    # nonexistentOut.
+                    __structuredAttrs = structuredAttrs;
                     requiredSystemFeatures = (orig.requiredSystemFeatures or [ ]) ++ [ "builder-rpc-v0" ];
                     __contentAddressed = true;
                     outputHashMode = "text";
@@ -286,8 +344,17 @@ stdenv0.override (
                     preBuild = ''
                       unset NIXGG_BYPASS
                     '' + (orig.preBuild or "");
-                    postBuild = (orig.postBuild or "") + submitBuildTreeScript outerName;
-                  };
+                    # A real phase, not a postBuild hook: postBuild only
+                    # runs if the package's buildPhase calls runHook, and
+                    # many hand-written ones do not (nixpkgs' own
+                    # linux-config among them) — those built fine,
+                    # submitted nothing, and failed with Nix's opaque
+                    # "failed to submit output path for 'out'". postPhases
+                    # is spliced on unconditionally by setup.sh.
+                    postPhases = (lib.toList (orig.postPhases or [ ])) ++ [ "ggSubmitPhase" ];
+                    ggSubmitPhase = submitBuildTreeScript outerName;
+                  }
+                  // nonexistentOut;
               in
               applyExtra extraBuildAttrs finalAttrs base;
 
@@ -312,20 +379,42 @@ stdenv0.override (
                 // {
                   phases = "ggRestorePhase checkPhase installPhase fixupPhase installCheckPhase distPhase";
                   dontUnpack = true;
-                  __structuredAttrs = false;
+                  # Honoured, not forced — same reasoning as the build
+                  # stage above. This stage owns the package's REAL
+                  # outputs, so it needs no placeholder.
+                  __structuredAttrs = structuredAttrs;
                   ggRestorePhase = ''
                     runHook preGgRestore
                     cp -a ${builtTree}/. "$NIX_BUILD_TOP/"
                     chmod -R u+w "$NIX_BUILD_TOP"
                     cd "$NIX_BUILD_TOP/$(cat "$NIX_BUILD_TOP/.gg-cwd")"
+                    ${ggRestoreEnv}
+
+                    # Shims stay reachable but inert here: build systems
+                    # bake absolute tool paths at configure time (cmake
+                    # does; a caller can via makeFlags), so a baked-in
+                    # path still gets invoked in this stage whether or
+                    # not the build was planned to hit it. Without this
+                    # env the shim can't build its own config and exits
+                    # non-zero; BYPASS makes it exec the real tool since
+                    # everything it would model is already built.
+                    export NIXGG_BYPASS=1
+                    ${ggShimsOnPath knownStorePathsJSON}
                     export DESTDIR="$NIX_BUILD_TOP/.gg-destdir"
-                    # Appended at runtime, not baked into installFlags as a
-                    # Nix string: GNU Make lets its own command-line value
-                    # override an inherited env var of the same name, and
-                    # some packages' Makefile (openssl's unix-Makefile.tmpl)
-                    # assigns DESTDIR= itself. A literal `$` in installFlags
-                    # would also get reinterpreted as make's own syntax.
-                    installFlags="''${installFlags-} DESTDIR=$DESTDIR"
+                    # installFlagsArray, not installFlags: under
+                    # __structuredAttrs, installFlags is a bash ARRAY,
+                    # and assigning a scalar to an array name writes
+                    # element 0 — silently welding this onto the
+                    # package's first real flag. Appended at RUNTIME
+                    # (not baked into a Nix string) because some
+                    # packages' own Makefile (openssl's
+                    # unix-Makefile.tmpl) assigns DESTDIR= itself, and
+                    # GNU Make lets its own command-line value override
+                    # an inherited env var of the same name — only a
+                    # value on make's own argv wins over that.
+                    # setup.sh concatenates installFlagsArray in both
+                    # modes, so appending here is mode-independent.
+                    installFlagsArray+=( "DESTDIR=$DESTDIR" )
                     runHook postGgRestore
                   '';
                   installFlags = (orig.installFlags or "");

@@ -48,6 +48,7 @@
   # See go/internal/cli/assemble.go / go/internal/assemble/.
   submitBuildTreeScript = drvName: ''
     realpath --relative-to="$NIX_BUILD_TOP" "$PWD" > "$NIX_BUILD_TOP/.gg-cwd"
+    export -p > "$NIX_BUILD_TOP/.gg-env"
     ${nixgg}/bin/nixgg assemble "$NIX_BUILD_TOP" "${drvName}"
   '';
 
