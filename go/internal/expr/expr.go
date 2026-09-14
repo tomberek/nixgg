@@ -303,6 +303,39 @@ func ArchiveJSON(p ArchiveJSONParams) JSONDrv {
 	return d.toJSON(p.ExtraSrcs)
 }
 
+// PartialLinkJSONParams describes an `ld -r` step: several objects in,
+// one object out. Sandbox mode only.
+type PartialLinkJSONParams struct {
+	Name      string
+	OutName   string
+	System    string
+	Bash      string
+	Coreutils string
+	ToolBin   string // absolute /nix/store/…/bin/ld
+	Flags     []string
+	Inputs    []JSONDrvInput
+	StoreDeps []string
+	ExtraSrcs []string
+	Env       map[string]string
+}
+
+func PartialLinkJSON(p PartialLinkJSONParams) JSONDrv {
+	d := &Derivation{
+		Kind:       KindPartialLink,
+		Name:       p.Name,
+		System:     p.System,
+		Bash:       p.Bash,
+		Coreutils:  p.Coreutils,
+		OutName:    p.OutName,
+		ToolBin:    p.ToolBin,
+		Flags:      p.Flags,
+		Inputs:     inputsFromJSON(p.Inputs),
+		StoreDeps:  p.StoreDeps,
+		WrapperEnv: p.Env,
+	}
+	return d.toJSON(p.ExtraSrcs)
+}
+
 func LinkJSON(p LinkJSONParams) JSONDrv {
 	d := &Derivation{
 		Kind:               KindLink,

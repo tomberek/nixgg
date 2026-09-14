@@ -50,9 +50,7 @@ func run() error {
 	case dispatch.ToolAR:
 		return shim.Archive(args, cfg, l)
 	case dispatch.ToolLD:
-		// Raw ld is always link-shaped (no -c mode like cc/g++); Link's
-		// parser already handles ld's bare, non-`-Wl,`-wrapped flags.
-		return shim.Link(tool, args, cfg, l)
+		return shim.LD(args, cfg, l)
 	case dispatch.ToolRanlib:
 		// Our archives are already indexed (ar handles `s` in the
 		// sandbox), so ranlib on them is a no-op.

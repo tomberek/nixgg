@@ -19,6 +19,11 @@ const (
 	KindCompile Kind = iota // builder.nix
 	KindLink                // linker.nix
 	KindArchive             // archiver.nix
+	// KindPartialLink: `ld -r` — combine several objects into one
+	// object (not an executable, not an archive). Sandbox mode only:
+	// no native-mode helper exists, since the tools that need it only
+	// appear in builds that already require the sandbox.
+	KindPartialLink
 )
 
 // Derivation is the intermediate representation both serializers
@@ -42,6 +47,11 @@ type Derivation struct {
 	Bash, Coreutils string
 	Compiler        string // gcc-wrapper root; unused by Archive
 	AR              string // binutils root (parent of bin/ar); Archive only
+
+	// PartialLink-only: absolute /nix/store/…/bin/ld path. Not taken
+	// from PATH like the compiler — a raw ld invocation is already an
+	// absolute-or-PATH-resolved binary the caller named directly.
+	ToolBin string
 
 	Tool     string // "cc", "gcc", "c++", "g++"; used by Compile + Link
 	SrcStore string // staged src tree
@@ -404,6 +414,15 @@ mkdir -p "%s"
 mkdir -p "%s"
 ar D%s "%s" %s
 `, pathPrefix, d.outDir(), d.ARFlags, d.outPath(), inputs())
+	case KindPartialLink:
+		// `-r` comes from the caller's own Flags, not added here — it's
+		// what identified this as a partial link in the first place.
+		return fmt.Sprintf(
+			`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "%s"
+"%s" %s -o "%s" %s
+`, d.Coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), d.outPath(), inputs())
 	}
 	return ""
 }
