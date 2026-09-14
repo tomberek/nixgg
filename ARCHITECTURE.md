@@ -396,8 +396,8 @@ shim runs (inside builder-rpc-v0 sandbox)
   │
   ├─ stage.Sources: hardlink source+headers into $TMPDIR/.nixgg/srcs/<tu-id>/
   │
-  ├─ sandbox.StoreAddScan (compile only):
-  │    nix store add --scan -n src-<name> <staged-dir>
+  ├─ sandbox.StoreAddDirectory (compile only):
+  │    nix store add -n src-<name> <staged-dir>
   │    → returns /nix/store/…-src-<name>
   │
   ├─ expr.CompileJSON / LinkJSON / ArchiveJSON:
@@ -436,6 +436,17 @@ For the exact placeholder digest algorithm (nix32-encoded sha256 of
 `"nix-upstream-output:<drvHashPart>:<pathName>"`), see
 `expr.caOutputPlaceholder` — verified byte-exact against
 `builtins.outputOf` via a pinned test vector.
+
+## Flow: EagerDrv mode (`NIXGG_EAGER_DRV=1`)
+
+Same JSON-drv assembly and `sandbox.DerivationAdd` call as sandbox
+mode above, run from an ordinary unrestricted daemon connection
+instead of a live `builder-rpc-v0` sandbox. The one behavioral
+difference is `sandbox.PointOutputAtDrv`: since there's no sandbox to
+leave a dangling reference in, the caller-visible output is a real
+`os.Symlink(drvPath, output)` instead of sandbox mode's drvref stub.
+`maybeSubmit`/`sandbox.SubmitOutput` never runs — there's no outer
+builder-rpc-v0 derivation to submit an output for.
 
 ## Placeholder vs. Realise (mode.For)
 
