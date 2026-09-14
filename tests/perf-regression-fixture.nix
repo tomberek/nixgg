@@ -1,14 +1,10 @@
 # mkNixggBuild per-TU rebuild-scope test fixture, driven by
-# tests/perf-regression.sh. Same shape as
-# tests/configure-cache-cutoff-fixture.nix (constructs the package
-# DIRECTLY from the pinned flake input, not via the flake's own
-# `.#lua` output — that output's src is fixed, so there is no way to
-# thread an edited src through it): a one-file source edit, built
-# through the exact same mkNixggBuild call examples/lua/default.nix
-# makes, so the resulting drv graph is the real one, not a synthetic
-# stand-in.
+# tests/perf-regression.sh. Constructs the package directly from the
+# pinned flake input (not via the flake's own `.#lua` output, whose
+# src is fixed and can't be threaded with an edit) through the same
+# mkNixggBuild call examples/lua/default.nix makes.
 {
-  flakeDir, # path to the nixgg checkout, passed by the driver script
+  flakeDir,
   edit ? null, # null | a relative path inside lua's src/ to touch
 }:
 let

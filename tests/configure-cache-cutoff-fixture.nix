@@ -1,19 +1,16 @@
 # splitStdenv (splitAtConfigure=true) early-cutoff test fixture,
 # driven by tests/configure-cache-cutoff.sh.
 #
-# Constructs a package DIRECTLY (not via pkgs.foo.override — nixpkgs'
-# own .override/.overrideAttrs reapplication always re-invokes the
-# wrapped function with its ORIGINAL args first, discarding any prior
-# .overrideAttrs, so a src substitution applied that way never reaches
-# the configure stage at all — confirmed directly while building
-# hello-cache-filtered/fmt-cache-filtered). This mirrors the shape a
-# real package.nix uses, parameterized to drive three scenarios:
-# baseline, an edit to a file the filter excludes, an edit to a file
-# it includes.
+# Constructs the package DIRECTLY (not via pkgs.foo.override, which
+# always re-invokes the wrapped function with its ORIGINAL args first,
+# discarding any prior .overrideAttrs — confirmed directly while
+# building hello-cache-filtered/fmt-cache-filtered), parameterized to
+# drive three scenarios: baseline, an edit to a file the filter
+# excludes, an edit to a file it includes.
 {
-  flakeDir, # path to the nixgg checkout, passed by the driver script
-  fixture, # "hello" or "fmt" — selects which real package to build like
-  edit ? null, # null | "excluded" | "included" — which file to perturb in src
+  flakeDir,
+  fixture, # "hello" or "fmt"
+  edit ? null, # null | "excluded" | "included"
 }:
 let
   flake = builtins.getFlake (toString flakeDir);

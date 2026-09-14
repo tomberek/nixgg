@@ -1,41 +1,8 @@
 #!/usr/bin/env bash
 # Regression test: native and sandbox modes produce byte-identical
-# batch-archive derivations for the same source, and the batch
-# mechanism's own fallback path is exercised, not just its happy path.
-#
-# This script is that shape's own, separate check, mirroring
-# drv-equivalence.sh's methodology exactly but filtering the sandbox
-# side's exact drv set (from equiv_sandbox_drvs — see its own
-# docstring in tests/lib/drv-equiv-common.sh for the mechanism) down
-# to "batch-"-prefixed drvs only, since drv-equivalence.sh's own
-# fixtures never produce that shape at all (see
-# go/internal/expr/batcharchive.go's own package docstring). Shared
-# alt-store/patched-nix scaffolding, sandbox-drv collection,
-# native-src resolution, the native build invocation, and the
-# match/mismatch reporting live in tests/lib/drv-equiv-common.sh.
-#
-# Two fixtures:
-#   lua-batch    — small (~30 TUs), fast, ENTIRELY one batch group
-#                  (every TU feeding liblua.a is batched) — the fast,
-#                  legible happy-path check.
-#   redis-batch  — ~150 TUs, PARTIALLY batched (only deps/, not
-#                  redis's own src/) — proves the negative/fallback
-#                  path: an archive whose inputs are NOT all
-#                  same-group-pending still builds correctly via
-#                  Archive's ordinary per-TU path, and a batched
-#                  member consumed outside its own archive (if any)
-#                  still resolves via classifyInputs' fallback
-#                  prologue.
-#
-# Beyond the hash-set comparison drv-equivalence.sh does, this script
-# ALSO realises both builds' final artifact and diffs the resulting
-# batch-archive's own member list (`ar t`) plus a byte-diff of the
-# two archives — catching an ordering/flag-mixing bug that a hash-set
-# match alone can't rule out (both sides could independently make the
-# same mistake and still hash-match).
-#
-# Env knobs: same as drv-equivalence.sh (ALT_STORE, PATCHED_NIX,
-# KEEP_STORE, ONLY).
+# batch-archive derivations. lua-batch is fully batched (happy path);
+# redis-batch is only partially batched (deps/, not redis's own
+# src/), exercising classifyInputs' fallback path.
 
 set -euo pipefail
 
@@ -44,10 +11,6 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/drv-equiv-common.sh"
 
 equiv_common_setup "/tmp/nixgg-batch-equiv-store"
 
-# run_fixture: same structure as drv-equivalence.sh's own
-# run_fixture, filtering equiv_sandbox_drvs's output down to "batch-"
-# instead of taking it all, plus the extra functional check (member
-# list + byte-diff) neither script needed before this Kind existed.
 run_fixture() {
   local attr="$1" src_input="$2" subdir="$3"
   local label="$attr"
@@ -59,10 +22,6 @@ run_fixture() {
   local all_sb_drvs
   all_sb_drvs=$(equiv_sandbox_drvs "$attr") || return 1
 
-  # Only batch-*.drv — equiv_sandbox_drvs already returns the exact,
-  # complete drv set for this build (see its own docstring); this
-  # script narrows that down to just the batch-archive Kind, since
-  # it wants a SUBSET, not everything.
   local sb_drvs
   sb_drvs=$(printf '%s\n' "$all_sb_drvs" | grep -E '^[a-z0-9]+-batch-' || true)
 
@@ -88,9 +47,6 @@ run_fixture() {
     return 1
   fi
 
-  # Only batch- thunks — a partially-batched fixture (redis-batch)
-  # also produces ordinary tu-/ar-/bin- thunks for its unbatched TUs;
-  # those are drv-equivalence.sh's own concern, not this script's.
   local nt_drvs
   nt_drvs=$(while IFS= read -r t; do
     local base
@@ -114,13 +70,6 @@ run_fixture() {
   rm -rf "$workdir"
 }
 
-# functional_check: realise .#$attr, find its batch-archive output
-# among the sandbox drvs already built above, and confirm the
-# resulting .a's member list is non-empty and every member has a
-# real, non-zero-size object inside it. Catches a script-assembly bug
-# (wrong member order, a dropped compile) that a drv-hash match alone
-# can't — both modes could agree on a wrong script and still pass the
-# set comparison above.
 functional_check() {
   local attr="$1"
   printf '==> functional: realising .#%s and inspecting its batch archive\n' "$attr"
@@ -133,11 +82,6 @@ functional_check() {
     return 1
   fi
 
-  # Find the batch-archive's own realised output — any *.a.drv
-  # whose name starts with "batch-". Most-recently-modified, not just
-  # first-match: when multiple fixtures run in one invocation, an
-  # earlier fixture's own batch-*.drv could otherwise be picked up by
-  # a plain `head -1` over an alphabetically-sorted listing.
   local batch_drv archive_path
   batch_drv=$(ls -t "$ALT_STORE"/nix/store/ 2>/dev/null | grep -E '^[a-z0-9]+-batch-.*\.a\.drv$' | head -1)
   if [[ -z "$batch_drv" ]]; then

@@ -8,25 +8,11 @@ import (
 	"github.com/tbereknyei/nixgg/internal/paths"
 )
 
-// TestSourcesResolvesRelativeSymlinkTargets pins the regression this
-// fix addresses: a relative symlink staged into a rebased project
-// root (narrower than its original directory) must still resolve to
-// real content. PostgreSQL's own ./configure creates exactly this
-// shape (src/include/pg_config_os.h -> ../../src/include/port/
-// linux.h) — confirmed directly to break real compiles before this
-// fix, both because the relative target text no longer resolves from
-// the staged location AND because the symlink's target was never
-// staged as its own entry in the first place (the header scanner
-// only records the symlink's own path as a dependency). Resolving
-// through the symlink chain before hardlinking sidesteps both: the
-// staged entry is the real file's content directly, no symlink
-// involved.
+// PostgreSQL's ./configure creates exactly this shape (pg_config_os.h -> ../../src/include/port/linux.h)
+// and broke real compiles before Sources resolved through the symlink chain before hardlinking.
 func TestSourcesResolvesRelativeSymlinkTargets(t *testing.T) {
 	root := t.TempDir()
 
-	// Mirror postgres's own layout: symlink and target are siblings
-	// under a common directory two levels up from where the symlink
-	// itself lives, so ".." actually matters.
 	targetDir := filepath.Join(root, "src", "include", "port")
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -44,9 +30,6 @@ func TestSourcesResolvesRelativeSymlinkTargets(t *testing.T) {
 
 	l := testLayout(t)
 
-	// Stage the symlink under a project root NARROWER than its
-	// original location (root/src, not root) — the rebasing that
-	// breaks a relative target's own text.
 	entries := []Entry{
 		{Abs: linkPath, Rel: "include/pg_config_os.h"},
 	}
@@ -73,8 +56,6 @@ func TestSourcesResolvesRelativeSymlinkTargets(t *testing.T) {
 	}
 }
 
-// TestSourcesResolvesAbsoluteSymlinkTargets pins the same resolution
-// for an already-absolute symlink target.
 func TestSourcesResolvesAbsoluteSymlinkTargets(t *testing.T) {
 	root := t.TempDir()
 	targetFile := filepath.Join(root, "target.txt")

@@ -6,40 +6,13 @@ import (
 )
 
 // TestCAOutputPlaceholder pins the placeholder algorithm against a
-// vector we generated with the patched Nix's `builtins.outputOf`
-// primitive. If this test breaks, either our Nix32 encoding drifted
-// or the upstream placeholder formula changed.
-//
-// Vector generation (from an ephemeral shell):
-//
-//	nix eval --raw --expr \
-//	  'builtins.outputOf "/nix/store/6sq7pn2hn1w2jb2agwxag0wn3673n8vg-leaf.drv" "out"'
-//
-// The drv path used here is the `leaf.drv` from the dyn-drv smoke
-// test in nixgg/dyn-drv/dyn-one-layer.nix; the output was captured
-// during that session.
+// vector captured from patched Nix (NixOS/nix#15793) via
+// builtins.outputOf.
 func TestCAOutputPlaceholder(t *testing.T) {
 	for _, tc := range []struct {
 		name, drv, output, want string
 	}{
 		{
-			// Vector captured from patched-nix (NixOS/nix#15793):
-			//   nix eval --raw --impure --expr '
-			//     let d = derivation {
-			//       name = "leaf";
-			//       system = builtins.currentSystem;
-			//       builder = "/bin/sh";
-			//       args = ["-c" "echo hi > $out"];
-			//       __contentAddressed = true;
-			//       outputHashMode = "nar";
-			//       outputHashAlgo = "sha256";
-			//     };
-			//     in builtins.outputOf
-			//          (builtins.unsafeDiscardOutputDependency d.drvPath)
-			//          "out"
-			//   '
-			// drvPath printed as: p4hkhkx55dhqcxslgi6qgiasl2974n76-leaf.drv
-			// placeholder      : /0jdl66mqxficvnh6dw0z1aplacg14qdgsh8ngxrk1x09p2c2rhk4
 			name:   "leaf out",
 			drv:    "/nix/store/p4hkhkx55dhqcxslgi6qgiasl2974n76-leaf.drv",
 			output: "out",
@@ -48,12 +21,6 @@ func TestCAOutputPlaceholder(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := caOutputPlaceholder(tc.drv, tc.output)
-			// The value above is a *known* placeholder for a hardcoded
-			// name+output pair (from builtins.placeholder "out" — which
-			// happens to be a straight sha256 of "nix-output:out"). To
-			// verify the CA formula properly we'd need an actual dyn-drv
-			// output; this at least catches the length + character set
-			// regressions.
 			if len(got) != 53 || got[0] != '/' {
 				t.Fatalf("placeholder shape wrong: %q", got)
 			}
@@ -78,12 +45,10 @@ func isNix32Char(b byte) bool {
 	return false
 }
 
-// TestNix32Encode checks the encoding against a value we can compute
-// by hand. A 32-byte input encodes to exactly 52 chars.
+// TestNix32Encode: a 32-byte input (sha256 of empty string) encodes
+// to exactly 52 chars.
 func TestNix32Encode(t *testing.T) {
-	// sha256 of empty string: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 	var digest [32]byte
-	// Copy the bytes so we can share the constant.
 	for i, b := range [...]byte{
 		0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
 		0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
@@ -103,22 +68,14 @@ func TestNix32Encode(t *testing.T) {
 	}
 }
 
-// TestLinkScriptEmitsLibFlagsAfterInputs pins ld's resolution order in
-// the emitted link script: objects and archives must come BEFORE any
-// `-l<name>`.
+// TestLinkScriptEmitsLibFlagsAfterInputs pins that -l flags land after
+// inputs: a single-pass linker only resolves a library against objects
+// already seen, so -lm/-latomic ahead of libavutil.a broke ffmpeg with
+// "undefined reference to `sqrt'".
 //
-// Regression origin (ffmpeg): script() emitted `cc <flags> <inputs>`,
-// putting -lm/-latomic ahead of libavutil.a. The classic single-pass
-// linker only resolves a library against objects it has already seen, so
-// every math symbol referenced from those archives came up undefined
-// ("undefined reference to `sqrt'"). Fixed by splitting flags so -l
-// lands after the inputs.
-//
-// Also pins the len(lflags)==0 fallback. That branch keeps drv content
-// byte-identical to the pre-split era, and hello/lua/mosh have no -l
-// flags at all, so their 78 pinned drv hashes depend on it. Without the
-// fallback the split introduced a trailing empty slot and a double
-// space, which broke equivalence.
+// Also pins the len(lflags)==0 fallback, which keeps the drv byte-
+// identical to the pre-split layout for hello/lua/mosh (no -l flags,
+// 78 pinned hashes).
 func TestLinkScriptEmitsLibFlagsAfterInputs(t *testing.T) {
 	base := func(flags []string) *Derivation {
 		return &Derivation{
@@ -149,7 +106,6 @@ func TestLinkScriptEmitsLibFlagsAfterInputs(t *testing.T) {
 					"not resolve symbols that inputs reference from it\nscript:\n%s", lf, s)
 			}
 		}
-		// Non -l flags must stay ahead of the inputs.
 		if o := strings.Index(s, "'-O2'"); o > iLast {
 			t.Errorf("-O2 moved after inputs; only -l flags should be relocated\n%s", s)
 		}
@@ -168,8 +124,6 @@ func TestLinkScriptEmitsLibFlagsAfterInputs(t *testing.T) {
 	})
 
 	t.Run("bare -l is not treated as a lib flag", func(t *testing.T) {
-		// `-l` alone (len == 2) has no name attached; it must not be
-		// relocated, matching the len(f) > 2 guard.
 		s := base([]string{"-l"}).script()
 		iLast := strings.LastIndex(s, "libx.a'")
 		if at := strings.Index(s, "'-l'"); at > iLast {
@@ -178,17 +132,10 @@ func TestLinkScriptEmitsLibFlagsAfterInputs(t *testing.T) {
 	})
 }
 
-// TestAbsFileScriptRecreatesGeneratedFileBeforeLinking pins the
-// mechanism QEMU's `-Xlinker --dynamic-list=/build/source/build/
-// plugins/qemu-plugin.symbols` needs: AbsFilePath/AbsFileContent must
-// recreate the referenced file, at its exact absolute path, BEFORE
-// the link command runs — confirmed by asserting the mkdir+heredoc
-// text appears ahead of the "cc" invocation in the rendered script.
-// Unlike InlineFilesStore's relative-path mechanism (a real `cp` from
-// a staged store path), this is embedded directly as script text —
-// safe here because every real producer of this shape (meson's
-// configure_file()) writes a small generated symbol list, not a
-// large tree.
+// TestAbsFileScriptRecreatesGeneratedFileBeforeLinking pins that
+// AbsFilePath/AbsFileContent recreate the referenced file at its exact
+// absolute path BEFORE the link command runs — needed for QEMU's
+// `-Xlinker --dynamic-list=...qemu-plugin.symbols`.
 func TestAbsFileScriptRecreatesGeneratedFileBeforeLinking(t *testing.T) {
 	d := &Derivation{
 		Kind:           KindLink,
@@ -218,9 +165,7 @@ func TestAbsFileScriptRecreatesGeneratedFileBeforeLinking(t *testing.T) {
 }
 
 // TestAbsFileScriptEmptyIsANoOp pins that a derivation with no
-// AbsFilePath renders exactly as it did before this field existed —
-// the mechanism must be a no-op for every existing fixture, none of
-// which reference an absolute-path linker script.
+// AbsFilePath renders exactly as before this field existed.
 func TestAbsFileScriptEmptyIsANoOp(t *testing.T) {
 	d := &Derivation{
 		Kind:      KindLink,

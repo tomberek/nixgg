@@ -14,8 +14,6 @@ import (
 	"github.com/tbereknyei/nixgg/internal/toolchain"
 )
 
-// TestParseLinkArgs pins the link-line parser: which tokens are inputs
-// (objects/archives), which stay as flags, and which are dropped.
 func TestParseLinkArgs(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -55,8 +53,7 @@ func TestParseLinkArgs(t *testing.T) {
 			wantOK:     true,
 		},
 		{
-			// -M* families are dep-file generation; meaningless in a link
-			// thunk and they target paths outside the sandbox.
+			// -M* families target paths outside the sandbox.
 			name:       "dep-file flags dropped",
 			args:       []string{"a.o", "-MD", "-MF", "dep.d", "-o", "prog"},
 			wantOut:    "prog",
@@ -65,8 +62,8 @@ func TestParseLinkArgs(t *testing.T) {
 		},
 		{
 			// CMake 4 emits this so ninja can track link deps; it makes ld
-			// WRITE to a build-tree-relative path that doesn't exist in the
-			// link drv's sandbox ("cannot open dependency file .../link.d").
+			// write to a build-tree-relative path that doesn't exist in
+			// the link drv's sandbox.
 			name:       "-Wl,--dependency-file= dropped (attached)",
 			args:       []string{"a.o", "-Wl,--dependency-file=x/link.d", "-o", "prog"},
 			wantOut:    "prog",
@@ -121,25 +118,21 @@ func TestParseLinkArgs(t *testing.T) {
 }
 
 // TestResolveLibFlagOnlyClaimsOurArtifacts pins that `-l<name>` is
-// promoted to an explicit input ONLY when the matching lib<name>.a in a
-// -L dir is something nixgg produced. A vendored or system .a that we
-// did not build must stay a `-l` flag so the linker resolves it normally.
-//
-// resolveLibFlag recognizes two markers: a symlink (native mode's thunk
-// pointer) and a regular file starting with the drvref magic header
-// (sandbox mode, since builder-rpc-v0 doesn't materialise .drv files
-// into the sandbox so a symlink would dangle).
+// promoted to an explicit input only when the matching lib<name>.a in
+// a -L dir is something nixgg produced. resolveLibFlag recognizes two
+// markers: a symlink (native mode's thunk pointer) and a regular file
+// starting with the drvref magic header (sandbox mode, since
+// builder-rpc-v0 doesn't materialise .drv files into the sandbox so a
+// symlink would dangle).
 func TestResolveLibFlagOnlyClaimsOurArtifacts(t *testing.T) {
 	dir := t.TempDir()
 
-	// A drvref stub: what the archive shim writes in sandbox mode.
 	stub := filepath.Join(dir, "libours.a")
 	body := drvref.Body("/nix/store/" + strings.Repeat("a", 32) + "-ar-libours.a.drv")
 	if err := os.WriteFile(stub, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// A plain archive we did not produce.
 	foreign := filepath.Join(dir, "libforeign.a")
 	if err := os.WriteFile(foreign, []byte("!<arch>\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -157,13 +150,11 @@ func TestResolveLibFlagOnlyClaimsOurArtifacts(t *testing.T) {
 	}
 }
 
-// TestResolveLibFlagClaimsBatchPendingArtifacts is a regression test
-// for a real gap found while implementing batch archives: a -lfoo
-// resolving to a still-deferred batch member's own stub (see
-// batchpending.Is) must be claimed the same way a drvref stub is —
-// otherwise resolveLibFlag returns "" and the caller leaves a bare
-// -lfoo flag, which resolves to nothing inside the sandbox even
-// though the file exists and nixgg knows exactly what produced it.
+// TestResolveLibFlagClaimsBatchPendingArtifacts is a regression test:
+// a -lfoo resolving to a still-deferred batch member's own stub (see
+// batchpending.Is) must be claimed the same way a drvref stub is, or
+// resolveLibFlag returns "" and the caller leaves a bare -lfoo flag
+// that resolves to nothing inside the sandbox.
 func TestResolveLibFlagClaimsBatchPendingArtifacts(t *testing.T) {
 	dir := t.TempDir()
 
@@ -179,11 +170,9 @@ func TestResolveLibFlagClaimsBatchPendingArtifacts(t *testing.T) {
 }
 
 // TestIsLinkInput pins which link-line tokens are files the linker
-// consumes. Getting this wrong is silently wrong, not loudly wrong: an
-// unrecognized token is filed under `flags` by parseLinkArgs and baked
-// into the drv as a bare relative path that does not exist in the
-// sandbox. Recognizing a token is what routes it through
-// classify.Target, whose Regular/Absent verdicts trigger Passthrough.
+// consumes. An unrecognized token is filed under `flags` by
+// parseLinkArgs and baked into the drv as a bare relative path that
+// does not exist in the sandbox.
 func TestIsLinkInput(t *testing.T) {
 	for _, tc := range []struct {
 		in   string
@@ -191,34 +180,30 @@ func TestIsLinkInput(t *testing.T) {
 	}{
 		{"main.o", true},
 		{"libfoo.a", true},
-		{"mod.xo", true},   // redis's PIC objects for test modules
-		{"thing.lo", true}, // libtool
-		{"MAIN.O", true},   // ext match is case-insensitive
+		{"mod.xo", true},
+		{"thing.lo", true},
+		{"MAIN.O", true},
 		{"sub/dir/main.o", true},
 
-		// Shared libraries, plain and versioned. filepath.Ext reports
-		// ".2" for the last one, which is why this needs its own check.
+		// filepath.Ext reports ".2" for the last one, which is why this
+		// needs its own check.
 		{"libfoo.so", true},
 		{"libfoo.so.1", true},
 		{"libfoo.so.1.2", true},
 		{"libfoo.so.1.2.3", true},
 		{"/abs/path/libfoo.so.1", true},
 
-		// Flags are never inputs. Without the leading-dash guard,
-		// `-l:libexact.a` has filepath.Ext ".a" and is mistaken for an
-		// archive — classify.Target then stats a file literally named
-		// "-l:libexact.a", gets Absent, and passes through. Safe, but
-		// only by accident; resolveLibFlag is the correct handler.
+		// Without the leading-dash guard, `-l:libexact.a` has
+		// filepath.Ext ".a" and is mistaken for an archive.
 		{"-l:libexact.a", false},
 		{"-lfoo", false},
 		{"-o", false},
 		{"-Wl,--as-needed", false},
 		{"-L/usr/lib", false},
 
-		// Not libraries despite superficial resemblance.
 		{"libfoo.solid", false},
-		{"libfoo.so.1.x", false}, // non-numeric version segment
-		{"libfoo.so.", false},    // empty trailing segment
+		{"libfoo.so.1.x", false},
+		{"libfoo.so.", false},
 		{"notes.txt", false},
 		{"main.c", false},
 		{"", false},
@@ -231,10 +216,6 @@ func TestIsLinkInput(t *testing.T) {
 	}
 }
 
-// TestLinkerScriptPath pins which link-line flag shapes are
-// recognized as naming a caller-local linker script (see
-// linkerScriptPath's own docstring for why these can never be
-// accelerated), and which superficially similar flags are not.
 func TestLinkerScriptPath(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -256,10 +237,8 @@ func TestLinkerScriptPath(t *testing.T) {
 		{"-Tbss= is an address, not a script", []string{"-Tbss=0x3000"}, ""},
 		{"no linker script flag at all", []string{"main.o", "-o", "prog"}, ""},
 		{"trailing -T with no value", []string{"main.o", "-T"}, ""},
-		// Bare --script=<path> — ld's own long-form spelling, no
-		// -Wl,/-Xlinker wrapper — Linux Kbuild's scripts/link-vmlinux.sh
-		// emits exactly this (wl="" for every arch but um) when it
-		// invokes $(LD) directly rather than through a compiler driver.
+		// Linux Kbuild's scripts/link-vmlinux.sh emits bare --script=
+		// (no -Wl,/-Xlinker wrapper) when it invokes $(LD) directly.
 		{"bare --script=", []string{"--script=./arch/x86/kernel/vmlinux.lds", "-o", "vmlinux"}, "./arch/x86/kernel/vmlinux.lds"},
 		{"-Wl,--script= comma form", []string{"-Wl,--script=script.ld"}, "script.ld"},
 	} {
@@ -272,7 +251,7 @@ func TestLinkerScriptPath(t *testing.T) {
 }
 
 // TestParseLinkArgsSharedLibIsAnInput pins that a positional shared
-// library reaches `inputs`, not `flags`. As a flag it would be baked
+// library reaches `inputs`, not `flags`; as a flag it would be baked
 // into the drv as a bare path with no corresponding staged file.
 func TestParseLinkArgsSharedLibIsAnInput(t *testing.T) {
 	_, inputs, flags, _, ok := parseLinkArgs(
@@ -294,17 +273,14 @@ func TestParseLinkArgsSharedLibIsAnInput(t *testing.T) {
 
 // TestParseLinkArgsSonameValueIsNotAnInput pins a real regression:
 // Linux Kbuild's vdso32 build passes raw ld `-soname linux-gate.so.1`
-// (ELF DT_SONAME metadata, not a link input) on its link line.
-// isSharedLib's own `.so.N` version-suffix match — deliberately
-// generous, so a real positional `libfoo.so.1.2.3` input is still
-// caught — means the bare VALUE following -soname looks exactly like
-// a versioned shared-library input if -soname's own two-token shape
-// isn't recognized first. Confirmed directly against a real build:
-// without this case, classifyInputs correctly reported
-// "linux-gate.so.1" as absent (nothing on disk has that name), and
-// the entire link fell to unshimmed Passthrough — which then failed
-// outright because its own OTHER inputs were still-deferred
-// placeholder thunk symlinks, not real objects.
+// (ELF DT_SONAME metadata, not a link input). isSharedLib's own
+// `.so.N` version-suffix match means the bare value following -soname
+// looks exactly like a versioned shared-library input unless
+// -soname's own two-token shape is recognized first. Confirmed
+// directly against a real build: without this case the entire link
+// fell to unshimmed Passthrough, which then failed because its other
+// inputs were still-deferred placeholder thunk symlinks, not real
+// objects.
 func TestParseLinkArgsSonameValueIsNotAnInput(t *testing.T) {
 	_, inputs, flags, _, ok := parseLinkArgs(
 		[]string{"note.o", "-soname", "linux-gate.so.1", "-shared", "-o", "vdso32.so.dbg"})
@@ -322,10 +298,6 @@ func TestParseLinkArgsSonameValueIsNotAnInput(t *testing.T) {
 	}
 }
 
-// TestParseLinkArgsTrailingSonameWithNoValue pins that a malformed
-// line (-soname as the very last token) doesn't panic or index past
-// the end — same defensive shape as the existing -L/-MF/-Wl,--dependency-file
-// two-token cases in parseLinkArgs.
 func TestParseLinkArgsTrailingSonameWithNoValue(t *testing.T) {
 	_, inputs, flags, _, ok := parseLinkArgs(
 		[]string{"main.o", "-o", "prog", "-soname"})
@@ -340,9 +312,9 @@ func TestParseLinkArgsTrailingSonameWithNoValue(t *testing.T) {
 	}
 }
 
-// TestResolveLibFlagExactNameForm pins `-l:libfoo.a`, the spelling build
-// systems use to pin a static archive when a shared one also exists (ld
-// takes the name literally instead of expanding lib…/.a).
+// TestResolveLibFlagExactNameForm pins `-l:libfoo.a`, the spelling
+// build systems use to pin a static archive when a shared one also
+// exists (ld takes the name literally instead of expanding lib…/.a).
 func TestResolveLibFlagExactNameForm(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "libexact.a")
@@ -350,7 +322,6 @@ func TestResolveLibFlagExactNameForm(t *testing.T) {
 	if err := os.WriteFile(stub, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A foreign archive under the exact-name form must NOT be claimed.
 	foreign := filepath.Join(dir, "libforeign.a")
 	if err := os.WriteFile(foreign, []byte("!<arch>\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -377,22 +348,13 @@ func TestResolveLibFlagExactNameForm(t *testing.T) {
 	}
 }
 
-// TestStoreInputPreservesSubpath guards the composition step that caused a
-// real LLVM link failure:
-//
-//	ld.bfd: cannot find /nix/store/…-zlib-1.3.2/libz.so
-//
-// LLVM's cmake puts an absolute positional shared library on the link
-// line. Classification correctly reduces it to the store root — that is
-// what builtins.storePath and inputs.srcs require — and the shim then
-// composes the argv token as Ref+"/"+Name. Using the caller-visible
-// basename for Name drops the intervening "lib/", producing a path that
-// does not exist.
-//
-// This is a distinct failure from the one link_test already covers:
-// isSharedLib correctly RECOGNISED libz.so as an input (that part worked).
-// The bug was one layer later, in what path got written for it — which is
-// why the earlier tests passed while a real build broke.
+// TestStoreInputPreservesSubpath guards the composition step that
+// caused a real LLVM link failure ("ld.bfd: cannot find
+// /nix/store/…-zlib-1.3.2/libz.so"): LLVM's cmake puts an absolute
+// positional shared library on the link line, classification reduces
+// it to the store root, and the shim composes the argv token as
+// Ref+"/"+Name — using the caller-visible basename for Name drops the
+// intervening "lib/", producing a path that doesn't exist.
 func TestStoreInputPreservesSubpath(t *testing.T) {
 	const root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-zlib-1.3.2"
 
@@ -411,7 +373,7 @@ func TestStoreInputPreservesSubpath(t *testing.T) {
 		if ji.Name != "lib/libz.so" {
 			t.Errorf("sandbox Name = %q, want \"lib/libz.so\"", ji.Name)
 		}
-		// inputs.srcs takes a basename, and must stay the ROOT's basename:
+		// inputs.srcs takes a basename, and must stay the root's basename:
 		// the sandbox mounts the whole store object, not one file in it.
 		if want := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-zlib-1.3.2"; ji.Ref != want {
 			t.Errorf("sandbox Ref = %q, want %q", ji.Ref, want)
@@ -419,8 +381,6 @@ func TestStoreInputPreservesSubpath(t *testing.T) {
 	})
 
 	t.Run("direct child falls back to the basename", func(t *testing.T) {
-		// Everything nixgg produces has this shape, and all 81 pinned drvs
-		// depend on it: an empty Sub must yield exactly the old behavior.
 		c := classify.Result{Kind: classify.Store, Ref: root, Sub: ""}
 		ni, ji := storeInput(c, "/build/obj/main.o")
 		if ni.Name != "main.o" {
@@ -432,9 +392,6 @@ func TestStoreInputPreservesSubpath(t *testing.T) {
 	})
 
 	t.Run("Sub wins over the caller-visible name", func(t *testing.T) {
-		// A Makefile can reference a library through a differently-named
-		// symlink. Sub describes where the bytes actually are, so it must
-		// take precedence over what the caller called it.
 		c := classify.Result{Kind: classify.Store, Ref: root, Sub: "lib/libz.so.1.3.2"}
 		ni, _ := storeInput(c, "/build/deps/libz.so")
 		if ni.Name != "lib/libz.so.1.3.2" {
@@ -446,13 +403,10 @@ func TestStoreInputPreservesSubpath(t *testing.T) {
 // TestClassifyInputsSonameAliasUsesRealOutputName pins the end-to-end
 // path for openssl's engines/*.so links, which reference libcrypto via
 // the plain `ln -s libcrypto.so.3 libcrypto.so` alias openssl's own
-// Makefile creates — not through -lcrypto. classify.Target resolves
-// the alias and reports the referenced drv's REAL output basename via
-// Sub; classifyInputs must use that, not the caller's own alias
-// basename, or the emitted link line reaches for
-// "<drv-out>/bin/libcrypto.so" — a file that never exists, since the
-// drv's own output is named libcrypto.so.3 — and ld fails with
-// "cannot find ...: No such file or directory".
+// Makefile creates, not through -lcrypto. classify.Target resolves
+// the alias and reports the referenced drv's real output basename via
+// Sub; classifyInputs must use that, or the emitted link line reaches
+// for a file that never exists.
 func TestClassifyInputsSonameAliasUsesRealOutputName(t *testing.T) {
 	drv := "/nix/store/" + strings.Repeat("a", 32) + "-bin-libcrypto.so.3.drv"
 
@@ -487,29 +441,14 @@ func TestClassifyInputsSonameAliasUsesRealOutputName(t *testing.T) {
 }
 
 // TestResolveLibFlagFindsSharedLibs pins that `-lfoo` can resolve to a
-// nixgg-produced libfoo.so, not only libfoo.a.
-//
-// The candidate list was hardcoded to lib<name>.a, so a project linking
-// its own shared library the ordinary way — `-L. -lfoo` against a
-// libfoo.so nixgg had just built — never matched. The flag stayed a bare
-// `-lfoo` with no staged input, and the link died at
-// `ld: cannot find -lfoo`.
-//
-// This is the third defect in this same area: 28cd274 taught the shim to
-// recognise a positional .so, a later fix stopped dropping the /lib/
-// subdirectory of a consumed .so, and the `-l` search path still only
-// knew about archives. Worth stating so the next reader checks all three
-// representations when touching library handling.
-//
-// Search order is load-bearing and verified against the real linker:
-// ld tries lib<name>.so before lib<name>.a in each -L directory and takes
-// the first hit. Claiming the archive first would silently link something
-// different from what the caller's toolchain would have chosen.
+// nixgg-produced libfoo.so, not only libfoo.a. Search order is
+// load-bearing and verified against the real linker: ld tries
+// lib<name>.so before lib<name>.a in each -L directory and takes the
+// first hit.
 func TestResolveLibFlagFindsSharedLibs(t *testing.T) {
 	t.Run("plain -lfoo resolves a .so thunk", func(t *testing.T) {
 		dir := t.TempDir()
 		so := filepath.Join(dir, "libfoo.so")
-		// Native mode marks an unrealised output with a symlink.
 		if err := os.Symlink(filepath.Join(dir, "whatever.nix"), so); err != nil {
 			t.Fatal(err)
 		}
@@ -561,9 +500,6 @@ func TestResolveLibFlagFindsSharedLibs(t *testing.T) {
 	})
 
 	t.Run("a foreign .so is still not claimed", func(t *testing.T) {
-		// A system library that nixgg did not produce has neither a
-		// thunk symlink nor a drvref header. Claiming it would put a
-		// path in the drv that the sandbox never staged.
 		dir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(dir, "libfoo.so"),
 			[]byte("\x7fELF not ours"), 0o644); err != nil {
@@ -575,26 +511,19 @@ func TestResolveLibFlagFindsSharedLibs(t *testing.T) {
 	})
 }
 
-// TestParseLinkArgsPreservesArchiveGroup pins that a linker archive group
-// survives the input/flag separation.
+// TestParseLinkArgsPreservesArchiveGroup pins that a linker archive
+// group survives the input/flag separation. parseLinkArgs sorts
+// tokens into inputs and flags, and buildScript emits all flags before
+// all inputs; group brackets are positional, so the pair ended up
+// adjacent in flags, spanning nothing — silently defeating ld's
+// multi-pass rescan. Reproduced against the real linker with two
+// mutually-recursive archives: with the group it links, without it
+// fails with `undefined reference to b_fn`.
 //
-// parseLinkArgs sorts tokens into inputs and flags, and buildScript emits
-// all flags before all inputs. Group brackets are positional — they
-// bracket whatever sits BETWEEN them — so the pair ended up adjacent in
-// flags, spanning nothing:
-//
-//	caller:  cc m.o -Wl,--start-group libb.a liba.a -Wl,--end-group -o p
-//	emitted: cc -Wl,--start-group -Wl,--end-group m.o libb.a liba.a -o p
-//
-// That silently defeats ld's multi-pass rescan. Reproduced against the
-// real linker with two mutually-recursive archives: with the group it
-// links, without it fails with `undefined reference to b_fn`.
-//
-// The fix records that a group was asked for and re-emits it around the
-// whole input list. That widens the span — objects end up inside the
-// group, which is harmless (also verified against ld) — because the
-// caller's exact span is no longer expressible once inputs and flags have
-// been separated.
+// The fix records that a group was asked for and re-emits it around
+// the whole input list, widening the span (harmless, also verified
+// against ld) since the caller's exact span is no longer expressible
+// once inputs and flags have been separated.
 func TestParseLinkArgsPreservesArchiveGroup(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -657,7 +586,6 @@ func TestParseLinkArgsPreservesArchiveGroup(t *testing.T) {
 			if !reflect.DeepEqual(flags, tc.wantFlags) {
 				t.Errorf("flags = %q, want %q", flags, tc.wantFlags)
 			}
-			// The brackets must not survive in flags: that is the bug.
 			for _, f := range flags {
 				if isGroupBracket(f) {
 					t.Errorf("group bracket %q left in flags — it would be emitted "+
@@ -671,11 +599,10 @@ func TestParseLinkArgsPreservesArchiveGroup(t *testing.T) {
 // TestParseLinkArgsWholeArchiveTracksNamedSubset pins that
 // --whole-archive/--no-whole-archive tracks exactly which inputs fell
 // inside the span, unlike isGroupBracket's own single global group
-// (widened to cover every input — safe there, NOT safe here, see
-// WholeArchiveInputs' own docstring for why: it changes archive member
-// SELECTION, not just resolution order). Modeled directly on Linux
-// Kbuild's own vmlinux.o link recipe (scripts/Makefile.vmlinux_o's
-// cmd_ld_vmlinux.o).
+// (widened to cover every input — safe there, not safe here, since it
+// changes archive member selection, not just resolution order).
+// Modeled directly on Linux Kbuild's own vmlinux.o link recipe
+// (scripts/Makefile.vmlinux_o's cmd_ld_vmlinux.o).
 func TestParseLinkArgsWholeArchiveTracksNamedSubset(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -684,9 +611,9 @@ func TestParseLinkArgsWholeArchiveTracksNamedSubset(t *testing.T) {
 		wantInputs []string
 	}{
 		{
-			// Kbuild's own real shape: --whole-archive wraps ONLY
-			// vmlinux.a, --start-group/--end-group wraps the libs —
-			// two independent, non-overlapping spans on the same line.
+			// Kbuild's own real shape: --whole-archive wraps only
+			// vmlinux.a, --start-group/--end-group wraps the libs — two
+			// independent, non-overlapping spans on the same line.
 			name: "kbuild vmlinux.o shape",
 			args: []string{"-r", "--whole-archive", "vmlinux.a", "--no-whole-archive",
 				"--start-group", "lib.a", "lib2.a", "--end-group", "-o", "vmlinux.o"},
@@ -707,7 +634,6 @@ func TestParseLinkArgsWholeArchiveTracksNamedSubset(t *testing.T) {
 			wantInputs: []string{"a.o", "liba.a"},
 		},
 		{
-			// Multiple inputs inside one span all get tracked.
 			name: "multiple inputs inside one span",
 			args: []string{"--whole-archive", "liba.a", "libb.a",
 				"--no-whole-archive", "-o", "prog"},
@@ -731,29 +657,22 @@ func TestParseLinkArgsWholeArchiveTracksNamedSubset(t *testing.T) {
 	}
 }
 
-// TestStoreInputPromotedArtifactKeepsItsSubdir guards the second half of
-// the FHS change, which the first half's test did not cover.
+// TestStoreInputPromotedArtifactKeepsItsSubdir guards the second half
+// of the FHS change: storeInput uses classify.Result.Sub when it has
+// one, but doesn't have one for our own promoted outputs — `force`
+// copies a realised artifact into the working tree and the promoted
+// registry records only the store root, so Sub is empty and the
+// artifact's FHS subdir has to be re-derived from its name. Missing
+// that broke native-mode lua: liblua.a is at <root>/lib/liblua.a but
+// was referenced as <root>/liblua.a.
 //
-// storeInput uses classify.Result.Sub when it has one. It does not have
-// one for our OWN promoted outputs: `force` copies a realised artifact
-// into the working tree as a real file, and the promoted registry records
-// only the store ROOT — so Sub is empty and the artifact's FHS subdir has
-// to be re-derived from its name.
-//
-// Missing that broke native-mode lua: liblua.a is at <root>/lib/liblua.a
-// but was referenced as <root>/liblua.a, so luac failed with
-//
-//	ld.bfd: cannot find …-ar-liblua.a/liblua.a: No such file or directory
-//
-// Note this is NOT the same case as the earlier zlib subpath bug. There,
-// Sub was correctly populated from a resolved symlink and the fix was to
-// stop discarding it. Here Sub is legitimately empty and the subdir must
-// be reconstructed. Two different causes, same symptom.
+// This is a different cause than the zlib subpath bug above (there,
+// Sub was populated from a resolved symlink and the fix was to stop
+// discarding it; here Sub is legitimately empty).
 func TestStoreInputPromotedArtifactKeepsItsSubdir(t *testing.T) {
 	const root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ar-liblua.a"
 
 	t.Run("promoted archive gets lib/", func(t *testing.T) {
-		// Sub empty: this is a promoted output, not a resolved symlink.
 		c := classify.Result{Kind: classify.Store, Ref: root}
 		ni, ji := storeInput(c, "/build/lua/src/liblua.a")
 		if ni.Name != "lib/liblua.a" {
@@ -775,9 +694,6 @@ func TestStoreInputPromotedArtifactKeepsItsSubdir(t *testing.T) {
 	})
 
 	t.Run("an explicit Sub still wins", func(t *testing.T) {
-		// A foreign dependency reached through a symlink: classify resolved
-		// the real position, and that must take precedence over any rule
-		// inferred from the filename.
 		c := classify.Result{Kind: classify.Store,
 			Ref: "/nix/store/cccccccccccccccccccccccccccccccc-zlib-1.3",
 			Sub: "lib/libz.so",
@@ -789,15 +705,11 @@ func TestStoreInputPromotedArtifactKeepsItsSubdir(t *testing.T) {
 	})
 }
 
-// TestMatchesTarget pins the basename-fallback boundary: it fires
-// ONLY when target itself is a bare name (no directory component),
-// never when target is itself a relative/absolute path. Modeled on
-// Linux Kbuild's own recursive build, which produces many archives
-// sharing a basename ("lib.a" at both lib/lib.a and
-// arch/x86/lib/lib.a) — a path-aware target that still fell through
-// to basename comparison would ALSO match the wrong sibling's own
-// call, and maybeSubmit would try to submit the same output key
-// twice for two different drvs.
+// TestMatchesTarget pins the basename-fallback boundary: it fires only
+// when target itself is a bare name (no directory component), never
+// when target is itself a relative/absolute path. Modeled on Linux
+// Kbuild's own recursive build, which produces many archives sharing
+// a basename ("lib.a" at both lib/lib.a and arch/x86/lib/lib.a).
 func TestMatchesTarget(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
@@ -808,9 +720,6 @@ func TestMatchesTarget(t *testing.T) {
 		{"bare name matches via basename fallback", "mosh-server", "src/mosh-server", true},
 		{"bare name matches an absolute output", "mosh-server", "/build/src/mosh-server", true},
 		{
-			// The bug this test exists to catch: a path-shaped target
-			// must NOT basename-match a different sibling that happens
-			// to share the same final component.
 			name:   "path-shaped target does not basename-match a sibling",
 			target: "lib/lib.a", output: "arch/x86/lib/lib.a", want: false,
 		},
@@ -820,24 +729,15 @@ func TestMatchesTarget(t *testing.T) {
 		},
 		{"path-shaped target matches its own exact path", "lib/lib.a", "lib/lib.a", true},
 		{
-			// A path-shaped target ("built-in.a" prefixed with a
-			// directory) must not basename-match a DIFFERENT nested
-			// built-in.a either — same shape as the lib.a case above,
-			// confirming the fix isn't specific to one basename.
 			name:   "path-shaped built-in.a target does not basename-match a different nested one",
 			target: "arch/x86/built-in.a", output: "arch/x86/kernel/built-in.a", want: false,
 		},
 		{
-			// "built-in.a" as a BARE target (no "/") is a real, if
-			// risky, case: Kbuild's own top-level archive is invoked
-			// with exactly this literal bare name (source root, no
-			// path prefix), so the basename fallback correctly fires
-			// for it — but the same declaration would ALSO match every
-			// nested built-in.a's own call, which is why the fixture
-			// that actually needs to target the top-level one uses
-			// vmlinux.a (globally unique) instead, never bare
-			// "built-in.a" — this case documents that tradeoff, not a
-			// recommendation to declare "built-in.a" as a real target.
+			// Kbuild's own top-level archive is invoked with exactly this
+			// literal bare name, so the basename fallback correctly fires
+			// for it — but the same declaration would also match every
+			// nested built-in.a's own call, which is why a fixture that
+			// needs to target the top-level one uses vmlinux.a instead.
 			name:   "bare built-in.a matches the literal top-level invocation",
 			target: "built-in.a", output: "built-in.a", want: true,
 		},

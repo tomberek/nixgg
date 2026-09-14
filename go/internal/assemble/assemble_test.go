@@ -123,18 +123,7 @@ func TestStageForScanPreservesSymlinks(t *testing.T) {
 }
 
 func TestStageForScanCopiesReadOnlySourceDirs(t *testing.T) {
-	// The regression this pins: an untouched subtree of the build
-	// tree (e.g. LLVM's cmake/ dir, never written to during the
-	// build) still carries its Nix-store read-only permission bits
-	// (dr-xr-xr-x) at scan time. copyRecursive used to create dst
-	// with that same read-only mode via MkdirAll(dst,
-	// info.Mode().Perm()), so its own subsequent recursive calls
-	// populating dst's children failed with "permission denied" —
-	// confirmed directly building llvm-dyndrv (4013/4013 TUs
-	// compiled, then failed at this exact step). dst is disposable
-	// scratch space consumed only by `nix store add --scan`, so the
-	// exact mode doesn't matter as long as this function can write
-	// into it.
+	// Nix-store read-only dirs (dr-xr-xr-x) used to get copied with that same mode, so populating their children failed with "permission denied" (confirmed on llvm-dyndrv).
 	root := t.TempDir()
 	roDir := filepath.Join(root, "cmake")
 	if err := os.MkdirAll(roDir, 0o755); err != nil {
@@ -158,18 +147,7 @@ func TestStageForScanCopiesReadOnlySourceDirs(t *testing.T) {
 }
 
 func TestStageForScanIsSelfExcluding(t *testing.T) {
-	// The regression this pins: StageForScan used to accept a
-	// caller-supplied dest, which — inside a real builder-rpc-v0
-	// sandbox where $TMPDIR resolves under root — could itself land
-	// under root. Copying root's entries into a destination that is
-	// ALSO one of root's own entries recursed into itself at every
-	// level until the kernel refused with "file name too long"
-	// (confirmed directly building hello-dyndrv). StageForScan now
-	// always stages at a FIXED, excluded name directly under root,
-	// which by construction cannot be copied into itself: this test
-	// pins that the staged tree contains no infinite ".gg-stage"
-	// nesting no matter how many times StageForScan runs against the
-	// same root.
+	// StageForScan used to accept a caller-supplied dest, which under a sandboxed $TMPDIR could land under root, recursing into itself until "file name too long" (confirmed on hello-dyndrv). It now always stages at a fixed, excluded name.
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)

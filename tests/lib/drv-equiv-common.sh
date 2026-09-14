@@ -1,9 +1,8 @@
 # Shared plumbing for tests/drv-equivalence.sh and
-# tests/batch-drv-equivalence.sh: both scripts prove the same
-# invariant (native and sandbox modes produce byte-identical drvs for
-# a given Kind) against the same alt-store/patched-nix scaffolding,
-# and differ only in *which* drv names they care about. Meant to be
-# `source`d, not executed.
+# tests/batch-drv-equivalence.sh: both prove the same invariant
+# (native and sandbox modes produce byte-identical drvs for a given
+# Kind) against the same scaffolding, differing only in which drv
+# names they care about. Meant to be `source`d, not executed.
 #
 # Env knobs (same names both callers already documented):
 #   ALT_STORE      root of the alt store
@@ -58,14 +57,12 @@ store = local?root=$ALT_STORE
 #
 # Echoes the resolved, existing on-disk path for a fixture's native
 # source: "example" resolves to $nixgg_root/example; anything else is
-# treated as a flake-input name and resolved straight out of
-# flake.lock (NOT `nix flake archive` / `builtins.getFlake`, both of
-# which pay the cost of locking every OTHER input's transitive graph
-# too — nix-15793 and its own sub-inputs, ffmpeg-src, llvm-src,
-# gcc-src — before returning even one field, confirmed directly as a
-# failure mode in a cold/isolated store). Every non-"example" input
-# here is `flake = false` (a plain source tree), so its locked node
-# has no further inputs to chase — fetchTree on it is standalone.
+# a flake-input name resolved straight out of flake.lock (NOT `nix
+# flake archive` / `builtins.getFlake`, both of which pay the cost of
+# locking every OTHER input's transitive graph too before returning
+# even one field — confirmed directly as a failure mode in a cold/
+# isolated store). Every non-"example" input here is `flake = false`,
+# so its locked node has no further inputs to chase.
 #
 # Echoes nothing (caller must check) if resolution fails. Requires
 # $nixgg_root / $ALT_STORE / $PATCHED_NIX from equiv_common_setup.
@@ -90,54 +87,25 @@ print(json.dumps(json.dumps(d['nodes']['$src_input']['locked'])))
     --expr "(builtins.fetchTree (builtins.fromJSON $locked)).outPath" 2>/dev/null)
   [[ -z "$src" ]] && return 1
 
-  # fetchTree ran against store = local?root=$ALT_STORE (this
-  # script's own NIX_CONFIG), so the path it returns lives under
-  # $ALT_STORE, not directly at /nix/store — same convention every
-  # other store-path reference in these scripts already follows. The
-  # bare path can spuriously exist anyway on a machine with its own
-  # ambient /nix/store, which is why a missing prefix here can go
-  # unnoticed in months of local-only runs but fail in CI's genuinely
-  # fresh store.
+  # fetchTree ran against store = local?root=$ALT_STORE (this script's
+  # own NIX_CONFIG), so the returned path lives under $ALT_STORE, not
+  # /nix/store directly — a missing prefix here can go unnoticed on a
+  # machine with its own ambient /nix/store, but fails in CI's
+  # genuinely fresh store.
   echo "$ALT_STORE$src"
 }
 
 # equiv_sandbox_drvs <attr>
 #
 # Echoes the basename of every TU/link/archive drv a sandbox build of
-# `.#<attr>` produces — the exact set, with zero filename filtering.
-#
-# Mechanism (confirmed directly, not inferred): mkNixggBuild.nix's
-# outer wrapper derivation (`drv`, `outputHashMode = "text"`) is what
-# actually runs the shims — each shimmed cc/ar/link call REGISTERS a
-# drv (`nix derivation add`) rather than compiling anything for real,
-# so building ONLY the wrapper's own per-target outputs (never the
-# outputOf-resolved `results`/`packages`) triggers every registration
-# with no real compilation, and each output's build result IS the
-# resolved target drv's own store path (`nix build ... --print-out-
-# paths` on `.#<attr>.drv."<output>.drv"`). Feeding every one of
-# those printed paths into ONE `nix derivation show -r` call then
-# returns the complete, already-deduplicated set of every TU/link/
-# archive drv this build produced — confirmed on lua (two outputs,
-# lua+luac, sharing one archive drv): 37 total entries, `ar-
-# liblua.a.drv` appearing exactly once despite being a dependency of
-# both, matching README.md's pinned count exactly.
-#
-# This replaces the previous store-snapshot-diff + filename-regex
-# approach (snapshot nix/store/ before and after a full `nix build`,
-# diff the listings, then guess which new files were real target
-# drvs vs toolchain noise via `^[a-z0-9]+-(tu-|ar-|bin-|nixgg-)` plus
-# several more lines excluding the outer wrapper itself, nixgg's own
-# toolchain-build drvs, and Nix's post-build inputDrvs-to-inputSrcs
-# rewrite). None of that filtering is needed here: toolchain deps
-# (bash/coreutils/gcc-wrapper) are referenced via inputs.srcs, never
-# inputs.drvs, so `derivation show -r` has nothing to recurse into
-# for them — the JSON keys already ARE exactly the real drv set.
-#
-# Output-key discovery is generic (`nix eval --json
-# "<flake>#<attr>.drv.outputs"`), so this works unchanged for both
-# single-target (hello -> ["hello.drv"]) and multi-target (lua ->
-# ["lua.drv","luac.drv"]) fixtures with no per-fixture target list to
-# maintain.
+# `.#<attr>` produces. Building the outer wrapper's own per-target
+# outputs runs the shims, which REGISTER each drv (`nix derivation
+# add`) rather than compiling for real, so this triggers every
+# registration with no real compilation; `nix derivation show -r` on
+# the resulting output paths then returns the complete, deduplicated
+# drv set with zero filename filtering needed (toolchain deps are
+# referenced via inputs.srcs, never inputs.drvs, so show -r has
+# nothing to recurse into for them).
 #
 # Requires $nixgg_root, $PATCHED_NIX in scope (from
 # equiv_common_setup). Logs failures to /tmp/nixgg-equiv-<attr>-
@@ -167,9 +135,9 @@ for k in json.loads(sys.stdin.read()):
     return 1
   fi
 
-  # One nix build invocation for every output — confirmed this shares
-  # ONE build phase for the whole multi-output derivation rather than
-  # re-running buildCommand per output.
+  # One nix build invocation for every output — shares one build phase
+  # for the whole multi-output derivation rather than re-running
+  # buildCommand per output.
   local -a attrs=()
   for k in "${keys[@]}"; do
     attrs+=("$nixgg_root#$attr.drv.\"$k\"")
@@ -223,21 +191,17 @@ for k in sorted(d['derivations'].keys()):
 equiv_native_build() {
   local attr="$1" subdir="$2" workdir="$3" nt_log="$4"
 
-  # Copy source, run the build. Store paths are read-only, so we need
-  # our own writable copy.
+  # Store paths are read-only, so we need our own writable copy.
   cp -a "$src"/. "$workdir/"
   chmod -R u+w "$workdir"
 
-  # Wipe any pre-existing .nixgg/ that auto-seed might hit.
   rm -rf "$workdir/.nixgg" 2>/dev/null || true
 
-  # "example" is a live working directory, not a pristine store path,
-  # so a stray `make` there leaves main.o / util.o / hello behind.
-  # Those are gitignored (the sandbox never sees them) but this copy
-  # is verbatim, and make would skip both compiles — zero thunks,
-  # looking like a nixgg bug. Use the fixture's own `clean` target so
-  # it can't drift from the build rules. No shims on PATH here, so
-  # this deletes and never builds.
+  # "example" is a live working directory; a stray `make` there leaves
+  # main.o/util.o/hello behind, and a verbatim copy would then skip
+  # both compiles (zero thunks, looking like a nixgg bug). Use the
+  # fixture's own `clean` target so it can't drift from the build
+  # rules.
   if [[ -e "$workdir/${subdir}/Makefile" ]]; then
     ( cd "$workdir/${subdir}" && make clean ) >/dev/null 2>&1 || true
   fi
@@ -305,8 +269,7 @@ equiv_report_sets() {
   only_native=$(comm -13 <(echo "$sb_drvs") <(echo "$nt_drvs"))
   both=$(comm -12 <(echo "$sb_drvs") <(echo "$nt_drvs"))
 
-  # Line counts. `wc -l` counts newlines; add 1 for content that
-  # doesn't end in \n. Simplest: filter empty lines then wc.
+  # `wc -l` undercounts content with no trailing newline; grep -c . avoids that.
   local n_both n_only_sb n_only_nt
   n_both=$(printf '%s\n' "$both" | grep -c . || true)
   n_only_sb=$(printf '%s\n' "$only_sandbox" | grep -c . || true)

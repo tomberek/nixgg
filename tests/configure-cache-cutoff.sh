@@ -11,16 +11,9 @@
 #                includePatterns/existenceStubs DON'T cover
 #   included   — src edited at a file the filter DOES cover
 #
-# Early-cutoff means: excluded must produce the SAME ggtree path as
-# baseline (the edit never reaches the configure stage's actual input
-# content, so CA collapses the rebuild back to the same output) —
-# while included must produce a DIFFERENT one (a negative control: if
-# this ALSO matched baseline, the filter would be excluding
-# everything, not correctly discriminating).
-#
-# This only checks the caching *mechanism* (nix/splitStdenv.nix +
-# nix/configureSrcFilter.nix) — whether a build succeeds/runs is
-# tests/smoke.sh's CONFIGCACHE set's job, not this script's.
+# excluded must match baseline (edit never reaches configure's input
+# content); included must differ (negative control — if it also
+# matched, the filter would be excluding everything).
 #
 # Env knobs:
 #   ALT_STORE      root of the alt store (default /tmp/nixgg-cutoff-store)
@@ -58,10 +51,8 @@ store = local?root=$ALT_STORE
 # configureStage_ggtree_path <edit-arg>
 #
 # Instantiates the fixture with the given edit, extracts the configure
-# stage's own derivation (the one named *-configure-<version>,
-# distinct from both the configureSrcFilter derivation and the final
-# stage — see nix/splitStdenv.nix's naming comment), builds ONLY its
-# "ggtree" output, and prints the resulting real store path.
+# stage's own derivation, builds ONLY its "ggtree" output, and prints
+# the resulting real store path.
 configureStage_ggtree_path() {
   local edit_arg="$1"
   local outer_drv configure_stage_drv

@@ -2,35 +2,26 @@
 # Regression test: an edit to ONE translation unit only rebuilds that
 # TU (and its downstream archive/link), not the whole package.
 #
-# tests/configure-cache-cutoff.sh and tests/dyndrv-configure-cache-cutoff.sh
-# check a BINARY proxy for caching — does an edit change an output
-# path or not. Neither can tell "2 TUs out of 2213 rebuilt" apart from
-# "every TU rebuilt" — both look like "the path changed" at the group
-# boundary they inspect. README.md's "Measured incremental-rebuild
-# cost" table has exactly that number (openssl, 2/2213 TUs), but it
-# was produced once, by hand, against a separate flake
-# (~/nixgg-example) — nothing in this repo re-checks it. This script
-# turns that one-off measurement into an automated count on a cheap
-# fixture (lua, 34 TUs), so a regression that widened the invalidation
-# blast radius while still passing the binary cutoff tests gets caught.
+# README.md's "Measured incremental-rebuild cost" table has a
+# hand-measured number (openssl, 2/2213 TUs) against a separate flake;
+# nothing in this repo re-checks it. This script turns that into an
+# automated count on a cheap fixture (lua, 34 TUs), catching a
+# regression that widens the invalidation blast radius while still
+# passing the binary cutoff checks in tests/configure-cache-cutoff.sh
+# and tests/dyndrv-configure-cache-cutoff.sh.
 #
-# Mechanism: build .#lua once (this fixture's exact mkNixggBuild call,
-# see tests/perf-regression-fixture.nix) to warm the store, then build
-# the fixture's `.package` derivation with one source file edited,
-# `^out` (forces Nix to walk the whole builtins.outputOf chain —
-# compile drvs -> archive drv -> link drv — not just the outer
-# text-mode wrapper), substituters disabled for this one build so a
-# remote build-trace match can't quietly satisfy a drv without it
-# showing up as a `building '...'` line. Every such line naming a
-# `tu-*.drv` is a real compile that happened this run; assert there is
-# exactly one, and it is the touched file's own object.
+# Mechanism: build .#lua once to warm the store, then build the
+# fixture's `.package` derivation with one source file edited, `^out`
+# (forces the whole outputOf chain: compile drvs -> archive drv ->
+# link drv), substituters disabled so a remote build-trace match can't
+# quietly satisfy a drv without a `building '...'` line. Assert
+# exactly one such line names a `tu-*.drv`, and it is the touched
+# file's own object.
 #
 # Deliberately does NOT assert that ar-liblua.a.drv/bin-lua.drv rebuild
 # too — a new drv is trivially registered for them whenever any input
-# changes (that's just CA hashing, not a build that happened), and
-# `-Lv`'s progress lines don't reliably surface every quick build
-# (confirmed via `nix log`: both build locally even on runs where no
-# matching `building '...'` line appeared). The property worth
+# changes (that's just CA hashing, not a build), and `-Lv`'s progress
+# lines don't reliably surface every quick build. The property worth
 # guarding is the negative one: every OTHER TU stays a cache hit.
 #
 # Env knobs:
@@ -114,8 +105,6 @@ tu_count=$(printf '%s\n' $rebuilt_tus | grep -c '.' || true)
 
 ok=1
 
-# Exactly one TU compile: the edited file's own object (hash-prefixed
-# store basename, e.g. <hash>-tu-lmathlib.o.drv), nothing else.
 if [[ "$tu_count" -ne 1 || "$rebuilt_tus" != *-tu-lmathlib.o.drv ]]; then
   printf '\033[1;31m  FAIL\033[0m expected exactly 1 tu-*.drv rebuild (*-tu-lmathlib.o.drv), got %d: %s\n' \
     "$tu_count" "$(printf '%s ' $rebuilt_tus)" >&2

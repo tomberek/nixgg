@@ -4,30 +4,20 @@
 # tests/configure-cache-cutoff.sh checks for splitAtConfigure alone,
 # now through the combined 3-stage split.
 #
-# Builds the configure stage (the *-configure-<version> derivation,
-# same naming convention as the splitAtConfigure-only case) three ways
-# and compares its ggtree OUTPUT PATH:
+# Builds the configure stage (the *-configure-<version> derivation)
+# three ways and compares its ggtree OUTPUT PATH:
 #
 #   baseline   — real, unedited src
 #   excluded   — src edited at a file configureSrcFilter's
 #                includePatterns/existenceStubs DON'T cover
 #   included   — src edited at a file the filter DOES cover
 #
-# Early-cutoff means: excluded must produce the SAME ggtree path as
-# baseline (the edit never reaches the configure stage's actual input
-# content, so CA collapses the rebuild back to the same output) —
-# while included must produce a DIFFERENT one (a negative control: if
-# this ALSO matched baseline, the filter would be excluding
-# everything, not correctly discriminating).
-#
-# This only checks the caching *mechanism* — whether the resulting
-# package builds/runs is tests/smoke.sh's DYNCONFIGCACHE set's job,
-# not this script's. hello (single-output) and gdbm (multi-output:
+# excluded must match baseline; included must differ (negative
+# control). hello (single-output) and gdbm (multi-output:
 # out/dev/info/lib/man) are both run through this — the combined
 # mechanism's third fixture (zstd) has no configureSrcFilter to test
-# cutoff against at all (see nix/splitStdenv.nix's flake.nix usage —
-# zstd's own CMakeLists.txt globs its sources, so filtering can't
-# preserve early-cutoff for it).
+# cutoff against at all (zstd's CMakeLists.txt globs its sources, so
+# filtering can't preserve early-cutoff for it).
 #
 # Env knobs:
 #   ALT_STORE      root of the alt store (default /tmp/nixgg-dyndrv-cutoff-store)
@@ -64,11 +54,10 @@ store = local?root=$ALT_STORE
 # configureStage_ggtree_path <package> <edit-arg>
 #
 # Instantiates the fixture with the given package/edit, extracts the
-# configure stage's own derivation (the one named *-configure-<version> —
-# nested one level inside the outer drv's *.drv.drv input, since the
-# build stage sits between the outer package derivation and the
-# configure stage here), builds ONLY its "ggtree" output, and prints
-# the resulting real store path.
+# configure stage's own derivation (nested one level inside the outer
+# drv's *.drv.drv input, since the build stage sits between the outer
+# package derivation and the configure stage here), builds ONLY its
+# "ggtree" output, and prints the resulting real store path.
 configureStage_ggtree_path() {
   local package="$1" edit_arg="$2"
   local outer_drv build_stage_drv configure_stage_drv

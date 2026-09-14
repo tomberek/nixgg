@@ -23,11 +23,8 @@ func testMembers() []BatchCompileMember {
 }
 
 // TestBatchArchiveMemberOrderPreserved pins that both the compile
-// lines and the ar argv preserve the caller's own member order — a
-// same-group archive's members are ordered by ar's own argv, and that
-// order is semantically load-bearing (some archives are order-
-// sensitive for symbol resolution, same reason link.go cares about
-// -l-vs-input ordering).
+// lines and the ar argv preserve the caller's own member order —
+// some archives are order-sensitive for symbol resolution.
 func TestBatchArchiveMemberOrderPreserved(t *testing.T) {
 	script := batchArchiveScript("/COREUTILS", "/AR", "rcs", "libhiredis.a", testMembers())
 
@@ -50,8 +47,7 @@ func TestBatchArchiveMemberOrderPreserved(t *testing.T) {
 }
 
 // TestBatchArchiveScriptFlagsQuoted pins that a flag containing a
-// shell-meaningful character is safely single-quoted, same escaping
-// convention shellQuoteFlags already gives every other Kind.
+// shell-meaningful character is escaped the same way as other Kinds.
 func TestBatchArchiveScriptFlagsQuoted(t *testing.T) {
 	members := []BatchCompileMember{
 		{Tool: "cc", SrcStore: "/nix/store/x-src", Source: "a.c", OutName: "a.o",
@@ -65,10 +61,7 @@ func TestBatchArchiveScriptFlagsQuoted(t *testing.T) {
 
 // TestBatchArchiveScriptToolAndPaths pins that each member's compile
 // runs from inside its own SrcStore (sandbox mode), using its own
-// Tool, and writes into a $objroot shared by every member — the
-// mechanism that lets a later `ar` reference every object by a
-// uniform, cd-independent path regardless of which SrcTree/SrcStore
-// each member's own source lives under.
+// Tool, and writes into a $objroot shared by every member.
 func TestBatchArchiveScriptToolAndPaths(t *testing.T) {
 	script := batchArchiveScript("/COREUTILS", "/AR", "rcs", "libhiredis.a", testMembers())
 	if !strings.Contains(script, `cd "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-deps-hiredis-sds-o"`) {
@@ -83,18 +76,11 @@ func TestBatchArchiveScriptToolAndPaths(t *testing.T) {
 }
 
 // TestBatchArchiveScriptThinUsesPermanentObjroot pins that a THIN
-// archive (`T` in arFlags) writes its member objects into the
-// archive's OWN store output ($out/lib/.nixgg-objs/) rather than a
-// build-tmp scratch dir. A thin archive stores each member's file
-// PATH, not its bytes (see internal/members' package docstring), so
-// those paths must survive after this derivation's own build sandbox
-// is torn down — confirmed via a real experiment that a thin archive
-// built from a tmp-relative $objroot breaks immediately once that
-// tmp is gone ("error opening thin archive member"), while one built
-// from $out/lib/.nixgg-objs/ (Nix rewrites the archive's own self-
-// reference to the final resolved store path) keeps working. This
-// makes a thin batch archive self-contained — no members sidecar
-// needed, unlike archive.go's own non-batched thin-archive path.
+// archive writes member objects into $out/lib/.nixgg-objs/ rather than
+// a build-tmp scratch dir: a thin archive stores each member's file
+// PATH, not its bytes, so the path must survive after the sandbox is
+// torn down — confirmed experimentally ("error opening thin archive
+// member" from a tmp-relative objroot vs. working from $out/lib/).
 func TestBatchArchiveScriptThinUsesPermanentObjroot(t *testing.T) {
 	script := batchArchiveScript("/COREUTILS", "/AR", "csrDT", "libfoo.a", testMembers())
 	if !strings.Contains(script, `mkdir -p "$out/lib/.nixgg-objs"`) {
@@ -109,11 +95,8 @@ func TestBatchArchiveScriptThinUsesPermanentObjroot(t *testing.T) {
 }
 
 // TestBatchArchiveScriptNonThinKeepsScratchObjroot pins the
-// complement: every existing (non-thin) batch fixture must render
-// EXACTLY the same script as before this distinction existed — a
-// build-tmp scratch dir, not $out/lib/.nixgg-objs — since its members
-// are copied INTO the archive's own bytes by `ar` itself and nothing
-// needs to survive past this derivation's own build.
+// complement: non-thin archives keep the build-tmp scratch objroot,
+// since `ar` copies member bytes into the archive itself.
 func TestBatchArchiveScriptNonThinKeepsScratchObjroot(t *testing.T) {
 	script := batchArchiveScript("/COREUTILS", "/AR", "rcs", "libfoo.a", testMembers())
 	if !strings.Contains(script, `mkdir -p "$out/lib" .nixgg-objs`) {
@@ -127,21 +110,14 @@ func TestBatchArchiveScriptNonThinKeepsScratchObjroot(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveScriptRunsConcurrently actually EXECUTES the
-// rendered script under real bash (substituting a fake "compiler"
-// that records its own start time), and confirms members run with
-// real overlapping concurrency, not strictly one at a time — pinning
-// the fix for the "one gcc/cc1 process at a time regardless of
-// available cores" regression found batching ffmpeg's libavcodec.
-// NIX_BUILD_CORES is set in the test's own env to control gg_max
-// deterministically rather than relying on the host's real core
-// count.
+// TestBatchArchiveScriptRunsConcurrently EXECUTES the rendered script
+// under real bash and confirms members run with real overlapping
+// concurrency, not strictly one at a time — pinning the fix for a
+// "one gcc/cc1 process at a time regardless of available cores"
+// regression found batching ffmpeg's libavcodec.
 func TestBatchArchiveScriptRunsConcurrently(t *testing.T) {
 	dir := t.TempDir()
 	fakeCC := filepath.Join(dir, "fakecc")
-	// Records "<nanoTime> start\n" / "<nanoTime> end\n" per invocation
-	// to a shared log, sleeping in between — real concurrency shows up
-	// as overlapping [start,end] intervals across members.
 	script := "#!/bin/sh\n" +
 		`echo "$(date +%s%N) start $1" >> "` + dir + `/log"` + "\n" +
 		"sleep 0.2\n" +
@@ -164,10 +140,7 @@ func TestBatchArchiveScriptRunsConcurrently(t *testing.T) {
 	}
 
 	full := "#!/bin/sh\nset -e\n" + batchArchiveScript("/usr", "/usr", "rcs", "lib.a", members)
-	// Replace the real `ar` call (no libs to actually archive here)
-	// with a no-op so the test only exercises the concurrency runner.
 	full = full[:strings.Index(full, "ar D")] + "mkdir -p \"$out/lib\"; : \"$out/lib\"\n"
-
 	scriptPath := filepath.Join(dir, "run.sh")
 	if err := os.WriteFile(scriptPath, []byte(full), 0o755); err != nil {
 		t.Fatal(err)
@@ -201,10 +174,8 @@ func TestBatchArchiveScriptRunsConcurrently(t *testing.T) {
 		}
 		events = append(events, event{ts, kind})
 	}
-	// Real concurrency check: at some point in time, at least 2
-	// members must be simultaneously "started but not yet ended" —
-	// impossible if the runner were fully serial (one start, one end,
-	// repeat).
+	// At least 2 members must be simultaneously "started but not yet
+	// ended" — impossible if the runner were fully serial.
 	running := 0
 	maxRunning := 0
 	for _, e := range events {
@@ -225,18 +196,16 @@ func TestBatchArchiveScriptRunsConcurrently(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveScriptPropagatesFailure actually EXECUTES the
-// rendered script and confirms a single failing member anywhere in
-// the batch (not just the last-launched one) fails the WHOLE script —
-// pinning against the "plain `wait` only returns the LAST job's exit
-// status" footgun found while designing the concurrency fix.
+// TestBatchArchiveScriptPropagatesFailure EXECUTES the rendered
+// script and confirms a single failing member anywhere in the batch
+// (not just the last-launched one) fails the WHOLE script — pinning
+// against the "plain `wait` only returns the LAST job's exit status"
+// footgun found while designing the concurrency fix.
 func TestBatchArchiveScriptPropagatesFailure(t *testing.T) {
 	dir := t.TempDir()
 	fakeCC := filepath.Join(dir, "fakecc")
-	// Fails when compiling "bad", succeeds (after a short sleep, so
-	// it's still running when later members launch) otherwise. The
-	// source name is the arg AFTER "-c" (invocation shape is
-	// `"$tool" ... -c "$source" -o "$objroot/$outName"`), not $1.
+	// Invocation shape is `"$tool" ... -c "$source" -o "..."`, so the
+	// source name is the arg after "-c", not $1.
 	script := "#!/bin/sh\n" +
 		`while [ "$#" -gt 0 ]; do` + "\n" +
 		`  if [ "$1" = "-c" ]; then src="$2"; fi` + "\n" +
@@ -277,30 +246,22 @@ func TestBatchArchiveScriptPropagatesFailure(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveScriptThinArchiveSurvivesObjectDeletion actually
-// EXECUTES a rendered thin-archive script under real bash + real ar,
-// then deletes the SCRATCH directory the OLD (pre-fix) scheme would
-// have used (build-tmp-relative, sibling to the script's own cwd —
-// not $out) and confirms the resulting archive still resolves its
-// members from $out/lib/.nixgg-objs/, which survives because it was
-// never inside the deleted directory — pinning the real, end-to-end
-// property TestBatchArchiveScriptThinUsesPermanentObjroot only
-// checks at the script-text level. Uses a fake "compiler" that
-// copies a real byte pattern rather than compiling anything, since
-// what's under test is object PERSISTENCE, not compilation.
+// TestBatchArchiveScriptThinArchiveSurvivesObjectDeletion EXECUTES a
+// rendered thin-archive script under real bash + real ar, deletes the
+// build-tmp-relative SCRATCH directory the OLD scheme would have used,
+// and confirms the resulting archive still resolves its members from
+// $out/lib/.nixgg-objs/ — the real, end-to-end property
+// TestBatchArchiveScriptThinUsesPermanentObjroot only checks at the
+// script-text level.
 func TestBatchArchiveScriptThinArchiveSurvivesObjectDeletion(t *testing.T) {
 	if _, err := exec.LookPath("ar"); err != nil {
 		t.Skip("ar not on PATH")
 	}
 
-	workDir := t.TempDir() // stands in for the build's own tmp — deleted below
-	outDir := t.TempDir()  // stands in for $out — a SEPARATE dir, survives
+	workDir := t.TempDir()
+	outDir := t.TempDir()
 
 	fakeCC := filepath.Join(workDir, "fakecc")
-	// Argv shape matches memberCompileLine: "$tool" ...flags... -c
-	// "$source" -o "$objroot/$outName" — the fake compiler ignores
-	// everything except the -o target, and writes deterministic
-	// bytes so the archive's own member content is checkable.
 	ccScript := "#!/bin/sh\n" +
 		`while [ "$#" -gt 0 ]; do` + "\n" +
 		`  if [ "$1" = "-o" ]; then out="$2"; fi` + "\n" +
@@ -345,15 +306,11 @@ func TestBatchArchiveScriptThinArchiveSurvivesObjectDeletion(t *testing.T) {
 		t.Fatalf("member object not written under $out/lib/.nixgg-objs/: %v", err)
 	}
 
-	// Simulate the build sandbox being torn down: delete EVERYTHING
-	// outside $out. Only outDir must matter from here on.
+	// Simulate the build sandbox being torn down.
 	if err := os.RemoveAll(workDir); err != nil {
 		t.Fatal(err)
 	}
 
-	// ar p extracts a named member's own bytes — resolves the thin
-	// archive's stored path and reads through it, exactly what a
-	// later link step's `ld` would need to do.
 	out, err := exec.Command(arPath, "p", archivePath, "a.o").Output()
 	if err != nil {
 		t.Fatalf("ar p failed after workDir deletion — thin archive member did not survive: %v", err)
@@ -365,14 +322,9 @@ func TestBatchArchiveScriptThinArchiveSurvivesObjectDeletion(t *testing.T) {
 
 // TestBatchArchiveJSONSrcsDedup pins that BatchArchiveJSON's
 // inputs.srcs is the union of every member's own SrcStore basename
-// plus the archive's own StoreDeps and ExtraSrcs, deduplicated — a
-// store path referenced by two members (or by both a member and the
-// archive's own StoreDeps) must appear exactly once, or `nix
-// derivation add` would receive a duplicate-looking entry.
+// plus the archive's own StoreDeps and ExtraSrcs, deduplicated.
 func TestBatchArchiveJSONSrcsDedup(t *testing.T) {
 	members := testMembers()
-	// A StoreDep that happens to coincide with one member's own
-	// SrcStore basename — must not be duplicated in the result.
 	dupStoreDep := "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-deps-hiredis-sds-o"
 
 	drv := BatchArchiveJSON(BatchArchiveJSONParams{
@@ -403,11 +355,10 @@ func TestBatchArchiveJSONSrcsDedup(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveJSONSingleOutput pins the scope decision this whole
-// Kind rests on: exactly one output, named "out", same shape as an
-// ordinary KindArchive derivation — this is what lets the combined
-// derivation's result flow through thunk.LinkPlaceholder /
-// sandbox.PointOutputAtDrv unmodified.
+// TestBatchArchiveJSONSingleOutput pins that this Kind produces
+// exactly one output named "out", same shape as an ordinary
+// KindArchive derivation, so the result flows through
+// thunk.LinkPlaceholder / sandbox.PointOutputAtDrv unmodified.
 func TestBatchArchiveJSONSingleOutput(t *testing.T) {
 	drv := BatchArchiveJSON(BatchArchiveJSONParams{
 		Name: "batch-lib.a", OutName: "lib.a", System: "x86_64-linux",
@@ -422,11 +373,10 @@ func TestBatchArchiveJSONSingleOutput(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveJSONNeverReferencesSiblingDrv pins the scope
-// decision that motivates this Kind's simplicity (see package
-// docstring): a batch-archive's inputs.drvs is always empty — every
-// input is a plain staged source tree, never a not-yet-realized
-// sibling drv/thunk.
+// TestBatchArchiveJSONNeverReferencesSiblingDrv pins that a
+// batch-archive's inputs.drvs is always empty — every input is a
+// plain staged source tree, never a not-yet-realized sibling
+// drv/thunk.
 func TestBatchArchiveJSONNeverReferencesSiblingDrv(t *testing.T) {
 	drv := BatchArchiveJSON(BatchArchiveJSONParams{
 		Name: "batch-lib.a", OutName: "lib.a", System: "x86_64-linux",
@@ -438,12 +388,10 @@ func TestBatchArchiveJSONNeverReferencesSiblingDrv(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveJSONScriptPassedAsFile pins that the combined
-// script never lands directly in Args — it goes through
-// Env["batchScript"] + passAsFile, same mechanism and same reason as
-// assemble.Build's own Env["buildScript"] fix. Args must stay a
-// short, fixed `source "$batchScriptPath"` regardless of member
-// count.
+// TestBatchArchiveJSONScriptPassedAsFile pins that the combined script
+// goes through Env["batchScript"] + passAsFile, same mechanism as
+// assemble.Build's own Env["buildScript"] fix, so Args stays a short,
+// fixed `source "$batchScriptPath"` regardless of member count.
 func TestBatchArchiveJSONScriptPassedAsFile(t *testing.T) {
 	drv := BatchArchiveJSON(BatchArchiveJSONParams{
 		Name: "batch-lib.a", OutName: "lib.a", System: "x86_64-linux",
@@ -461,13 +409,13 @@ func TestBatchArchiveJSONScriptPassedAsFile(t *testing.T) {
 	}
 }
 
-// TestBatchArchiveJSONArgsStaySmallAtScale pins the actual fix for
-// ffmpeg's "Argument list too long" failure batching libavcodec (350+
-// members, 1MB+ combined script): with enough members, Args must
-// stay a short, fixed string no matter how large the real script
-// grows — confirmed directly against MAX_ARG_STRLEN (131072).
+// TestBatchArchiveJSONArgsStaySmallAtScale pins the fix for ffmpeg's
+// "Argument list too long" failure batching libavcodec (350+ members,
+// 1MB+ combined script): Args must stay short no matter how large the
+// real script grows — checked directly against MAX_ARG_STRLEN
+// (131072).
 func TestBatchArchiveJSONArgsStaySmallAtScale(t *testing.T) {
-	members := make([]BatchCompileMember, 900) // more than ffmpeg's largest real archive
+	members := make([]BatchCompileMember, 900)
 	for i := range members {
 		members[i] = BatchCompileMember{
 			Tool:     "cc",
@@ -483,7 +431,7 @@ func TestBatchArchiveJSONArgsStaySmallAtScale(t *testing.T) {
 		ARFlags: "rcs", Members: members,
 	})
 
-	const maxArgStrlen = 131072 // Linux MAX_ARG_STRLEN — this is exactly the bug
+	const maxArgStrlen = 131072 // Linux MAX_ARG_STRLEN
 	argvSize := 0
 	for _, a := range drv.Args {
 		argvSize += len(a)
@@ -500,10 +448,9 @@ func TestBatchArchiveJSONArgsStaySmallAtScale(t *testing.T) {
 }
 
 // TestBatchArchiveNativeExprShape pins the native-mode expression's
-// gross structure: it imports batchArchiver.nix, carries a members
-// list with an unquoted srcTree path literal per member (Nix must
-// resolve it, not Go), and each member's own compileLine is present
-// as an indented string.
+// gross structure: imports batchArchiver.nix, carries a members list
+// with an unquoted srcTree path literal per member, and each member's
+// own compileLine present as an indented string.
 func TestBatchArchiveNativeExprShape(t *testing.T) {
 	e := BatchArchive(BatchArchiveParams{
 		Helpers: "/nix/store/helpers", OutName: "libhiredis.a", ARFlags: "rcs",

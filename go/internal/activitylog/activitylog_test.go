@@ -9,12 +9,6 @@ import (
 	"testing"
 )
 
-// resetState clears the package's own open-once bookkeeping between
-// tests — Emit's real callers are one-shim-invocation-per-process, so
-// "open the log file once, reuse for the process's lifetime" never
-// needs resetting in production, but a test process calls Emit many
-// times against different temp paths and must not reuse a stale
-// handle from an earlier test.
 func resetState(t *testing.T) {
 	t.Helper()
 	mu.Lock()
@@ -46,10 +40,6 @@ func readLines(t *testing.T, path string) []map[string]any {
 	return lines
 }
 
-// TestEmitDisabledByDefault pins the whole feature's off-by-default
-// contract: with NIXGG_LOG unset, Emit must not create a file at all
-// — a build that never opted in gets zero activity-log overhead and
-// zero filesystem side effects.
 func TestEmitDisabledByDefault(t *testing.T) {
 	resetState(t)
 	os.Unsetenv("NIXGG_LOG")
@@ -64,11 +54,7 @@ func TestEmitDisabledByDefault(t *testing.T) {
 	}
 }
 
-// TestEmitWritesEnvelopeAndFields pins the actual line shape: the
-// common envelope (event, kind, ts, cwd) plus every field the caller
-// passed, merged into one JSON object — matching the old bash
-// version's own nixgg::emit schema so existing jq-based tooling still
-// works unmodified.
+// Line shape must match the old bash nixgg::emit schema for existing jq tooling.
 func TestEmitWritesEnvelopeAndFields(t *testing.T) {
 	resetState(t)
 	os.Unsetenv("NIXGG_SANDBOX")
@@ -100,9 +86,6 @@ func TestEmitWritesEnvelopeAndFields(t *testing.T) {
 	}
 }
 
-// TestEmitAppendsMultipleLines pins that successive Emit calls append
-// (ndjson, not one-JSON-object-per-file) — a real build calls Emit
-// once per shim invocation, many times per process tree.
 func TestEmitAppendsMultipleLines(t *testing.T) {
 	resetState(t)
 	os.Unsetenv("NIXGG_SANDBOX")
@@ -123,14 +106,7 @@ func TestEmitAppendsMultipleLines(t *testing.T) {
 	}
 }
 
-// TestEmitNoOpUnderSandbox pins the core architectural constraint
-// this package rests on: a builder-rpc-v0 sandbox's own filesystem
-// writes never reach the host (confirmed directly against a real
-// sandbox before writing this package), so Emit must never even try
-// to write when NIXGG_SANDBOX=1 — not "try and fail silently", but
-// skip the attempt entirely (no wasted work opening a file that, in
-// the real sandbox case, would silently land in a mount nobody will
-// ever read).
+// A builder-rpc-v0 sandbox's own filesystem writes never reach the host, so Emit must skip the attempt entirely under NIXGG_SANDBOX=1.
 func TestEmitNoOpUnderSandbox(t *testing.T) {
 	resetState(t)
 	t.Setenv("NIXGG_SANDBOX", "1")
@@ -145,10 +121,6 @@ func TestEmitNoOpUnderSandbox(t *testing.T) {
 	}
 }
 
-// TestEmitBadPathDoesNotPanic pins the best-effort contract: a
-// NIXGG_LOG pointing at an unwritable/nonexistent-parent path must
-// never panic or otherwise disrupt the caller — losing an activity-
-// log line must never fail a real build.
 func TestEmitBadPathDoesNotPanic(t *testing.T) {
 	resetState(t)
 	os.Unsetenv("NIXGG_SANDBOX")

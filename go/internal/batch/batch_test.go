@@ -2,11 +2,6 @@ package batch
 
 import "testing"
 
-// TestClassifyRedisDeps pins the motivating real-world case from
-// ARCHITECTURE.md's batching discussion: redis's deps/{hiredis,
-// linenoise,lua,jemalloc,hdr_histogram,fpconv,fast_float}/ trees are
-// vendored and rarely edited, unlike redis's own src/ — a project
-// author would list deps/ as one batch and leave src/ unbatched.
 func TestClassifyRedisDeps(t *testing.T) {
 	cfg := Config{Groups: []Group{
 		{Name: "vendor", Patterns: []string{"deps/**/*.c"}},
@@ -32,45 +27,10 @@ func TestClassifyRedisDeps(t *testing.T) {
 	}
 }
 
-// TestClassifyUnanchoredAcrossVaryingRoots is a regression test for a
-// real bug found while verifying this package end to end against a
-// live redis build: compile.go originally passed Classify a path
-// relative to internal/scan's ProjectRoot, which is NOT a fixed,
-// build-wide root — it's recomputed per compile call as the common
-// ancestor of that call's own cwd + -I dirs. When `make` recurses
-// into deps/hiredis/ and compiles from inside that directory with no
-// outside -I references, ProjectRoot collapses to deps/hiredis
-// itself, so the "relative path" for sds.c was just "sds.c", not
-// "deps/hiredis/sds.c" — deps/**/*.c could never match it. Out of 156
-// real TUs compiled in that build, exactly 1 matched.
-//
-// Classify's fix: take the TU's ABSOLUTE path and search unanchored
-// (try every start offset), so it doesn't matter what any particular
-// call's cwd happened to be — this test pins that a source under
-// deps/hiredis/ classifies the same whether it's reached via a
-// project-root-anchored absolute path or one where cwd collapsed
-// everything above deps/hiredis/ away.
-// TestClassifyUnanchoredAcrossVaryingRoots is a regression test for a
-// real bug found while verifying this package end to end against a
-// live redis build: compile.go originally passed Classify a path
-// relative to internal/scan's ProjectRoot, which is NOT a fixed,
-// build-wide root — it's recomputed per compile call as the common
-// ancestor of that call's own cwd + -I dirs. When `make` recurses
-// into deps/hiredis/ and compiles from inside that directory with no
-// outside -I references, ProjectRoot collapses to deps/hiredis
-// itself, so what reached Classify was effectively just "sds.c" —
-// deps/**/*.c can never match that. Out of 156 real TUs compiled in
-// that build, exactly 1 matched.
-//
-// The fix has two parts: compile.go now passes the TU's ABSOLUTE
-// path (stable, no dependency on any per-call scan state), and
-// Classify searches it unanchored (tries every start offset) instead
-// of assuming position 0 is the project root. This test pins the
-// second half directly: a short, collapsed-root-style path with no
-// "deps/" segment at all correctly does NOT match (there's nothing
-// left to search), proving the fix has to be "pass the full path",
-// not "make Classify smarter about a truncated one" — Classify
-// cannot recover information the caller already threw away.
+// Regression: compile.go used to pass Classify a path relative to internal/scan's ProjectRoot,
+// which collapses to the TU's own dir when make recurses with no outside -I refs, so deps/**/*.c
+// could never match (1/156 real TUs matched in a live redis build). Fix: pass the TU's absolute
+// path and match unanchored. This pins that a truncated, root-collapsed path correctly does not match.
 func TestClassifyUnanchoredAcrossVaryingRoots(t *testing.T) {
 	cfg := Config{Groups: []Group{
 		{Name: "vendor", Patterns: []string{"deps/**/*.c"}},
@@ -81,16 +41,12 @@ func TestClassifyUnanchoredAcrossVaryingRoots(t *testing.T) {
 		t.Fatalf("Classify(%q) = (%q, %v), want (vendor, true)", full, g, ok)
 	}
 
-	truncated := "sds.c" // what a collapsed ProjectRoot-relative path looked like in practice
+	truncated := "sds.c"
 	if _, ok := cfg.Classify(truncated); ok {
 		t.Fatalf("Classify(%q) unexpectedly matched — a path with no deps/ segment at all must not match deps/**/*.c", truncated)
 	}
 }
 
-// TestClassifyFirstMatchWins pins the declaration-order contract: an
-// author can list a narrow exception before a broad catch-all, same
-// as switch/case fallthrough — reordering the two Groups below would
-// change hot.c's classification.
 func TestClassifyFirstMatchWins(t *testing.T) {
 	cfg := Config{Groups: []Group{
 		{Name: "hot", Patterns: []string{"vendor/hot/*.c"}},
@@ -105,9 +61,6 @@ func TestClassifyFirstMatchWins(t *testing.T) {
 	}
 }
 
-// TestClassifyNoGroups pins the empty-config case: Classify never
-// panics on a zero Config, and always reports unbatched — matches
-// FromJSON's own "absence is not an error" contract.
 func TestClassifyNoGroups(t *testing.T) {
 	var cfg Config
 	if g, ok := cfg.Classify("/build/source/src/anything.c"); ok || g != "" {
@@ -115,9 +68,7 @@ func TestClassifyNoGroups(t *testing.T) {
 	}
 }
 
-// TestClassifySingleStar pins that a bare "*" segment (no "**")
-// behaves exactly like configureSrcFilterPresets.nix's own
-// includePatterns convention: one path segment, not arbitrary depth.
+// A bare "*" segment matches one path segment, not arbitrary depth (configureSrcFilterPresets.nix's own convention).
 func TestClassifySingleStar(t *testing.T) {
 	cfg := Config{Groups: []Group{
 		{Name: "one-level", Patterns: []string{"deps/*/*.c"}},
@@ -130,10 +81,6 @@ func TestClassifySingleStar(t *testing.T) {
 	}
 }
 
-// TestClassifyDeepStar pins "**"'s zero-or-more-segments behavior at
-// both ends: it must match a direct child (zero extra segments) as
-// well as an arbitrarily nested one, and must not match a path that
-// never contains "deps" at all.
 func TestClassifyDeepStar(t *testing.T) {
 	cfg := Config{Groups: []Group{
 		{Name: "vendor", Patterns: []string{"deps/**/*.c"}},
@@ -149,10 +96,6 @@ func TestClassifyDeepStar(t *testing.T) {
 	}
 }
 
-// TestClassifyUnanchoredDoesNotFalseMatchSimilarNames pins the cost of
-// unanchored matching: a directory that merely CONTAINS "deps" as a
-// substring of a longer segment name must not match "deps/**/*.c" —
-// only an exact "deps" path segment should.
 func TestClassifyUnanchoredDoesNotFalseMatchSimilarNames(t *testing.T) {
 	cfg := Config{Groups: []Group{
 		{Name: "vendor", Patterns: []string{"deps/**/*.c"}},
@@ -165,9 +108,7 @@ func TestClassifyUnanchoredDoesNotFalseMatchSimilarNames(t *testing.T) {
 	}
 }
 
-// TestFromJSON pins the wire format $NIXGG_BATCH_GROUPS carries —
-// same JSON-array-of-objects shape a Nix-side eval-time computation
-// would produce, mirroring $NIXGG_KNOWN_STORE_PATHS's own convention.
+// $NIXGG_BATCH_GROUPS carries this JSON-array-of-objects shape, mirroring $NIXGG_KNOWN_STORE_PATHS's convention.
 func TestFromJSON(t *testing.T) {
 	cfg := FromJSON(`[{"name":"vendor","patterns":["deps/**/*.c"]},{"name":"proto","patterns":["*.pb.cc"]}]`)
 	if len(cfg.Groups) != 2 {
@@ -181,9 +122,6 @@ func TestFromJSON(t *testing.T) {
 	}
 }
 
-// TestFromJSONEmptyOrInvalid pins the "absence is not an error"
-// contract knownStorePathsFromEnv already established for the
-// sibling env var.
 func TestFromJSONEmptyOrInvalid(t *testing.T) {
 	for _, s := range []string{"", "not json", "{}", "[1,2,3]"} {
 		cfg := FromJSON(s)

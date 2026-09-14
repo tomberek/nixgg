@@ -1,19 +1,15 @@
 # splitStdenv (splitAtConfigure=true, splitAtBuild=true) early-cutoff
 # test fixture, driven by tests/dyndrv-configure-cache-cutoff.sh. Same
 # shape as tests/configure-cache-cutoff-fixture.nix (constructs the
-# package DIRECTLY, not via pkgs.foo.override — nixpkgs' own
-# .override/.overrideAttrs reapplication always re-invokes the wrapped
-# function with its ORIGINAL args first, so a src substitution applied
-# that way never reaches the configure stage at all), parameterized to
-# drive three scenarios: baseline, an edit to a file the filter
-# excludes, an edit to a file it includes.
+# package directly, not via pkgs.foo.override, which always
+# re-invokes the wrapped function with its original args first,
+# discarding any prior .overrideAttrs).
 #
-# `package` selects which fixture package to build — "hello"
-# (single-output) or "gdbm" (multi-output: out/dev/info/lib/man,
-# AC_CONFIG_SRCDIR = src/gdbmdefs.h) — so the same cutoff mechanics get
-# exercised against both single- and multi-output+filter combinations.
+# `package` selects "hello" (single-output) or "gdbm" (multi-output:
+# out/dev/info/lib/man, AC_CONFIG_SRCDIR = src/gdbmdefs.h), so the same
+# cutoff mechanics get exercised against both.
 {
-  flakeDir, # path to the nixgg checkout, passed by the driver script
+  flakeDir,
   edit ? null, # null | "excluded" | "included"
   package ? "hello", # "hello" | "gdbm"
 }:

@@ -7,14 +7,7 @@ import (
 	"testing"
 )
 
-// TestDumpMatchesNixStoreDump verifies Dump's output is byte-for-byte
-// identical to the REAL `nix-store --dump` for the same directory —
-// not just "parses" — across regular files, an executable file, a
-// subdirectory, and a symlink. Requires nix-store on PATH; skips
-// otherwise (this is an integration check against the real tool, not
-// a golden-file test, since the format is small enough that a golden
-// fixture would just be re-deriving the same tool's own output by
-// hand).
+// Compares byte-for-byte against the real nix-store --dump rather than a golden file.
 func TestDumpMatchesNixStoreDump(t *testing.T) {
 	if _, err := exec.LookPath("nix-store"); err != nil {
 		t.Skip("nix-store not on PATH")
@@ -61,10 +54,6 @@ func truncate(b []byte) []byte {
 	return b
 }
 
-// TestDumpMatchesNixStoreDumpEdgeCases covers empty directory, empty
-// file, and a single top-level regular file (not wrapped in a
-// directory at all — Dump's root can be any of the three NAR node
-// types, matching dumpPath's own contract).
 func TestDumpMatchesNixStoreDumpEdgeCases(t *testing.T) {
 	if _, err := exec.LookPath("nix-store"); err != nil {
 		t.Skip("nix-store not on PATH")

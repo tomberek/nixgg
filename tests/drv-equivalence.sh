@@ -8,22 +8,17 @@
 #             (never the outputOf-resolved result), which registers
 #             every drv but compiles nothing for real, then `nix
 #             derivation show -r` on the resolved target paths for
-#             the exact drv set — see equiv_sandbox_drvs's own
-#             docstring for why this needs no filename filtering.
+#             the exact drv set.
 #   native:   fetch same source, unpack into a tempdir, `nix develop`
 #             and run the same buildCommand there. Shims write .nix
 #             thunks; nix-instantiate on each thunk → drv path.
 #
-# Compare the SET of drv-hashes produced. If native and sandbox agree
-# on every drv-hash, the mode-independent Derivation representation
-# is doing its job.
-#
 # Shared alt-store/patched-nix scaffolding, sandbox-drv collection,
 # native-src resolution, the native build invocation, and the
 # match/mismatch reporting live in tests/lib/drv-equiv-common.sh
-# (shared with tests/batch-drv-equivalence.sh and tests/thin-archive-
-# equivalence.sh, which prove the same invariant for other Kinds).
-# Only the fixture list is this script's own.
+# (shared with tests/batch-drv-equivalence.sh and
+# tests/thin-archive-equivalence.sh). Only the fixture list is this
+# script's own.
 #
 # Env knobs:
 #   ALT_STORE      root of the alt store (default /tmp/nixgg-equiv-store)
@@ -39,7 +34,6 @@ source "$(cd "$(dirname "$0")" && pwd)/lib/drv-equiv-common.sh"
 
 equiv_common_setup "/tmp/nixgg-equiv-store"
 
-# ---------------------------------------------------------------
 # Fixtures. Each entry is:
 #
 #   attr | native-src-flake-input | native-src-subdir
@@ -54,7 +48,6 @@ equiv_common_setup "/tmp/nixgg-equiv-store"
 # The build command comes from the flake itself:
 # `.#$attr-shell.passthru.buildCommand` — same string mkNixggBuild
 # passes to buildPhase. No per-fixture logic lives in this script.
-# ---------------------------------------------------------------
 run_fixture() {
   local attr="$1" src_input="$2" subdir="$3"
   local label="$attr"
@@ -62,12 +55,10 @@ run_fixture() {
   echo
   printf '\033[1;36m===== %s =====\033[0m\n' "$label"
 
-  # -- 1. sandbox drvs --
   printf '==> sandbox: nix build .#%s (wrapper only) + derivation show -r\n' "$attr"
   local sb_drvs
   sb_drvs=$(equiv_sandbox_drvs "$attr") || return 1
 
-  # -- 2. native build --
   local workdir="$(mktemp -d)"
   local src
   src=$(equiv_resolve_native_src "$src_input") || true
@@ -95,7 +86,6 @@ run_fixture() {
     equiv_thunk_drvpath "$t"
   done <<<"$thunk_files" | sort -u)
 
-  # -- 3. compare sets --
   local n_both
   if ! n_both=$(equiv_report_sets "$label" "drvs" "$sb_drvs" "$nt_drvs"); then
     rm -rf "$workdir"
@@ -107,7 +97,6 @@ run_fixture() {
 
 fail=0
 
-# Fixtures:  attr | src-input | src-subdir
 if [[ -z "${ONLY:-}" || "$ONLY" == "hello" ]]; then
   run_fixture "hello" "example" "" || fail=1
 fi
@@ -124,25 +113,17 @@ if [[ -z "${ONLY:-}" || "$ONLY" == "gcc" ]]; then
   run_fixture "gcc" "gcc-src" "" || fail=1
 fi
 # linux-kernel is two-phase (phase1 = mkNixggBuild, phase2 = a plain
-# stdenv.mkDerivation with zero nixgg shims — nothing for this check
-# to compare there). Only phase1 fits run_fixture's single-src,
-# single-mkNixggBuild-call shape, exposed at the top-level attr
-# "linux-kernel-phase1"/"linux-kernel-phase1-shell" (flake.nix's own
-# "Extras" block) the same way llvm's own tblgen phases are. Not in
-# the default set — real linux-6.12 source, ~2800 real compiles
-# natively, several minutes even on a warm cache; opt in via
+# stdenv.mkDerivation with zero nixgg shims). Only phase1 fits
+# run_fixture's shape, exposed as "linux-kernel-phase1". Not in the
+# default set — real linux-6.12 source, ~2800 real compiles natively,
+# several minutes even on a warm cache; opt in via
 # ONLY=linux-kernel-phase1.
 if [[ "${ONLY:-}" == "linux-kernel-phase1" ]]; then
   run_fixture "linux-kernel-phase1" "linux-src" "" || fail=1
 fi
 # nix-full builds ALL of Nix itself (24 real Meson subprojects/
 # targets, ~700 TUs) from the nix-15793 flake input — real, but far
-# too slow for the default set (many minutes even warm). "nix-15793"
-# resolves via equiv_resolve_native_src's generic non-"example" branch
-# exactly like lua-src/fmt-src/gcc-src do: `builtins.fetchTree` on a
-# locked GitHub node fetches only that node's own tree, never chasing
-# the flake's OWN sub-inputs (nixpkgs, flake-parts, etc.) — confirmed
-# directly, same call other fixtures already make. Opt in via
+# too slow for the default set (many minutes even warm). Opt in via
 # ONLY=nix-full.
 if [[ "${ONLY:-}" == "nix-full" ]]; then
   run_fixture "nix-full" "nix-15793" "" || fail=1

@@ -14,32 +14,16 @@ import (
 )
 
 // TestRewriteFlagsKeepsForceIncludes guards a bug that already shipped
-// and was already fixed once, in 267722b.
+// and was fixed once, in 267722b: `-include <file>` names a file to
+// textually include, not an include directory. Treating it as a
+// directory meant the file was staged wrong and the flag dropped, so
+// the TU compiled without it — a silent miscompile, not a build
+// failure. No fixture uses -include, which is why the integration test
+// never caught it; this is the unit test that would have.
 //
-// `-include <file>` names a file to textually include before the
-// translation unit — it is not an include *directory*. Treating it as one
-// meant the file was staged as a directory and the flag dropped, so the
-// TU compiled without it: a silent miscompile, not a build failure.
-//
-// That commit's own message records why the integration test missed it:
-// "no fixture uses -include, which is why the integration test never
-// caught this." So the only thing standing between that bug and a
-// reappearance is a unit test at this function, and there wasn't one —
-// the fix's tests covered scan.go's extraction helpers and the cache
-// round-trip, not rewriteFlags' own drop-then-append logic.
-//
-// Every case below asserts the full output slice rather than a
-// Contains(), because the failure mode is positional: forceInc must land
-// AFTER the staged -I flags, or a same-named header in an earlier
-// directory wins.
-//
-// Note on what this can and cannot catch. Adding "-include" back to
-// pathFlags is, on its own, a no-op: the pathFlags branch drops the flag
-// and its argument exactly as the explicit case does, so output is
-// unchanged and no test can see a difference. The original bug needed
-// both halves — flag treated as a directory AND no forceInc replacement
-// appended — and that combination does fail these tests. Verified by
-// mutation, in both the one-sided and two-sided forms.
+// Every case asserts the full output slice rather than Contains(),
+// because the failure mode is positional: forceInc must land after the
+// staged -I flags, or a same-named header in an earlier directory wins.
 func TestRewriteFlagsKeepsForceIncludes(t *testing.T) {
 	for _, tc := range []struct {
 		name                            string
@@ -58,9 +42,7 @@ func TestRewriteFlagsKeepsForceIncludes(t *testing.T) {
 			caller:   []string{"-include", "pch.h"},
 			staged:   []string{"-I", "inc", "-I", "gen"},
 			forceInc: []string{"-include", "pch.h"},
-			// If forceInc came first, a pch.h in inc/ or gen/ would not
-			// be the one already resolved by the scanner.
-			want: []string{"-I", "inc", "-I", "gen", "-include", "pch.h"},
+			want:     []string{"-I", "inc", "-I", "gen", "-include", "pch.h"},
 		},
 		{
 			name:     "several -include flags all survive",
@@ -85,9 +67,7 @@ func TestRewriteFlagsKeepsForceIncludes(t *testing.T) {
 			want:     []string{"-O2", "-Wall", "-I", ".", "-I", "/nix/store/x/include"},
 		},
 		{
-			name: "-include as the final token doesn't run off the end",
-			// A malformed line: -include with no argument. Must not panic
-			// and must not consume a token that isn't there.
+			name:     "-include as the final token doesn't run off the end",
 			caller:   []string{"-O2", "-include"},
 			staged:   nil,
 			forceInc: nil,
@@ -105,9 +85,9 @@ func TestRewriteFlagsKeepsForceIncludes(t *testing.T) {
 }
 
 // TestRewriteFlagsDropsCallerIncludePaths pins that a caller's
-// `-include` path never survives verbatim. The caller's spelling is
-// relative to its own cwd, which does not exist inside the sandbox; only
-// the staged replacement in forceInc is valid there.
+// `-include` path never survives verbatim: it's relative to the
+// caller's own cwd, which doesn't exist inside the sandbox; only the
+// staged replacement in forceInc is valid there.
 func TestRewriteFlagsDropsCallerIncludePaths(t *testing.T) {
 	got := rewriteFlags(
 		[]string{"-include", "../../outside/config.h", "-O2"},
@@ -123,16 +103,11 @@ func TestRewriteFlagsDropsCallerIncludePaths(t *testing.T) {
 }
 
 // TestParseCompileArgsExplicitLanguage pins that `-x <lang>` overrides
-// extension-based source detection.
-//
-// isSource matches on suffix, so a precompiled-header compile —
-//
-//	g++ -x c++-header -c pch.h -o pch.h.gch
-//
-// which is what CMake's target_precompile_headers and Qt's build emit —
-// had no source by nixgg's reckoning, returned ok=false, and fell to
-// Passthrough. The output was correct but the TU was never cached or
-// distributed, and (before the diagnostics added earlier) said nothing.
+// extension-based source detection. isSource matches on suffix, so a
+// precompiled-header compile (`g++ -x c++-header -c pch.h -o
+// pch.h.gch`, as CMake's target_precompile_headers and Qt's build
+// emit) had no source by nixgg's reckoning and fell to Passthrough
+// uncached.
 func TestParseCompileArgsExplicitLanguage(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -152,26 +127,21 @@ func TestParseCompileArgsExplicitLanguage(t *testing.T) {
 			wantSource: "pch.h", wantOutput: "pch.h.gch", wantOK: true,
 		},
 		{
-			// -x also legitimises an unusual extension for a normal
-			// compile, which is the same rule the driver applies.
 			name:       "explicit language with an odd extension",
 			args:       []string{"-x", "c++", "-c", "gen.inc", "-o", "gen.o"},
 			wantSource: "gen.inc", wantOutput: "gen.o", wantOK: true,
 		},
 		{
-			// Without -x, a .h is not a source and never was.
 			name:   "header with no -x is still not a source",
 			args:   []string{"-c", "pch.h", "-o", "pch.h.gch"},
 			wantOK: false,
 		},
 		{
-			// The -x value itself must not be mistaken for the source.
 			name:       "the language token is not the source",
 			args:       []string{"-x", "c++-header", "-c", "real.h"},
 			wantSource: "real.h", wantOutput: "real.h.gch", wantOK: true,
 		},
 		{
-			// Two sources is still unmodellable, -x or not.
 			name:   "two sources under -x still bails",
 			args:   []string{"-x", "c++", "-c", "a.cc", "b.cc"},
 			wantOK: false,
@@ -183,12 +153,9 @@ func TestParseCompileArgsExplicitLanguage(t *testing.T) {
 		},
 		{
 			// AC_LINK_IFELSE / AC_RUN_IFELSE compile a conftest straight to
-			// a binary — no -c. This must bail here, into Passthrough,
-			// never reaching mode.For/realiseAndLink: those probes run
-			// under NIXGG_BYPASS=1 at configure time regardless, but this
-			// is the second, independent reason it can't reach the
-			// realise carveout. TestRealiseCarveoutOutputsAreAlwaysFlat's
-			// unreachability claim rests on this holding.
+			// a binary — no -c — so this must bail into Passthrough.
+			// TestRealiseCarveoutOutputsAreAlwaysFlat's unreachability
+			// claim rests on this holding.
 			name:   "a no -c conftest link line is not a compile",
 			args:   []string{"conftest.c", "-o", "conftest"},
 			wantOK: false,
@@ -205,18 +172,12 @@ func TestParseCompileArgsExplicitLanguage(t *testing.T) {
 			if src != tc.wantSource {
 				t.Errorf("source = %q, want %q", src, tc.wantSource)
 			}
-			// Call the production helper rather than restating it: an
-			// earlier version of this test reimplemented the rule here,
-			// which made a mutation of the real logic invisible.
 			if out == "" {
 				out = defaultOutputName(src, flags)
 			}
 			if out != tc.wantOutput {
 				t.Errorf("output = %q, want %q", out, tc.wantOutput)
 			}
-			// -x must survive into the sandbox flags: without it the
-			// compiler would guess the language from the extension and
-			// produce an object instead of a PCH.
 			var sawX bool
 			for i := 0; i+1 < len(flags); i++ {
 				if flags[i] == "-x" {
@@ -233,8 +194,8 @@ func TestParseCompileArgsExplicitLanguage(t *testing.T) {
 
 // TestPCHDefaultOutputName pins gcc's naming rule for a precompiled
 // header, which differs from the object rule: .gch is appended to the
-// source's FULL name, so pch.h becomes pch.h.gch, not pch.gch. Verified
-// against gcc by compiling a header with no -o.
+// source's full name, so pch.h becomes pch.h.gch, not pch.gch.
+// Verified against gcc by compiling a header with no -o.
 func TestPCHDefaultOutputName(t *testing.T) {
 	if !isHeaderLang("c++-header") {
 		t.Fatal("c++-header must be recognised as a header language")
@@ -259,10 +220,10 @@ func TestPCHDefaultOutputName(t *testing.T) {
 	}
 }
 
-// TestDefaultOutputName covers the -o-omitted path directly. An earlier
-// version of the PCH test restated this rule inline instead of calling
-// the real function, so a mutation that gave precompiled headers the .o
-// naming rule passed clean. Call the production code.
+// TestDefaultOutputName covers the -o-omitted path directly, calling
+// the production function rather than restating its rule inline (an
+// earlier version of the PCH test above did that, which let a mutation
+// pass clean).
 func TestDefaultOutputName(t *testing.T) {
 	for _, tc := range []struct {
 		source string
@@ -273,11 +234,9 @@ func TestDefaultOutputName(t *testing.T) {
 		{"src/b.c", nil, "b.o"},
 		{"a.b.cc", nil, "a.b.o"},
 		{"noext", nil, "noext.o"},
-		// The header rule: extension kept, .gch appended.
 		{"pch.h", []string{"-x", "c++-header"}, "pch.h.gch"},
 		{"inc/pch.hpp", []string{"-x", "c++-header"}, "pch.hpp.gch"},
 		{"pch.h", []string{"-x", "c-header"}, "pch.h.gch"},
-		// A non-header -x keeps the object rule.
 		{"gen.inc", []string{"-x", "c++"}, "gen.o"},
 	} {
 		if got := defaultOutputName(tc.source, tc.flags); got != tc.want {
@@ -287,29 +246,23 @@ func TestDefaultOutputName(t *testing.T) {
 	}
 }
 
-// TestOnlyDashXLegitimisesAnOddSource pins that the "any token can be the
-// source" relaxation is gated on -x specifically, not on any two-argument
-// flag. -Xlinker and -Xassembler go through the same parser branch, and
-// their values say nothing about the source language.
-//
-// Without the guard, `cc -c -Xassembler --foo bar.unknown -o out.o` would
-// treat bar.unknown as a source and try to model a TU nixgg cannot
-// reason about.
+// TestOnlyDashXLegitimisesAnOddSource pins that the "any token can be
+// the source" relaxation is gated on -x specifically, not on any
+// two-argument flag: -Xlinker and -Xassembler go through the same
+// parser branch, and their values say nothing about the source
+// language.
 func TestOnlyDashXLegitimisesAnOddSource(t *testing.T) {
-	// -Xassembler present, no real source: must NOT adopt the odd token.
 	if _, _, _, _, ok := parseCompileArgs([]string{
 		"-c", "-Xassembler", "--noexecstack", "mystery.dat", "-o", "out.o",
 	}); ok {
 		t.Error("an -Xassembler value legitimised a non-source token as the " +
 			"compile source; only -x names a language")
 	}
-	// -Xlinker likewise.
 	if _, _, _, _, ok := parseCompileArgs([]string{
 		"-c", "-Xlinker", "-z", "mystery.dat", "-o", "out.o",
 	}); ok {
 		t.Error("-Xlinker legitimised a non-source token as the compile source")
 	}
-	// And the real thing still works.
 	if src, _, _, _, ok := parseCompileArgs([]string{
 		"-x", "c++-header", "-c", "pch.h", "-o", "pch.h.gch",
 	}); !ok || src != "pch.h" {
@@ -317,20 +270,13 @@ func TestOnlyDashXLegitimisesAnOddSource(t *testing.T) {
 	}
 }
 
-// TestRealiseCarveoutOutputsAreAlwaysFlat pins that every COMPILE-side
-// realise-mode probe's default output stays flat (compile-shaped, per
-// expr.ArtifactSubdir), which is what lets compile.go's own
+// TestRealiseCarveoutOutputsAreAlwaysFlat pins that every compile-side
+// realise-mode probe's default output stays flat, per
+// expr.ArtifactSubdir, which is what lets compile.go's own
 // realiseAndLink call site pass "" as the subdir unconditionally.
-//
 // realiseAndLink no longer derives the subdir from the output's own
-// name at all (it used to, via expr.ArtifactSubdir — but that guessed
-// wrong for Kbuild's own vmlinux.o, a LINK output that happens to be
-// named like a compile one). Each of realiseAndLink's two call sites
-// now states its own Kind's real placement explicitly (compile.go: ""
-// always; link.go: "bin" always, per outSubdir()) — so this test's
-// claim is purely about these compile-side probes' own filenames,
-// pinned because a probe accidentally producing a non-flat output
-// would silently break compile.go's own "" call site.
+// name (it used to, via expr.ArtifactSubdir, but that guessed wrong
+// for Kbuild's vmlinux.o, a link output named like a compile one).
 func TestRealiseCarveoutOutputsAreAlwaysFlat(t *testing.T) {
 	for _, source := range []string{
 		"conftest.c", "conftest.cpp",
@@ -350,28 +296,15 @@ func TestRealiseCarveoutOutputsAreAlwaysFlat(t *testing.T) {
 	}
 
 	// A link-style probe (AC_LINK_IFELSE / AC_RUN_IFELSE, output
-	// "conftest" with no extension) is NOT a hole in this guard: it never
-	// reaches Compile at all. Those invocations have no -c, so
-	// parseCompileArgs returns ok=false and the call falls to Passthrough
-	// before mode.For is ever consulted — confirmed by reading
-	// parseCompileArgs' hasDashC gate. mode.For's own docstring makes the
-	// same claim for a different reason (bypassed() short-circuits first,
-	// since these run at configure time); both are true simultaneously,
-	// and either one is enough to keep realiseAndLink from ever seeing a
-	// bare "conftest". This is deliberately NOT asserted with an
-	// ArtifactSubdir check the way the .o cases above are, because
-	// ArtifactSubdir("conftest") is genuinely "bin" — the guard here is
-	// unreachability, not a flat name, and the two should not be
-	// conflated.
+	// "conftest" with no extension) never reaches Compile at all: no
+	// -c means parseCompileArgs returns ok=false before mode.For is
+	// consulted, so it's not a hole in this guard.
 }
 
 // TestIsKbuildElfProbe pins the Passthrough carveout for Kbuild's
-// scripts/mod/empty.o — see its call site in Compile for why this one
-// probe bypasses nixgg's graph entirely (mode.Realise's `nix build
-// --file` is incompatible with sandbox mode; this probe has no
-// headers and gains nothing from CA-hashing anyway) rather than using
-// mode.Realise's synchronous-build carveout the way a real autoconf/
-// cmake probe still does.
+// scripts/mod/empty.o: mode.Realise's `nix build --file` is
+// incompatible with sandbox mode, and this probe has no headers and
+// gains nothing from CA-hashing anyway.
 func TestIsKbuildElfProbe(t *testing.T) {
 	for _, tc := range []struct {
 		source string
@@ -380,9 +313,9 @@ func TestIsKbuildElfProbe(t *testing.T) {
 		{"scripts/mod/empty.c", true},
 		{"scripts/mod/empty.o", true},
 		{"/build/linux-6.12/scripts/mod/empty.c", true},
-		{"empty.c", false},               // bare, outside scripts/mod/: an ordinary TU
-		{"scripts/mod/modpost.c", false}, // sibling in the same dir, not the probe itself
-		{"conftest.c", false},            // a different probe entirely, still mode.Realise's
+		{"empty.c", false},
+		{"scripts/mod/modpost.c", false},
+		{"conftest.c", false},
 	} {
 		if got := isKbuildElfProbe(tc.source); got != tc.want {
 			t.Errorf("isKbuildElfProbe(%q) = %v, want %v", tc.source, got, tc.want)
@@ -392,11 +325,9 @@ func TestIsKbuildElfProbe(t *testing.T) {
 
 // TestIsKbuildRealmodeObj pins the Passthrough carveout for Kbuild's
 // arch/x86/realmode/rm/{header,trampoline_32,trampoline_64,stack,
-// reboot}.o — moved here from mode.go's own isKbuildRealmodeObj for
-// the identical sandbox-mode reason isKbuildElfProbe was: confirmed
-// directly against a real sandboxed build, routed through
-// mode.Realise this hit the same "no substituter" failure empty.o
-// did.
+// reboot}.o: confirmed directly against a real sandboxed build,
+// routing through mode.Realise hit the same "no substituter" failure
+// empty.o did.
 func TestIsKbuildRealmodeObj(t *testing.T) {
 	for _, tc := range []struct {
 		source string
@@ -409,8 +340,8 @@ func TestIsKbuildRealmodeObj(t *testing.T) {
 		{"arch/x86/realmode/rm/stack.o", true},
 		{"arch/x86/realmode/rm/reboot.o", true},
 		{"/build/linux-6.12/arch/x86/realmode/rm/reboot.o", true},
-		{"arch/x86/realmode/rm/realmode.lds.S", false}, // in the dir, but not a realmode-y member
-		{"arch/x86/kernel/head_32.S", false},           // outside the realmode/rm/ dir entirely
+		{"arch/x86/realmode/rm/realmode.lds.S", false},
+		{"arch/x86/kernel/head_32.S", false},
 	} {
 		if got := isKbuildRealmodeObj(tc.source); got != tc.want {
 			t.Errorf("isKbuildRealmodeObj(%q) = %v, want %v", tc.source, got, tc.want)
@@ -422,10 +353,8 @@ func TestIsKbuildRealmodeObj(t *testing.T) {
 // arch/x86/entry/vdso/vdso32/{note,system_call,sigreturn,
 // vclock_gettime,vgetcpu}.o. Confirmed directly against a real
 // sandboxed build: with these Passthrough'd, vdso32.so.dbg's own link
-// falls to RealiseThunkArgsAndPassthrough's Passthrough (a real,
-// unshimmed `ld`) instead of mode.ForLink's sandbox-incompatible
-// realiseAndLink — the same emergent fix realmode.elf's link already
-// gets from isKbuildRealmodeObj above.
+// falls to RealiseThunkArgsAndPassthrough's Passthrough instead of
+// mode.ForLink's sandbox-incompatible realiseAndLink.
 func TestIsKbuildVDSO32Obj(t *testing.T) {
 	for _, tc := range []struct {
 		source string
@@ -437,8 +366,8 @@ func TestIsKbuildVDSO32Obj(t *testing.T) {
 		{"arch/x86/entry/vdso/vdso32/vclock_gettime.o", true},
 		{"arch/x86/entry/vdso/vdso32/vgetcpu.c", true},
 		{"/build/linux-6.12/arch/x86/entry/vdso/vdso32/vgetcpu.o", true},
-		{"arch/x86/entry/vdso/vdso32/vdso32.lds.S", false}, // in the dir, but not a vobjs32-y member
-		{"arch/x86/entry/vdso/vclock_gettime.c", false},    // the 64-bit sibling, outside vdso32/
+		{"arch/x86/entry/vdso/vdso32/vdso32.lds.S", false},
+		{"arch/x86/entry/vdso/vclock_gettime.c", false},
 	} {
 		if got := isKbuildVDSO32Obj(tc.source); got != tc.want {
 			t.Errorf("isKbuildVDSO32Obj(%q) = %v, want %v", tc.source, got, tc.want)
@@ -447,16 +376,14 @@ func TestIsKbuildVDSO32Obj(t *testing.T) {
 }
 
 // TestParseCompileArgsCapturesDepfile pins depfile-path recovery for
-// the three shapes a compile invocation can request dependency
-// output in: Kbuild's comma-joined `-Wp,-MMD,<path>` (the actual form
-// scripts/Makefile.lib uses — NOT bare -MD/-MF, which is what an
-// earlier, wrong analysis assumed), the autotools-style explicit
-// `-MF <path>`, and bare `-MD`/`-MMD` with no `-MF` at all (gcc's own
-// documented default: the object's own path with .o replaced by .d).
-//
-// This path is what lets writeSynthesizedDepfile (see Compile) put a
+// the three shapes a compile invocation can request dependency output
+// in: Kbuild's comma-joined `-Wp,-MMD,<path>` (what
+// scripts/Makefile.lib actually uses, not bare -MD/-MF), the
+// autotools-style explicit `-MF <path>`, and bare `-MD`/`-MMD` with no
+// `-MF` (gcc's documented default: the object's own path with .o
+// replaced by .d). This is what lets writeSynthesizedDepfile put a
 // substitute .d file exactly where Kbuild's `cmd_and_fixdep` macro
-// will look for it — get the path wrong and fixdep still hard-fails.
+// will look for it.
 func TestParseCompileArgsCapturesDepfile(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -479,10 +406,8 @@ func TestParseCompileArgsCapturesDepfile(t *testing.T) {
 			wantDepfile: "foo.d",
 		},
 		{
-			name: "bare -MD with no -MF falls back to gcc's own default: obj with .d",
-			args: []string{"-MD", "-c", "foo.c", "-o", "foo.o"},
-			// gcc's default depfile is next to the OBJECT (foo.o -> foo.d),
-			// not the source — confirmed against gcc's own docs.
+			name:        "bare -MD with no -MF falls back to gcc's own default: obj with .d",
+			args:        []string{"-MD", "-c", "foo.c", "-o", "foo.o"},
 			wantDepfile: "foo.d",
 		},
 		{
@@ -505,9 +430,7 @@ func TestParseCompileArgsCapturesDepfile(t *testing.T) {
 
 // TestParseCompileArgsWpFlagsDoNotLeakIntoSandboxFlags pins that
 // -Wp,-MMD,... never reaches the sandbox compile's own flag list: the
-// path it carries is meaningless inside the sandbox (relative to
-// make's cwd, not the staged tree), and passing it through would make
-// the real compiler try to write there and fail.
+// path it carries is relative to make's cwd, not the staged tree.
 func TestParseCompileArgsWpFlagsDoNotLeakIntoSandboxFlags(t *testing.T) {
 	_, _, _, flags, ok := parseCompileArgs([]string{
 		"-Wp,-MMD,kernel/.foo.o.d", "-O2", "-c", "foo.c", "-o", "foo.o",
@@ -525,21 +448,14 @@ func TestParseCompileArgsWpFlagsDoNotLeakIntoSandboxFlags(t *testing.T) {
 	}
 }
 
-// TestWriteSynthesizedDepfileSatisfiesRealFixdep runs the REAL Linux
+// TestWriteSynthesizedDepfileSatisfiesRealFixdep runs the real Linux
 // kernel `fixdep` binary (built from upstream scripts/basic/fixdep.c,
-// vendored under testdata/fixdep for exactly this test — see
+// vendored under testdata/fixdep for this test — see
 // testdata/fixdep/README) against a depfile produced by
-// writeSynthesizedDepfile, using a real on-disk header instead of a
-// hand-typed path list.
-//
-// This is the same experiment run manually during research (see the
-// project's own plan-mode notes on the fixdep gap): fixdep doesn't
+// writeSynthesizedDepfile, using a real on-disk header. fixdep doesn't
 // care whether a .d file's dependency list came from genuine `-MD`
 // compiler output or was synthesized from scan's own header list — it
-// only requires that every listed path be real and readable, which is
-// exactly what scan.Run always produces. Guards against a regression
-// in writeSynthesizedDepfile's own Makefile-rule syntax silently
-// breaking Kbuild's `cmd_and_fixdep` step.
+// only requires that every listed path be real and readable.
 func TestWriteSynthesizedDepfileSatisfiesRealFixdep(t *testing.T) {
 	fixdepBin := buildFixdep(t)
 
@@ -582,12 +498,10 @@ func TestWriteSynthesizedDepfileSatisfiesRealFixdep(t *testing.T) {
 	}
 }
 
-// buildFixdep compiles the vendored, real upstream fixdep.c (see
-// testdata/fixdep/) with the host's cc, skipping the test if no C
-// compiler is available on PATH — CI's go-vet/go-test job runs with
-// CGO_ENABLED=0 but still has a real `cc` on PATH for this, same as
-// TestBatchArchiveScriptThinArchiveSurvivesObjectDeletion's own
-// "ar not on PATH" skip in internal/expr/batcharchive_test.go.
+// buildFixdep compiles the vendored, real upstream fixdep.c with the
+// host's cc, skipping the test if no C compiler is on PATH — CI's
+// go-vet/go-test job runs with CGO_ENABLED=0 but still has a real `cc`
+// on PATH for this.
 func buildFixdep(t *testing.T) string {
 	t.Helper()
 	cc, err := exec.LookPath("cc")

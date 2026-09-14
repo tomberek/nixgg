@@ -14,8 +14,6 @@ func testLayout(t *testing.T) paths.Layout {
 	return paths.Layout{Batches: filepath.Join(dir, "batches")}
 }
 
-// TestWriteReadRoundTrip pins that every field survives a write/read
-// cycle, for both the native-mode and sandbox-mode record shapes.
 func TestWriteReadRoundTrip(t *testing.T) {
 	l := testLayout(t)
 
@@ -57,10 +55,7 @@ func TestWriteReadRoundTrip(t *testing.T) {
 	}
 }
 
-// TestKeyDeterministic pins that Key is a pure function of the
-// absolute path — this is what lets a reader (ar's own argv) recompute
-// the same filename a writer (a prior compile) used, without any
-// shared index.
+// Key is a pure function of the absolute path, letting a reader (ar's argv) recompute a prior writer's filename without any shared index.
 func TestKeyDeterministic(t *testing.T) {
 	a := Key("/build/source/deps/hiredis/sds.o")
 	b := Key("/build/source/deps/hiredis/sds.o")
@@ -73,9 +68,6 @@ func TestKeyDeterministic(t *testing.T) {
 	}
 }
 
-// TestWriteCreatesGroupDir pins that Write creates
-// .nixgg/batches/<group>/ on demand — the first compile in a group
-// is not expected to pre-create it.
 func TestWriteCreatesGroupDir(t *testing.T) {
 	l := testLayout(t)
 	m := MemberRecord{Group: "vendor", OutName: "x.o", SrcTreeLiteral: "../srcs/x"}
@@ -89,9 +81,6 @@ func TestWriteCreatesGroupDir(t *testing.T) {
 	}
 }
 
-// TestReadMissingFile pins that Read on a nonexistent path returns an
-// error, not a zero-value success — resolvePendingMember must not
-// silently proceed with an empty record.
 func TestReadMissingFile(t *testing.T) {
 	if _, err := Read(filepath.Join(t.TempDir(), "nope.json")); err == nil {
 		t.Error("Read(missing) = nil error, want an error")

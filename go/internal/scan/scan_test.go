@@ -8,23 +8,12 @@ import (
 	"testing"
 )
 
-// TestExtractIncludeDirsExcludesForceInclude pins that `-include` is NOT
-// treated as an include DIRECTORY.
-//
-// Regression origin: `-include` shared the pathFlags map with
-// -I/-isystem/-iquote/-idirafter, so its value — a FILE — was collected
-// as if it were a directory. Two consequences, both silent:
-//
-//  1. scan emitted a bogus `-I<path-to-a-file>`, which gcc reports only
-//     as "warning: config.h: not a directory".
-//  2. rewriteFlags, sharing the same map, DROPPED the `-include` from
-//     the flags reaching the compiler.
-//
-// The header still got staged (scan's own -MM -MG lists it as a
-// dependency), so the build SUCCEEDED — compiling with different
-// preprocessor state than the caller asked for, exit code 0, no error.
-// `-include config.h` is the standard autoconf/CMake way to inject
-// HAVE_XXX defines, so this hit real projects.
+// `-include` shares the pathFlags map with -I/-isystem/-iquote/-idirafter,
+// but its value is a FILE, not a directory. `-include config.h` is the
+// standard autoconf/CMake way to inject HAVE_XXX defines, so this hit
+// real projects: the header still gets staged (scan's own -MM -MG lists
+// it as a dependency), so the build succeeds with different preprocessor
+// state than the caller asked for, exit code 0, no error.
 func TestExtractIncludeDirsExcludesForceInclude(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -60,9 +49,6 @@ func TestExtractIncludeDirsExcludesForceInclude(t *testing.T) {
 	}
 }
 
-// TestExtractForceIncludes pins the companion extractor: `-include`
-// values must be recovered so the flag can be re-emitted pointing at the
-// staged copy of the header.
 func TestExtractForceIncludes(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -82,8 +68,6 @@ func TestExtractForceIncludes(t *testing.T) {
 			[]string{"config.h"},
 		},
 		{
-			// gcc has no attached `-include<file>` spelling, so a token
-			// merely starting with -include is not a force-include.
 			"attached spelling is not a thing",
 			[]string{"-includeconfig.h"},
 			nil,
@@ -98,17 +82,14 @@ func TestExtractForceIncludes(t *testing.T) {
 	}
 }
 
-// TestResultCacheRoundTrip pins that every Result field survives the
-// scan cache. The cache is consulted whenever all recorded deps' mtimes
-// match, so a field that encodes but doesn't decode produces a bug
-// visible ONLY on warm rebuilds — intermittent by construction, and the
-// exact trap StagedIncludeFlags would have fallen into.
+// The cache is consulted whenever all recorded deps' mtimes match, so a
+// field that encodes but doesn't decode produces a bug visible ONLY on
+// warm rebuilds.
 func TestResultCacheRoundTrip(t *testing.T) {
 	want := &Result{
-		ProjectRoot:  "/tmp/proj",
-		StagedIFlags: []string{"-I.", "-Iinc"},
-		StoreIFlags:  []string{"-I/nix/store/aaa-dep/include"},
-		// Flat slice of alternating flag/value, as rewriteFlags appends it.
+		ProjectRoot:        "/tmp/proj",
+		StagedIFlags:       []string{"-I.", "-Iinc"},
+		StoreIFlags:        []string{"-I/nix/store/aaa-dep/include"},
 		StagedIncludeFlags: []string{"-include", "config.h", "-include", "sub/other.h"},
 		Headers: []Header{
 			{Abs: "/tmp/proj/inc/a.h", Rel: "inc/a.h"},
@@ -128,7 +109,7 @@ func TestResultCacheRoundTrip(t *testing.T) {
 	}
 
 	// Guard against a future field being added to Result without a
-	// corresponding encode/decode line: count them and fail loudly.
+	// corresponding encode/decode line.
 	const knownFields = 5
 	if n := reflect.TypeOf(Result{}).NumField(); n != knownFields {
 		t.Errorf("Result has %d fields, round-trip test knows about %d — "+
@@ -137,24 +118,17 @@ func TestResultCacheRoundTrip(t *testing.T) {
 	}
 }
 
-// TestRunScannerDoesNotLeakSrcDirAsIFlag pins the ffmpeg regression at
-// its real call site: runScanner must pass only the CALLER's include
-// dirs to stagedIFlags, never projectRootHints.
+// Regression: runScanner must pass only the CALLER's include dirs to
+// stagedIFlags, never projectRootHints. Compiling libavutil/parseutils.c
+// from the ffmpeg root meant srcDir (libavutil/) leaked out as a spurious
+// `-Ilibavutil`; inside the drv (cwd = staged root) that resolved to
+// $src/libavutil, whose own time.h shadowed glibc's <time.h> (-I dirs
+// are searched before -isystem ones), leaving `struct tm` incomplete.
+// Only a real ffmpeg build caught it — no fixture exists for this.
 //
-// Regression origin: those were one list. Compiling
-// libavutil/parseutils.c from the ffmpeg root meant srcDir (libavutil/)
-// was in it, so it leaked out as a spurious `-Ilibavutil`. Inside the
-// drv (cwd = staged root) that resolved to $src/libavutil, whose own
-// time.h shadowed glibc's <time.h> — -I dirs are searched before
-// -isystem ones — leaving `struct tm` incomplete. Every TU that reached
-// it failed, and no ffmpeg fixture exists in drv-equivalence.sh, so
-// only a real ffmpeg build caught it.
-//
-// This drives runScanner with a fake `cc` that prints a canned -MM
-// fragment. Testing stagedIFlags alone does NOT catch this: the bug was
-// which list the caller hands it, not what it does with the list.
+// Drives runScanner with a fake `cc`, since testing stagedIFlags alone
+// would not catch this: the bug was which list the caller hands it.
 func TestRunScannerDoesNotLeakSrcDirAsIFlag(t *testing.T) {
-	// Lay out the ffmpeg shape: root/ with a libavutil/ subdir.
 	root := t.TempDir()
 	sub := filepath.Join(root, "libavutil")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
@@ -168,14 +142,12 @@ func TestRunScannerDoesNotLeakSrcDirAsIFlag(t *testing.T) {
 		}
 	}
 
-	// Fake cc: emit a -MM fragment naming the one header, ignore argv.
 	fakeCC := filepath.Join(t.TempDir(), "fake-cc")
 	script := "#!/bin/sh\necho 'parseutils.o: libavutil/parseutils.h'\n"
 	if err := os.WriteFile(fakeCC, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Run from the ffmpeg root, as ffmpeg's make does.
 	prev, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -185,8 +157,6 @@ func TestRunScannerDoesNotLeakSrcDirAsIFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Caller passes `-I.` only — exactly what ffmpeg's CPPFLAGS does.
-	// srcDir is libavutil/, which must NOT become an -I flag.
 	r, _, err := runScanner(fakeCC, "libavutil/parseutils.c", []string{"-I."})
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +175,6 @@ func TestRunScannerDoesNotLeakSrcDirAsIFlag(t *testing.T) {
 	}
 }
 
-// TestStagedIFlags pins the rewriting itself, given a caller-dir list.
 func TestStagedIFlags(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -226,8 +195,6 @@ func TestStagedIFlags(t *testing.T) {
 		},
 		{"no caller dirs still yields -I.", "/p", nil, []string{"-I."}},
 		{
-			// Only reachable if projectRoot computation already went
-			// wrong; a visibly-broken flag beats a silently wrong one.
 			"dir outside root becomes ..-relative",
 			"/p/sub", []string{"/p/other"}, []string{"-I.", "-I../other"},
 		},
@@ -242,10 +209,6 @@ func TestStagedIFlags(t *testing.T) {
 	}
 }
 
-// TestCommonAncestor pins projectRoot selection. projectRoot decides
-// where every staged file lands (headers at <root>-relative paths), so a
-// wrong answer here either escapes the staging dir with `..` or widens
-// far enough to stage unrelated trees.
 func TestCommonAncestor(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -260,8 +223,6 @@ func TestCommonAncestor(t *testing.T) {
 		{"empty input", nil, "/"},
 		{"trailing slashes are cleaned", []string{"/p/a/", "/p/a"}, "/p/a"},
 		{
-			// The ffmpeg case: cwd=root, srcDir=subdir. Root must stay
-			// the ffmpeg root, not narrow to libavutil.
 			"cwd plus srcDir subdir",
 			[]string{"/ff", "/ff/libavutil"},
 			"/ff",
@@ -275,9 +236,6 @@ func TestCommonAncestor(t *testing.T) {
 	}
 }
 
-// TestIsAssemblySource pins the extension check that gates the
-// .incbin scan pass — must match compile.go's own isSource assembly
-// recognition (.s/.S), not a broader or narrower set.
 func TestIsAssemblySource(t *testing.T) {
 	for _, tc := range []struct {
 		source string
@@ -297,34 +255,19 @@ func TestIsAssemblySource(t *testing.T) {
 	}
 }
 
-// TestRunScannerFindsIncbinTargets is a regression test for a real
-// gap found against a real Linux kernel build: Linux Kbuild's own
-// arch/x86/realmode/rmpiggy.S uses GNU as's `.incbin "path"` directive
-// to embed a previously-built binary blob into a later object file.
-// `.incbin` is processed by the ASSEMBLER after preprocessing, so
-// gcc's own `-M`/`-MM` (which tracks only what the PREPROCESSOR
-// consumed — #include, never .incbin) silently omits it — confirmed
-// directly against real gcc: no error, no warning, the incbin'd file
-// just never appears in the dependency list. Without this, the
-// compile shim never stages the incbin target into the TU's sandbox,
-// and the real, deferred compile fails with "file not found" for a
-// file that exists right there in the caller's own build tree —
-// confirmed directly against a real kernel build before this fix.
+// Regression test: Linux Kbuild's arch/x86/realmode/rmpiggy.S uses GNU
+// as's `.incbin "path"` directive to embed a previously-built binary
+// blob. `.incbin` is processed by the ASSEMBLER after preprocessing, so
+// gcc's `-M`/`-MM` (which tracks only what the preprocessor consumed)
+// silently omits it — confirmed against real gcc, no error, no warning.
+// Without this, the compile shim never stages the incbin target, and the
+// deferred compile fails with "file not found" for a file that exists in
+// the caller's own build tree.
 //
-// Uses the REAL system compiler (skips if none on PATH), not a fake
-// script, because what's under test is real `as --MD` behavior
-// (binutils' own dependency-output flag, unrelated to gcc's -M
-// family) — a fake compiler script can't stand in for that without
-// just reimplementing the thing being tested.
-// realCCForTest finds a REAL compiler binary, bypassing nixgg's own
-// shims even when this test runs inside `nixgg develop` (where a bare
-// "cc"/"gcc" on PATH IS the shim, not the real tool — using it would
-// make this test exercise the shim's own compile path instead of
-// as's real --MD behavior, and the shim's own placeholder-thunk
-// output would confuse a plain compile probe like this one).
-// NIXGG_COMPILER_ROOT (set by `nixgg env` / the dev shell) points at
-// the real gcc-wrapper root when present; otherwise fall back to a
-// plain PATH lookup, skipping if neither yields a compiler.
+// realCCForTest uses the REAL system compiler (skips if none on PATH),
+// bypassing nixgg's own shims even inside `nixgg develop` (where a bare
+// "cc"/"gcc" on PATH IS the shim) — testing real `as --MD` behavior
+// needs the real tool, not a fake script standing in for it.
 func realCCForTest(t *testing.T) string {
 	t.Helper()
 	if root := os.Getenv("NIXGG_COMPILER_ROOT"); root != "" {
@@ -374,14 +317,9 @@ func TestRunScannerFindsIncbinTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runScanner: %v", err)
 	}
-	// Abs, not Rel: a real system gcc's own implicit predef header
-	// (e.g. glibc's stdc-predef.h) can land outside projectRoot and
-	// widen it all the way to "/", which shifts Rel unpredictably —
-	// harmless for staging (Abs is what's actually copied) and never
-	// happens with nixgg's own hermetic gcc-wrapper (its implicit
-	// headers all live under /nix/store), but it did make this
-	// assertion flaky on CI's system gcc. Abs is what this test
-	// actually needs to prove: the .incbin target was discovered.
+	// Abs, not Rel: a real system gcc's implicit predef header can land
+	// outside projectRoot and widen it to "/", shifting Rel unpredictably
+	// and making this assertion flaky on CI's system gcc.
 	found := false
 	for _, h := range r.Headers {
 		if h.Abs == blob {

@@ -12,23 +12,16 @@ import (
 // TestRealiseThunkArgsAndPassthroughClassificationBoundary pins the
 // classification RealiseThunkArgsAndPassthrough relies on to decide
 // which argv tokens get a synchronous realise attempt before the real
-// tool runs: ONLY classify.Thunk. A foreign archive (a real file
-// nixgg didn't produce) and a path that doesn't exist at all must
-// both classify as something other than Thunk — calling
-// realise.Realise on either would be wrong (no thunk exists for a
-// Store or Absent classification, so Realise would fail trying to
-// read a nonexistent .nix file).
+// tool runs: only classify.Thunk. A foreign archive and a nonexistent
+// path must both classify as something other than Thunk — calling
+// realise.Realise on either would fail trying to read a nonexistent
+// .nix file.
 //
 // This can't exercise RealiseThunkArgsAndPassthrough itself in a unit
-// test: its whole point is to exec the real tool via Passthrough,
-// which replaces the test process. The Thunk-classified case it
-// actually acts on (Linux Kbuild's own `ar t vmlinux.a` reading a
-// just-created, not-yet-realised thin archive, or `ar cDPrST
-// built-in.a` reading several still-deferred sibling thunks before
-// falling to Passthrough because ONE OTHER sibling couldn't be
-// classified) is covered by the real end-to-end kernel-fixture build
-// instead — this test only pins the classification boundary the fix
-// depends on.
+// test, since its whole point is to exec the real tool via
+// Passthrough, replacing the test process; that path is covered by
+// the real end-to-end kernel-fixture build instead. This test only
+// pins the classification boundary the fix depends on.
 func TestRealiseThunkArgsAndPassthroughClassificationBoundary(t *testing.T) {
 	dir := t.TempDir()
 	l := paths.Layout{Thunks: filepath.Join(dir, "thunks")}

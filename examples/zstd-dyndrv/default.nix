@@ -2,27 +2,17 @@
 # phase-chaining pattern for packages that exec one of their own
 # binaries mid-build.
 #
-# zstd's cmake graph (with ZSTD_BUILD_CONTRIB on, nixpkgs' own default)
-# execs `contrib/gen_html` mid-build to render zstd_manual.html. In
-# sandbox mode that fails: the shim's link step leaves a drvref stub in
-# place of a real executable, so `./gen_html` gets "Permission
+# zstd's cmake graph execs `contrib/gen_html` mid-build to render
+# zstd_manual.html; in sandbox mode the link shim leaves a drvref stub
+# there instead of a real executable, so `./gen_html` gets "Permission
 # denied".
 #
 # A plain .overrideAttrs patch can't fix this: nixpkgs' own
-# .override/.overrideAttrs reapplication always rebuilds the wrapped
-# package from its ORIGINAL attrs first, and the build stage is closed
-# over inside that call — before any .overrideAttrs the caller wrote
-# gets a chance to run (verified directly: both orderings produce a
-# byte-identical build-stage hash to the unpatched build). Use
-# splitStdenv's `extraBuildAttrs` instead — spliced in before the
-# build stage is computed.
-#
-# Two-phase structure, same shape as examples/two-phase.nix:
-#   phase A (mkNixggBuild) -> builds gen_html.cpp standalone (one TU,
-#            no cmake) into a real binary.
-#   phase B (splitStdenv, extraBuildAttrs) -> zstd's real cmake
-#            build, patched so gen_html's CMakeLists.txt calls phase
-#            A's binary directly instead of building+execing its own.
+# .override/.overrideAttrs reapplication rebuilds from ORIGINAL attrs
+# first, closing over the build stage before any caller-supplied
+# .overrideAttrs runs (verified: both orderings produce a
+# byte-identical build-stage hash). Use splitStdenv's `extraBuildAttrs`
+# instead — spliced in before the build stage is computed.
 {
   pkgs,
   mkNixggBuild,
@@ -30,9 +20,6 @@
 }:
 
 let
-  # gen_html.cpp is self-contained (iostream/fstream/sstream/vector
-  # only) — a plain single-TU mkNixggBuild call, same shape as
-  # examples/two-phase/codegen.
   genHtml = mkNixggBuild {
     pname = "zstd-gen-html";
     version = "0";
@@ -51,9 +38,7 @@ pkgs.zstd.override {
     splitAtBuild = true;
     extraBuildAttrs = finalAttrs: old: old // {
       # Removes gen_html's add_executable + DEPENDS edge, and points
-      # GENHTML_BINARY at phase A's binary instead. Every other TU
-      # still goes through splitStdenv's real shim acceleration
-      # unmodified.
+      # GENHTML_BINARY at phase A's binary instead.
       postPatch =
         old.postPatch
         + ''

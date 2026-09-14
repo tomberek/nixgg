@@ -10,13 +10,8 @@ import (
 	"github.com/tbereknyei/nixgg/internal/paths"
 )
 
-// TestTargetDrvRefStub pins that a sandbox-mode drvref stub classifies
-// as Kind.Drv with the recorded drv path.
-//
-// This is what lets a downstream link/archive shim reference the
-// producing drv under inputs.drvs. If it regressed to Regular, the shim
-// would fall back to Passthrough and silently stop accelerating — no
-// error, just a build that quietly stops using nixgg.
+// A regression to Regular would make the link/archive shim silently fall
+// back to Passthrough with no error.
 func TestTargetDrvRefStub(t *testing.T) {
 	dir := t.TempDir()
 	want := "/nix/store/00000000000000000000000000000000-ar-libfoo.a.drv"
@@ -33,9 +28,6 @@ func TestTargetDrvRefStub(t *testing.T) {
 	}
 }
 
-// TestTargetPlainFileIsRegular pins the complement: a file we did not
-// produce must be Regular, so the shim passes through rather than
-// referencing a drv that doesn't exist.
 func TestTargetPlainFileIsRegular(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "libvendored.a")
@@ -43,29 +35,17 @@ func TestTargetPlainFileIsRegular(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := Target(f, "", paths.Layout{}); got.Kind != Regular {
-		t.Errorf("Kind = %v, want Regular (a vendored archive is not ours)", got.Kind)
+		t.Errorf("Kind = %v, want Regular", got.Kind)
 	}
 }
 
-// TestTargetLiteralStorePathIsStore pins a shape no earlier fixture
-// exercised: a foreign dependency referenced by a LITERAL, already-
-// resolved /nix/store/... path with no symlink hop at all — e.g.
-// meson's build.ninja putting zlib's absolute
-// ".../zlib-1.3.2-static/lib/libz.a" directly on a link line, rather
-// than via -l/-L or a SONAME symlink chain. Every other route to a
-// foreign store dependency (an ordinary symlink resolving into
-// /nix/store/) already classified as Store; missing this one meant
-// classify.Target fell through to Regular, which degrades the WHOLE
-// link to Passthrough (classifyInputs bails out the moment any one
-// input can't be modeled) — confirmed directly against a real QEMU
-// build, whose zlib dependency has exactly this shape.
+// A dependency reached via a literal, already-resolved /nix/store/...
+// path with no symlink hop (e.g. meson emitting zlib's absolute path
+// directly on a link line) used to fall through to Regular, degrading
+// the whole link to Passthrough — confirmed against a real QEMU build.
 func TestTargetLiteralStorePathIsStore(t *testing.T) {
-	// Can't actually create a file under /nix/store in a unit test, so
-	// exercise the altStorePrefix branch instead: the alt-store's own
-	// on-disk root stands in for "/nix/store" the same way sandbox mode's
-	// real store does, and Target's alt-store-stripping logic is
-	// identical between the two branches (see the symlink branch's own
-	// "canonical" handling just above this one).
+	// Can't create a file under /nix/store in a unit test, so exercise
+	// the altStorePrefix branch, which shares the same stripping logic.
 	dir := t.TempDir()
 	storeDir := filepath.Join(dir, "nix", "store", "abc123-zlib-1.3.2-static", "lib")
 	if err := os.MkdirAll(storeDir, 0o755); err != nil {
@@ -88,9 +68,6 @@ func TestTargetLiteralStorePathIsStore(t *testing.T) {
 	}
 }
 
-// TestTargetAbsent pins that a missing path is Absent, not Regular —
-// the shims treat both as "pass through", but the distinction shows up
-// in the log line and is worth keeping honest.
 func TestTargetAbsent(t *testing.T) {
 	got := Target(filepath.Join(t.TempDir(), "nope.o"), "", paths.Layout{})
 	if got.Kind != Absent {
@@ -98,19 +75,12 @@ func TestTargetAbsent(t *testing.T) {
 	}
 }
 
-// TestTargetDanglingDrvSymlink documents a case the review proposed
-// testing as a regression, which on inspection was NOT the historical
-// bug.
-//
 // A dangling symlink to a .drv still classifies as Drv, because
-// readlinkFollow falls back to os.Readlink when EvalSymlinks fails. So
-// classify was never the broken layer. The real historical failure was
-// a Makefile's shell-level `test -e` on such a symlink (mosh's
-// `mosh-client: ../crypto/libmoshcrypto.a`), which is why sandbox mode
-// switched to writing regular-file stubs — see internal/drvref.
-//
-// Kept as documentation of the actual boundary, so nobody "fixes"
-// classify for a bug that never lived here.
+// readlinkFollow falls back to os.Readlink when EvalSymlinks fails. The
+// historical bug (mosh's `mosh-client: ../crypto/libmoshcrypto.a`) was a
+// Makefile's shell-level `test -e` on such a symlink, not this layer —
+// which is why sandbox mode switched to writing regular-file stubs (see
+// internal/drvref).
 func TestTargetDanglingDrvSymlink(t *testing.T) {
 	dir := t.TempDir()
 	link := filepath.Join(dir, "libfoo.a")
@@ -129,26 +99,17 @@ func TestTargetDanglingDrvSymlink(t *testing.T) {
 	}
 }
 
-// TestStoreSubpathSurvivesClassification is the regression guard for a
-// link failure that reached a real build: LLVM's cmake puts an absolute
-// positional shared library on the link line, and nixgg linked against a
-// path that did not exist.
+// Regression guard for a link failure that reached a real build: LLVM's
+// cmake puts an absolute positional shared library on the link line, and
+// nixgg linked against a path that did not exist:
 //
 //	ld.bfd: cannot find /nix/store/…-zlib-1.3.2/libz.so
 //
 // The file is at <root>/lib/libz.so. Classification reduced it to the
-// store root (correct — builtins.storePath and inputs.srcs both need a
-// root, not a subpath), and the link shim then rebuilt the argv as
+// store root, and the link shim rebuilt the argv as
 // Ref+"/"+filepath.Base(input), silently dropping the "lib/" in between.
-//
-// Every input nixgg produces itself lives directly in a drv output dir,
-// so root+basename was right for all of them, and the 81-drv fixture set
-// contains no positional absolute .so. The bug needed an input that
-// nixgg did not create.
 func TestStoreSubpathSurvivesClassification(t *testing.T) {
 	dir := t.TempDir()
-	// Fake store layout: <root>/lib/libz.so, reached through a symlink
-	// the way a build tree references a dependency.
 	root := filepath.Join(dir, "nix", "store", strings.Repeat("a", 32)+"-zlib-1.3.2")
 	if err := os.MkdirAll(filepath.Join(root, "lib"), 0o755); err != nil {
 		t.Fatal(err)
@@ -177,18 +138,14 @@ func TestStoreSubpathSurvivesClassification(t *testing.T) {
 			"cannot be reconstructed and the link references a nonexistent file", got.Sub)
 	}
 
-	// The composed argv path is the whole point: it must be the real
-	// file, not root+basename.
 	if want := wantRef + "/lib/libz.so"; got.ArgvPath("libz.so") != want {
 		t.Errorf("ArgvPath = %q, want %q", got.ArgvPath("libz.so"), want)
 	}
 }
 
-// TestStoreDirectChildHasNoSub pins the common case: an artifact nixgg
-// produced sits directly in its drv output dir, so Sub stays empty and
-// ArgvPath falls back to the caller-visible basename. Every one of the 81
-// pinned drvs depends on this shape, so a change that started reporting
-// Sub here would move hashes across the board.
+// Every one of the 81 pinned drvs depends on this shape (artifact sits
+// directly in its drv output dir, Sub stays empty), so a change here
+// would move hashes across the board.
 func TestStoreDirectChildHasNoSub(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "nix", "store", strings.Repeat("b", 32)+"-tu-main.o")
@@ -216,31 +173,17 @@ func TestStoreDirectChildHasNoSub(t *testing.T) {
 	}
 }
 
-// TestTargetDistinguishesStatFailure pins that a path we could not
-// inspect is reported differently from a path that is genuinely an
-// ordinary file nixgg doesn't own.
-//
-// Both classify as Regular — passthrough is the right action either way
-// — but they need different diagnostics. Reporting an ELOOP symlink
-// chain or an EACCES build output as "isn't a nixgg symlink" points the
-// reader at an ownership question when the real cause is a broken
-// symlink or a permission problem.
+// A path we could not inspect (ELOOP, EACCES) must be distinguished from
+// a genuinely ordinary file nixgg doesn't own: both classify as Regular,
+// but they need different diagnostics.
 func TestTargetDistinguishesStatFailure(t *testing.T) {
 	dir := t.TempDir()
 
 	t.Run("symlink loop stays Regular, and that is not the Err path", func(t *testing.T) {
-		// a -> b -> a. Worth pinning because it is NOT what it looks
-		// like: EvalSymlinks fails with "too many links", but
-		// readlinkFollow deliberately falls back to os.Readlink, which
-		// succeeds on a loop (it reads one hop without following). So
-		// classification proceeds on the raw target and no error is
-		// ever produced.
-		//
-		// That fallback is load-bearing — it is how an unrealised thunk
-		// symlink still classifies as Thunk — so this is correct
-		// behaviour, not a gap to close. The survey finding that
-		// prompted this test claimed ELOOP reached the Lstat error
-		// path; it does not.
+		// a -> b -> a. EvalSymlinks fails with "too many links", but
+		// readlinkFollow falls back to os.Readlink, which succeeds on a
+		// loop (reads one hop without following) — load-bearing, since
+		// it's also how an unrealised thunk symlink classifies as Thunk.
 		a := filepath.Join(dir, "loop-a")
 		b := filepath.Join(dir, "loop-b")
 		if err := os.Symlink(b, a); err != nil {
@@ -307,17 +250,11 @@ func TestTargetDistinguishesStatFailure(t *testing.T) {
 	})
 }
 
-// TestTargetSymlinkToDrvRefStub pins that a symlink resolving to one of
-// our own drvref stubs is recognised as Drv.
-//
-// This is what a SONAME alias chain looks like — `libfoo.so ->
-// libfoo.so.1.2.3`, which is ordinary libtool and autotools output —
-// where the final target is the stub nixgg wrote for the real link
-// output. The direct-regular-file branch has always checked drvref; the
-// symlink branch did not, so such an input classified as Regular, the
-// link shim's default case fired, and the entire link silently degraded
-// to an unaccelerated Passthrough. No wrong bytes, just no acceleration
-// and no explanation.
+// A SONAME alias chain (`libfoo.so -> libfoo.so.1.2.3`) resolving to our
+// own drvref stub must classify as Drv. The direct-regular-file branch
+// always checked drvref; the symlink branch did not, so such an input
+// classified as Regular and the entire link silently degraded to an
+// unaccelerated Passthrough.
 func TestTargetSymlinkToDrvRefStub(t *testing.T) {
 	drv := "/nix/store/" + strings.Repeat("a", 32) + "-bin-libfoo.so.drv"
 
@@ -340,21 +277,16 @@ func TestTargetSymlinkToDrvRefStub(t *testing.T) {
 		if got.Ref != drv {
 			t.Errorf("Ref = %q, want %q", got.Ref, drv)
 		}
-		// Sub must be the REAL target's basename (libfoo.so.1.2.3),
-		// not the alias's own name (libfoo.so) — the drv's output
-		// will exist under the former, never the latter. Missing
-		// this broke openssl's engines/*.so, which link against the
-		// plain `ln -s libcrypto.so.3 libcrypto.so` alias openssl's
-		// own Makefile creates: the emitted link line reached for
-		// ".../bin/libcrypto.so", a file that never exists.
+		// Sub is the real target's basename, not the alias's own name —
+		// broke openssl's engines/*.so, which link against the plain
+		// `ln -s libcrypto.so.3 libcrypto.so` alias openssl's own
+		// Makefile creates.
 		if got.Sub != "libfoo.so.1.2.3" {
 			t.Errorf("Sub = %q, want %q (the real target's basename, not the alias)", got.Sub, "libfoo.so.1.2.3")
 		}
 	})
 
 	t.Run("multi hop", func(t *testing.T) {
-		// libfoo.so -> libfoo.so.1 -> libfoo.so.1.2.3, the full chain
-		// autotools actually produces.
 		dir := t.TempDir()
 		real := filepath.Join(dir, "libfoo.so.1.2.3")
 		if err := os.WriteFile(real, []byte(drvref.Body(drv)), 0o644); err != nil {
@@ -379,9 +311,7 @@ func TestTargetSymlinkToDrvRefStub(t *testing.T) {
 	})
 
 	t.Run("symlink to a foreign file is still Regular", func(t *testing.T) {
-		// A system library reached through a symlink must NOT be claimed:
-		// nixgg never staged it, so referencing it would produce a drv
-		// input that doesn't exist in the sandbox.
+		// Must NOT be claimed: nixgg never staged it.
 		dir := t.TempDir()
 		real := filepath.Join(dir, "libsystem.so.6")
 		if err := os.WriteFile(real, []byte("\x7fELF not ours"), 0o644); err != nil {

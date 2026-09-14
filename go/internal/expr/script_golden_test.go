@@ -11,48 +11,17 @@ import (
 
 // The drv-script golden test.
 //
-// Both modes get their shell body from one place — Go's buildScript.
-// Sandbox renders it resolved; native renders the same layout with
-// @NIXGG_*@ markers for nix/resolve-script.nix to fill in. These tests pin
-// the seam:
-//
-//   - the marker contract desynchronising, which would send a literal
-//     `@NIXGG_INPUT0@` to bash → TestNativeTemplateResolvesToSandboxScript
-//   - the template not being a valid Nix literal, reachable from flags
-//     carrying `''` or `${` → TestScriptTemplateSurvivesNixParsing
-//   - layout regressions → TestScriptEndsWithNewline, plus
-//     TestLinkScriptEmitsLibFlagsAfterInputs in expr_test.go
-//
-// Cases deliberately cover shapes no pinned fixture contains — that blind
-// spot is how the `'` quoting divergence survived 81 drvs.
-//
-// All pure eval via `nix-instantiate --eval --raw` reading drvAttrs.args:
-// ~1s, no daemon, no store writes. End-to-end drv-hash equality remains
+// Both modes get their shell body from Go's buildScript. Sandbox
+// renders it resolved; native renders the same layout with @NIXGG_*@
+// markers for nix/resolve-script.nix to fill in. These tests pin the
+// seam via nix-instantiate --eval --raw reading drvAttrs.args (~1s, no
+// daemon, no store writes). End-to-end drv-hash equality remains
 // tests/drv-equivalence.sh's job.
 
-// nixEvalScript renders `helper` with `args` and returns args[1] of the
-// resulting derivation — the bash body. helper is a basename in nix/.
-func nixEvalScript(t *testing.T, helper string, argsNix string) string {
-	t.Helper()
-	dir, err := filepath.Abs("../../../nix")
-	if err != nil {
-		t.Fatal(err)
-	}
-	expr := "builtins.elemAt (import " + filepath.Join(dir, helper) + " " + argsNix + ").drvAttrs.args 1"
-	return runNixEval(t, expr)
-}
-
-// runNixEval evaluates `expr` and returns its raw string value. Nix's
-// diagnostics go to stderr and are the whole story when eval fails
-// (e.g. "context key ... is not a store path"), so capture and report
-// them — an "exit status 1" alone sends you back here to re-run by hand.
+// runNixEval evaluates `expr` and returns its raw string value.
 func runNixEval(t *testing.T, expr string) string {
 	t.Helper()
 	cmd := exec.Command("nix-instantiate", "--eval", "--raw", "--impure", "--expr", expr)
-	// A user's NIX_PATH / overlays can't affect these helpers (they take
-	// every store path as an argument and never touch <nixpkgs>), but keep
-	// the environment minimal so the test can't pick up an eval cache from
-	// a different checkout.
 	cmd.Env = append(os.Environ(), "NIX_PATH=")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -71,14 +40,13 @@ func nixStr(s string) string {
 	return `"` + e + `"`
 }
 
-// nixIndentedString renders a Go string as a Nix indented-string literal
-// (the two-apostrophe delimiter), which is how the driver passes
-// flagsJSON / storeDepsJSON / wrapperEnvJSON. Our JSON payloads contain
-// `"`, which needs no escaping there, but could contain the delimiter
-// itself or `${`, both of which do.
+// nixIndentedString renders a Go string as a Nix indented-string
+// literal, which is how the driver passes flagsJSON / storeDepsJSON /
+// wrapperEnvJSON. It could contain the delimiter itself or `${`, both
+// of which need escaping.
 //
-// The delimiter is spelled through strings.ReplaceAll below rather than
-// written in this comment on purpose: gofmt rewrites a bare pair of
+// The delimiter is spelled through strings.ReplaceAll below rather
+// than written literally in a comment: gofmt rewrites a bare pair of
 // apostrophes in a comment into typographic quotes, which would make
 // this file permanently unformatted (see internal/expr/expr.go).
 func nixIndentedString(s string) string {
@@ -99,13 +67,10 @@ func flagsJSONOf(t *testing.T, flags []string) string {
 	return nixIndentedString(string(b))
 }
 
-// Fixed fake store paths. Real-looking (32-char hash + name) so the
-// helpers' pureStorePath and Go's string handling both behave as they
-// would in production, but stable so the test is deterministic.
-//
-// The hash characters must come from the nix32 alphabet — pureStorePath
-// calls builtins.appendContext, which validates the path and rejects
-// anything containing E, O, U or T (see nix32Chars).
+// Fixed fake store paths, real-looking (32-char hash + name) but
+// stable for determinism. The hash chars must come from the nix32
+// alphabet — pureStorePath calls builtins.appendContext, which
+// rejects E, O, U, T (see nix32Chars).
 const (
 	fakeBash      = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bash-5.2"
 	fakeCoreutils = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-coreutils-9.5"
@@ -127,14 +92,12 @@ func toolchainArgsNix(compilerOrAR string) string {
 // placeholder and native mode renders by interpolating the imported
 // derivation.
 //
-// These two CANNOT be compared by string equality — that is the point of
-// the test. Go computes the placeholder itself (caOutputPlaceholder);
-// native lets Nix compute it while instantiating the sibling. Both
-// produce a 53-char `/`-prefixed nix32 string in the same argv slot, and
-// drv-equivalence.sh proves the values agree end to end. What is checked
-// here is the surrounding layout: same quoting, same `/name` suffix, same
-// position relative to flags and other inputs. A layout change would
-// otherwise only surface as a hash mismatch in the slow test.
+// The two values can't be compared by string equality — Go computes
+// the placeholder itself, native lets Nix compute it while
+// instantiating the sibling (drv-equivalence.sh proves they agree end
+// to end). What's checked here is the surrounding layout instead:
+// same quoting, same `/name` suffix, same position relative to flags
+// and other inputs.
 func TestDrvRefInputsRenderIdentically(t *testing.T) {
 	drv := "/nix/store/" + strings.Repeat("9", 32) + "-tu-other.o.drv"
 	d := &Derivation{
@@ -155,24 +118,19 @@ func TestDrvRefInputsRenderIdentically(t *testing.T) {
 	if len(ph) != 53 || ph[0] != '/' {
 		t.Fatalf("placeholder shape wrong: %q", ph)
 	}
-	// The placeholder must appear quoted, with the input's basename
-	// appended — the exact shape `'${i.drv}/${i.name}'` in linker.nix.
+	// Exact shape `'${i.drv}/${i.name}'` from linker.nix.
 	want := "'" + ph + "/other.o'"
 	if !strings.Contains(got, want) {
 		t.Errorf("drv input not rendered as %q:\n%s", want, got)
 	}
-	// And it must sit after the realised input, preserving argv order.
 	if strings.Index(got, "main.o'") > strings.Index(got, want) {
 		t.Errorf("input order inverted — argv order is load-bearing for ld:\n%s", got)
 	}
 }
 
-// TestScriptEndsWithNewline pins a property that is easy to break with an
-// innocuous edit and expensive to notice: both emitters end the script
-// with exactly one trailing newline. Nix's indented-string literal strips
-// the common indent and keeps the final newline; Go's fmt.Sprintf has it
-// written literally. Adding or dropping one changes every drv hash in the
-// project at once.
+// TestScriptEndsWithNewline pins that both emitters end the script
+// with exactly one trailing newline — dropping it changes every drv
+// hash in the project at once.
 func TestScriptEndsWithNewline(t *testing.T) {
 	for _, d := range []*Derivation{
 		{Kind: KindCompile, Tool: "cc", Coreutils: "/C", Compiler: "/G",
@@ -180,7 +138,7 @@ func TestScriptEndsWithNewline(t *testing.T) {
 		{Kind: KindLink, Tool: "cc", Coreutils: "/C", Compiler: "/G",
 			OutName: "p", Flags: []string{"-O2"}},
 		{Kind: KindLink, Tool: "cc", Coreutils: "/C", Compiler: "/G",
-			OutName: "p", Flags: []string{"-lm"}}, // the other branch
+			OutName: "p", Flags: []string{"-lm"}},
 		{Kind: KindArchive, Coreutils: "/C", AR: "/AR",
 			OutName: "l.a", ARFlags: "rcs"},
 	} {
@@ -194,19 +152,6 @@ func TestScriptEndsWithNewline(t *testing.T) {
 	}
 }
 
-// nixEvalScriptWithPS is nixEvalScript for the helpers whose `inputs`
-// argument needs pure-store-path in scope as `ps`.
-func nixEvalScriptWithPS(t *testing.T, helper string, argsNix string) string {
-	t.Helper()
-	dir, err := filepath.Abs("../../../nix")
-	if err != nil {
-		t.Fatal(err)
-	}
-	expr := "let ps = import " + filepath.Join(dir, "pure-store-path.nix") + "; in " +
-		"builtins.elemAt (import " + filepath.Join(dir, helper) + " " + argsNix + ").drvAttrs.args 1"
-	return runNixEval(t, expr)
-}
-
 func requireNixInstantiate(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("nix-instantiate"); err != nil {
@@ -214,8 +159,6 @@ func requireNixInstantiate(t *testing.T) {
 	}
 }
 
-// assertSameScript reports a byte difference between the two emitters
-// with enough context to see which line diverged.
 func assertSameScript(t *testing.T, goScript, nixScript string) {
 	t.Helper()
 	if goScript == nixScript {
@@ -240,27 +183,20 @@ func assertSameScript(t *testing.T, goScript, nixScript string) {
 }
 
 // TestNativeTemplateResolvesToSandboxScript is the core guard for the
-// unified serializer.
+// unified serializer: script() and scriptTemplate() come from the
+// same buildScript call, so the layout cannot diverge, but the
+// template still has to survive a round trip through the REAL
+// nix/resolve-script.nix with the same store paths and inputs the
+// sandbox side used, resolving to script() byte for byte.
 //
-// script() and scriptTemplate() come from the same buildScript call, so
-// the layout cannot diverge — but the template still has to survive a
-// round trip through Nix. This test runs the REAL nix/resolve-script.nix
-// with the same store paths and inputs the sandbox side used, and demands
-// the resolved text equal script() byte for byte.
+// If Go renames a marker, adds an input marker the helper does not
+// substitute, or the helper's replaceStrings lists fall out of order,
+// the template reaches bash with a literal `@NIXGG_INPUT0@` in argv —
+// a build failure whose cause is nowhere near its symptom.
 //
-// That is what makes the marker contract enforceable. If Go renames a
-// marker, adds an input marker the helper does not substitute, or the
-// helper's replaceStrings lists fall out of order, the template reaches
-// bash with a literal `@NIXGG_INPUT0@` in argv — a build failure whose
-// cause is nowhere near its symptom. Here it is a one-line diff.
-//
-// Only "store"-kind inputs are used. A "nix"-kind input is a sibling drv
-// whose placeholder Go computes and Nix derives while instantiating; the
-// two agree (verified by TestCAOutputPlaceholder against a captured
-// vector, and end to end by drv-equivalence.sh), but reproducing it here
-// would mean instantiating a real sibling derivation, which needs a
-// writable store. TestDrvRefInputsRenderIdentically covers the layout of
-// that case instead.
+// Only "store"-kind inputs are used; TestDrvRefInputsRenderIdentically
+// covers "nix"-kind inputs' layout, since reproducing those here would
+// need instantiating a real sibling derivation in a writable store.
 func TestNativeTemplateResolvesToSandboxScript(t *testing.T) {
 	requireNixInstantiate(t)
 
@@ -268,8 +204,8 @@ func TestNativeTemplateResolvesToSandboxScript(t *testing.T) {
 		{InputKind: "store", Ref: fakeObj, Name: "main.o"},
 		{InputKind: "store", Ref: fakeArchive, Name: "libx.a"},
 	}
-	// Two inputs sharing one store path: pins that markers are positional,
-	// not content-derived. A content-keyed scheme would collapse these.
+	// Pins that markers are positional, not content-derived — a
+	// content-keyed scheme would collapse these two shared-path inputs.
 	dupInputs := []derivInput{
 		{InputKind: "store", Ref: fakeObj, Name: "a.o"},
 		{InputKind: "store", Ref: fakeObj, Name: "b.o"},
@@ -332,8 +268,7 @@ func TestNativeTemplateResolvesToSandboxScript(t *testing.T) {
 				d.Compiler = fakeCompiler
 			}
 
-			// The helper renders `${i.drv}/${i.name}`, so pass the store
-			// root as drv and let it append the name — same as production.
+			// The helper renders `${i.drv}/${i.name}`, so pass the store root as drv and let it append the name.
 			items := make([]string, 0, len(d.Inputs))
 			for _, in := range d.Inputs {
 				items = append(items,
@@ -352,7 +287,6 @@ func TestNativeTemplateResolvesToSandboxScript(t *testing.T) {
 			resolved := runNixEval(t, expr)
 			assertSameScript(t, d.script(), resolved)
 
-			// No marker of the chosen tag may survive resolution.
 			if strings.Contains(resolved, "@"+tag+"_") {
 				t.Errorf("unresolved @%s_ marker reached the final script — bash "+
 					"would receive it as a literal argument:\n%s", tag, resolved)
@@ -361,15 +295,14 @@ func TestNativeTemplateResolvesToSandboxScript(t *testing.T) {
 	}
 }
 
-// TestScriptTemplateSurvivesNixParsing pins that the template Go writes
-// into a thunk is a well-formed Nix indented-string literal whose value
-// is the template unchanged.
+// TestScriptTemplateSurvivesNixParsing pins that the template Go
+// writes into a thunk is a well-formed Nix indented-string literal
+// whose value is the template unchanged.
 //
-// Two constructs are special inside that literal and both are reachable
-// from ordinary flags: a doubled apostrophe closes the string, and `${`
-// opens an interpolation. Unescaped, the first yields a thunk that will
-// not parse and the second one that silently interpolates at eval time —
-// or fails with "undefined variable", which at least is loud.
+// A doubled apostrophe closes the string and `${` opens an
+// interpolation — both are reachable from ordinary flags and both
+// need escaping, or the thunk either fails to parse or silently
+// interpolates at eval time.
 func TestScriptTemplateSurvivesNixParsing(t *testing.T) {
 	requireNixInstantiate(t)
 
@@ -403,7 +336,6 @@ func TestScriptTemplateSurvivesNixParsing(t *testing.T) {
 	}
 }
 
-// nixHelperPath returns the absolute path of a helper in nix/.
 func nixHelperPath(t *testing.T, name string) string {
 	t.Helper()
 	dir, err := filepath.Abs("../../../nix")
@@ -414,15 +346,12 @@ func nixHelperPath(t *testing.T, name string) string {
 }
 
 // TestMarkerTagAvoidsCollisionWithFlagText pins the escape hatch that
-// makes marker substitution safe against adversarial flag text.
-//
-// Markers are plain text in a shell script, so a flag spelling one would
-// be substituted along with the real markers: `-DAT=@NIXGG_COMPILER@`
-// would reach the compiler as `-DAT=/nix/store/…-gcc-wrapper`. Contrived,
-// yes — and so was an apostrophe in a -D, right up until it broke native
-// mode. This is caught by TestNativeTemplateResolvesToSandboxScript with
-// a fixed tag; the point here is that the fallback actually engages and
-// stays deterministic.
+// makes marker substitution safe against adversarial flag text:
+// markers are plain text in a shell script, so a flag spelling one
+// would be substituted along with the real markers
+// (`-DAT=@NIXGG_COMPILER@` would reach the compiler as
+// `-DAT=/nix/store/…-gcc-wrapper`) — an apostrophe in a -D broke
+// native mode the same way, right up until it did.
 func TestMarkerTagAvoidsCollisionWithFlagText(t *testing.T) {
 	mk := func(flags ...string) *Derivation {
 		return &Derivation{
@@ -444,11 +373,9 @@ func TestMarkerTagAvoidsCollisionWithFlagText(t *testing.T) {
 			t.Fatal("tag did not move away from a colliding flag; the flag text " +
 				"would be substituted as if it were a marker")
 		}
-		// The flag's own text must still be present, unsubstituted.
 		if !strings.Contains(tmpl, "-DAT=@NIXGG_COMPILER@") {
 			t.Errorf("flag text lost from template:\n%s", tmpl)
 		}
-		// And the real markers must use the new tag.
 		if !strings.Contains(tmpl, "@"+tag+"_COMPILER@") {
 			t.Errorf("template has no @%s_COMPILER@ marker:\n%s", tag, tmpl)
 		}
@@ -464,8 +391,6 @@ func TestMarkerTagAvoidsCollisionWithFlagText(t *testing.T) {
 	})
 
 	t.Run("deterministic", func(t *testing.T) {
-		// The tag lands in the thunk text and therefore in its hash, so a
-		// second call on equal input must produce the same tag.
 		_, a := mk("-DAT=@NIXGG_COMPILER@").scriptTemplate()
 		_, b := mk("-DAT=@NIXGG_COMPILER@").scriptTemplate()
 		if a != b {
@@ -506,7 +431,6 @@ func TestLinkScriptGroupWrapsInputs(t *testing.T) {
 			t.Errorf("group does not span the inputs (start=%d firstIn=%d lastIn=%d end=%d)\n%s",
 				start, firstIn, lastIn, end, s)
 		}
-		// A group spanning nothing is the exact bug being fixed.
 		if end < firstIn {
 			t.Errorf("--end-group precedes the first input — the group spans "+
 				"nothing and ld's rescan is defeated:\n%s", s)
@@ -514,8 +438,6 @@ func TestLinkScriptGroupWrapsInputs(t *testing.T) {
 	})
 
 	t.Run("group coexists with the -l split", func(t *testing.T) {
-		// -l flags go after the inputs; they must land outside the group,
-		// since the group is about archive rescanning among the inputs.
 		s := mk(true, []string{"-O2", "-lm"}).script()
 		end := strings.Index(s, "-Wl,--end-group")
 		lm := strings.Index(s, "'-lm'")
@@ -528,8 +450,6 @@ func TestLinkScriptGroupWrapsInputs(t *testing.T) {
 	})
 
 	t.Run("no group is byte-identical to before", func(t *testing.T) {
-		// Pins that GroupInputs=false changes nothing. All 81 pinned drvs
-		// depend on this.
 		s := mk(false, []string{"-O2"}).script()
 		if strings.Contains(s, "start-group") || strings.Contains(s, "end-group") {
 			t.Errorf("group emitted without being asked for:\n%s", s)
@@ -551,11 +471,8 @@ func TestLinkScriptGroupWrapsInputs(t *testing.T) {
 	})
 
 	t.Run("raw ld tool uses bare group brackets, not -Wl,", func(t *testing.T) {
-		// A raw `ld` invocation (Linux Kbuild's own vmlinux.o link —
-		// see isRawLinker's own docstring) rejects -Wl,--start-group
-		// outright ("unrecognized option"); only cc/gcc/clang-driven
-		// links use the -Wl, spelling, which is what mk's default
-		// Tool: "cc" already pins above.
+		// Linux Kbuild's own vmlinux.o link uses a raw `ld` invocation
+		// (see isRawLinker), which rejects -Wl,--start-group outright.
 		d := mk(true, []string{"-O2"})
 		d.Tool = "ld"
 		s := d.script()
@@ -638,15 +555,11 @@ func TestLinkScriptWholeArchiveWrapsOnlyNamedInputs(t *testing.T) {
 // TestLinkScriptStagesInlineFiles pins that InlineFilesStore (a
 // staged directory holding a linker script the link shim read off
 // disk before staging it — see shim/link.go's linkerScriptPath) gets
-// copied into the build root BEFORE the link command runs, and that
-// the flag referencing it (e.g. -Wl,--version-script=libcrypto.ld)
-// passes through unchanged — the copied file now exists at exactly
-// the relative path the flag already names. Copied via `cp`, not
-// embedded as text: a large generated linker script plus hundreds of
-// real object-file paths on one link line can exceed the kernel's
-// argv limit if baked into the script body directly (confirmed
-// directly against openssl's libcrypto.so.3 — "Argument list too
-// long").
+// copied into the build root BEFORE the link command runs. Copied via
+// `cp`, not embedded as text, since a large generated linker script
+// plus hundreds of object-file paths on one link line can exceed the
+// kernel's argv limit (confirmed against openssl's libcrypto.so.3 —
+// "Argument list too long").
 func TestLinkScriptStagesInlineFiles(t *testing.T) {
 	d := &Derivation{
 		Kind: KindLink, Tool: "cc", OutName: "libcrypto.so.3",
@@ -681,8 +594,7 @@ func TestLinkScriptStagesInlineFiles(t *testing.T) {
 }
 
 // TestLinkScriptNoInlineFilesUnchanged pins that omitting
-// InlineFilesStore (the overwhelming common case — every link before
-// this feature existed) doesn't add anything to the script at all.
+// InlineFilesStore doesn't add anything to the script at all.
 func TestLinkScriptNoInlineFilesUnchanged(t *testing.T) {
 	d := &Derivation{
 		Kind: KindLink, Tool: "cc", OutName: "prog",
@@ -699,14 +611,11 @@ func TestLinkScriptNoInlineFilesUnchanged(t *testing.T) {
 }
 
 // TestOutSubdirAgreesWithInputSubdirFor pins the producer/consumer
-// contract for FHS placement.
-//
-// outSubdir decides where a derivation WRITES its artifact, keyed on Kind.
-// inputSubdirFor decides where a downstream derivation LOOKS for it, keyed
-// on the artifact's filename. They are separate functions because each
-// side has only one of those two facts — the producer knows its Kind, the
-// consumer sees only a filename. If they disagree, a link reaches for an
-// archive at a path the archive drv never wrote.
+// contract for FHS placement: outSubdir decides where a derivation
+// WRITES its artifact, keyed on Kind; inputSubdirFor decides where a
+// downstream derivation LOOKS for it, keyed on the artifact's
+// filename. If they disagree, a link reaches for an archive at a path
+// the archive drv never wrote.
 func TestOutSubdirAgreesWithInputSubdirFor(t *testing.T) {
 	for _, tc := range []struct {
 		kind Kind
@@ -719,14 +628,11 @@ func TestOutSubdirAgreesWithInputSubdirFor(t *testing.T) {
 		{KindLink, "prog"},
 		{KindLink, "mosh-server"},
 		{KindLink, "llc"},
-		// A shared library is a link output; bin/ is where the link drv
-		// puts whatever it was told to produce.
 		{KindLink, "libfoo.so"},
-		// meson's own `prelink: true` static-library convention: a LINK
-		// output (shim.Link's `g++ -r`) named with a `.o` extension,
-		// same "filename lies about Kind" shape as Kbuild's vmlinux.o —
-		// see ArtifactSubdir's own docstring for the real build
-		// (examples/nix-util) this was found against.
+		// meson's `prelink: true` static-library convention: a LINK
+		// output named with a `.o` extension — see ArtifactSubdir's
+		// docstring for the real build (examples/nix-util) this was
+		// found against.
 		{KindLink, "nixutil-prelink.o"},
 	} {
 		producer := (&Derivation{Kind: tc.kind, OutName: tc.name}).outSubdir()
@@ -739,19 +645,16 @@ func TestOutSubdirAgreesWithInputSubdirFor(t *testing.T) {
 	}
 }
 
-// TestInputSubdirForIsModeIndependent pins that the subdir is derived from
-// something BOTH modes have.
-//
-// Sandbox references a sibling by drv path ("…-ar-libfoo.a.drv"); native
-// references it by thunk path (".nixgg/thunks/<hash>.nix"), which encodes
-// no kind whatsoever. An earlier version of this keyed on the drv name and
-// therefore resolved to "lib" in sandbox mode and "" in native mode for
-// the same input — different scripts, different drv hashes, invariant
-// broken. Keying on the artifact filename is what makes the two agree.
+// TestInputSubdirForIsModeIndependent pins that the subdir is derived
+// from something BOTH modes have: sandbox references a sibling by
+// drv path, native by thunk path, which encodes no kind whatsoever.
+// An earlier version keyed on the drv name and resolved to "lib" in
+// sandbox mode and "" in native mode for the same input — different
+// scripts, different drv hashes. Keying on the artifact filename is
+// what makes the two agree.
 func TestInputSubdirForIsModeIndependent(t *testing.T) {
 	for _, name := range []string{"libfoo.a", "main.o", "prog"} {
 		want := inputSubdirFor(name)
-		// Whatever wrapping either mode applies, the answer must not move.
 		for _, ref := range []string{
 			name,
 			"/nix/store/" + strings.Repeat("a", 32) + "-ar-" + name + ".drv",
@@ -774,14 +677,12 @@ func TestInputSubdirForIsModeIndependent(t *testing.T) {
 	}
 }
 
-// TestScriptCreatesTheDirectoryItWritesTo pins that every emitted script
-// mkdir's the directory it then writes into.
-//
-// Without this, moving an artifact into $out/bin while still creating only
-// $out produces a script that fails at BUILD time — `gcc -o $out/bin/prog`
-// with no $out/bin — which no unit test would notice and which surfaces as
-// a compiler error deep in a Nix build log. Mutation-caught: dropping the
-// subdir from outDir() passed every other test here.
+// TestScriptCreatesTheDirectoryItWritesTo pins that every emitted
+// script mkdir's the directory it then writes into — otherwise moving
+// an artifact into $out/bin while still creating only $out fails at
+// BUILD time (`gcc -o $out/bin/prog` with no $out/bin), which no unit
+// test would notice on its own. Mutation-caught: dropping the subdir
+// from outDir() passed every other test here.
 func TestScriptCreatesTheDirectoryItWritesTo(t *testing.T) {
 	for _, d := range []*Derivation{
 		{Kind: KindCompile, Tool: "cc", Coreutils: "/C", Compiler: "/G",
@@ -789,12 +690,11 @@ func TestScriptCreatesTheDirectoryItWritesTo(t *testing.T) {
 		{Kind: KindLink, Tool: "cc", Coreutils: "/C", Compiler: "/G",
 			OutName: "prog", Flags: []string{"-O2"}},
 		{Kind: KindLink, Tool: "cc", Coreutils: "/C", Compiler: "/G",
-			OutName: "prog", Flags: []string{"-lm"}}, // the other branch
+			OutName: "prog", Flags: []string{"-lm"}},
 		{Kind: KindArchive, Coreutils: "/C", AR: "/AR",
 			OutName: "libfoo.a", ARFlags: "rcs"},
 	} {
 		s := d.script()
-		// The directory the script creates.
 		var made string
 		for _, line := range strings.Split(s, "\n") {
 			if strings.HasPrefix(line, "mkdir -p ") {
@@ -804,7 +704,6 @@ func TestScriptCreatesTheDirectoryItWritesTo(t *testing.T) {
 		if made == "" {
 			t.Fatalf("kind %d: no mkdir in script:\n%s", d.Kind, s)
 		}
-		// The directory the artifact is written into.
 		want := d.outPath()
 		wantDir := want[:strings.LastIndexByte(want, '/')]
 		if made != wantDir {

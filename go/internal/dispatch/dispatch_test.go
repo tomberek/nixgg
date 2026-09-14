@@ -7,12 +7,8 @@ import (
 	"testing"
 )
 
-// TestFromArgv0 pins the argv[0] → role mapping.
-//
-// An unclassified name returns ToolUnknown and the shim has no role to
-// play, so acceleration silently never engages for that tool: no error,
-// no drv, nothing in the log — the build just quietly runs
-// unaccelerated. Real build systems invoke compilers under
+// An unclassified name returns ToolUnknown and acceleration silently
+// never engages for that tool. Real build systems invoke compilers under
 // target-triple and version decorations, so the matcher has to be
 // generous about spelling.
 func TestFromArgv0(t *testing.T) {
@@ -29,50 +25,42 @@ func TestFromArgv0(t *testing.T) {
 		{"ranlib", ToolRanlib},
 		{"ld", ToolLD},
 
-		// Full paths — only the basename matters.
 		{"/usr/bin/gcc", ToolGCC},
 		{"/nix/store/xxx-gcc-wrapper/bin/c++", ToolCXX},
 		{"./cc", ToolCC},
 
-		// Version-decorated, as Debian/Fedora ship parallel compilers.
 		{"gcc-15", ToolGCC},
 		{"g++-14", ToolGXX},
 		{"g++-14.2", ToolGXX},
 		{"clang-18", ToolGCC},
 		{"clang++-18", ToolGXX},
 
-		// Target-triple prefixed, from cross and explicit-triple setups.
 		{"x86_64-unknown-linux-gnu-gcc", ToolGCC},
 		{"x86_64-linux-gnu-g++", ToolGXX},
 		{"aarch64-linux-gnu-ar", ToolAR},
 		{"arm-none-eabi-ranlib", ToolRanlib},
 
-		// Both decorations at once.
 		{"x86_64-linux-gnu-g++-14", ToolGXX},
 		{"x86_64-unknown-linux-gnu-gcc-15", ToolGCC},
 
-		// clang maps onto the gcc/g++ roles: nixgg pins its own
-		// compiler, so the role only selects C vs C++ mode.
+		// clang maps onto the gcc/g++ roles: nixgg pins its own compiler,
+		// so the role only selects C vs C++ mode.
 		{"clang", ToolGCC},
 		{"clang++", ToolGXX},
 
-		// binutils equivalents.
 		{"llvm-ar", ToolAR},
 		{"llvm-ranlib", ToolRanlib},
 
-		// Linux Kbuild's raw-link tool names — bfd/gold/lld linker
-		// personalities, and the ld.lld spelling LLVM builds use.
+		// ld.lld is the spelling LLVM builds use.
 		{"ld.bfd", ToolLD},
 		{"ld.gold", ToolLD},
 		{"ld.lld", ToolLD},
 		{"x86_64-linux-gnu-ld", ToolLD},
 
-		// Not compilers.
 		{"make", ToolUnknown},
 		{"python3", ToolUnknown},
 		{"nixgg", ToolUnknown},
 		{"", ToolUnknown},
-		// A trailing dash leaves nothing to match.
 		{"gcc-", ToolUnknown},
 	} {
 		t.Run(tc.argv0, func(t *testing.T) {
@@ -84,14 +72,10 @@ func TestFromArgv0(t *testing.T) {
 }
 
 // TestBasenameIsClosedOverSevenNames pins the property that makes widening
-// FromArgv0 safe for drv hashes: however a tool was spelled on the
-// command line, Basename() — which is what lands in the derivation as
-// toolBasename — returns one of seven canonical strings.
-//
-// So `gcc-15` dispatches as ToolGCC and the drv still says "gcc". That
-// is deliberate, not a lossy shortcut: the drv must name a tool that
-// exists inside the sandbox, which contains nixgg's pinned compiler and
-// not the caller's versioned one.
+// FromArgv0 safe for drv hashes: Basename() (toolBasename in the
+// derivation) always returns one of seven canonical strings regardless of
+// how the tool was spelled on the command line — the drv must name a tool
+// that exists inside the sandbox, not the caller's versioned one.
 func TestBasenameIsClosedOverSevenNames(t *testing.T) {
 	canonical := map[string]bool{
 		"cc": true, "gcc": true, "c++": true,
@@ -117,26 +101,21 @@ func TestBasenameIsClosedOverSevenNames(t *testing.T) {
 				"break drv-equivalence", s, b)
 		}
 	}
-	// ToolUnknown has no basename; nothing should map to "".
+	// ToolUnknown has no basename.
 	if got := ToolUnknown.Basename(); got != "" {
 		t.Errorf("ToolUnknown.Basename() = %q, want empty", got)
 	}
 }
 
-// TestSplitRspLine pins response-file tokenisation.
-//
 // The bug this replaces: `strings.Fields` split the line first and a
 // per-token unquote ran second, so any quoted argument containing a space
-// — the only reason to quote at all — was already shattered by the time
-// unquoting happened:
+// was already shattered by the time unquoting happened:
 //
 //	"-DGREETING=hello world"  ->  ["-DGREETING=hello, world"]
 //
-// each fragment keeping a stray quote character. cmake and ninja emit
-// exactly that shape for defines with spaces, and ExpandRspfiles runs on
-// every shim invocation, so the corrupted flag went straight to the
-// compiler. Confirmed against real gcc: it treats the quoted run as one
-// argument whose macro body is `hello world`.
+// cmake and ninja emit exactly that shape for defines with spaces, and
+// ExpandRspfiles runs on every shim invocation, so the corrupted flag
+// went straight to the compiler.
 func TestSplitRspLine(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -148,7 +127,6 @@ func TestSplitRspLine(t *testing.T) {
 		{"only spaces", `   `, nil},
 		{"tabs separate too", "-O2\t-Wall", []string{"-O2", "-Wall"}},
 
-		// The regression.
 		{"double-quoted value with a space",
 			`-DGREETING="hello world" -DA=1`,
 			[]string{"-DGREETING=hello world", "-DA=1"}},
@@ -162,7 +140,6 @@ func TestSplitRspLine(t *testing.T) {
 			`"-DA=x y" "-DB=p q"`,
 			[]string{"-DA=x y", "-DB=p q"}},
 
-		// Quoting minutiae the drivers permit.
 		{"quote opens mid-token", `-DX="a b"c`, []string{"-DX=a bc"}},
 		{"empty quoted value still yields a token", `-DX=""`, []string{"-DX="}},
 		{"bare empty quotes yield an empty token", `""`, []string{""}},
@@ -177,9 +154,8 @@ func TestSplitRspLine(t *testing.T) {
 		{"windows-style path keeps its backslashes unquoted",
 			`-IC:\proj\inc`, []string{`-IC:\proj\inc`}},
 
-		// Malformed input must degrade, not crash: the compiler will
-		// reject a bad flag on its own terms, and erroring here would
-		// turn that into a nixgg failure.
+		// Malformed input must degrade, not crash: the compiler rejects a
+		// bad flag on its own terms.
 		{"unterminated double quote", `-DX="a b`, []string{"-DX=a b"}},
 		{"unterminated single quote", `-DX='a b`, []string{"-DX=a b"}},
 		{"lone quote", `"`, []string{""}},
@@ -193,9 +169,6 @@ func TestSplitRspLine(t *testing.T) {
 	}
 }
 
-// TestExpandRspfilesPreservesQuotedSpaces drives the whole path through a
-// real file on disk, since that is what a shim actually sees. The unit
-// test above pins the tokeniser; this pins that ExpandRspfiles uses it.
 func TestExpandRspfilesPreservesQuotedSpaces(t *testing.T) {
 	dir := t.TempDir()
 	rsp := filepath.Join(dir, "link.rsp")
@@ -211,9 +184,6 @@ func TestExpandRspfilesPreservesQuotedSpaces(t *testing.T) {
 	}
 }
 
-// TestExpandRspfilesLeavesNonFilesAlone pins the existing guard: plenty
-// of legitimate flags start with @, so an @arg that isn't a readable file
-// must pass through untouched.
 func TestExpandRspfilesLeavesNonFilesAlone(t *testing.T) {
 	in := []string{"cc", "@notafile", "-O2"}
 	got := ExpandRspfiles(in)

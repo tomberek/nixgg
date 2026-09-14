@@ -4,25 +4,17 @@
 # resulting binary actually runs — proving the member-propagation
 # mechanism in go/internal/shim/storeinput.go's classifyInputs +
 # go/internal/members works identically in both modes, not just in
-# the isolated Go unit tests (thinarchive_test.go).
+# the isolated Go unit tests.
 #
-# Mirrors tests/drv-equivalence.sh's own methodology (same shared
-# scaffolding in tests/lib/drv-equiv-common.sh, including
-# equiv_sandbox_drvs for the sandbox-side drv set — see its own
-# docstring for the mechanism) but for a fixture that has no
-# flake-input source (examples/thin-archive/src is a small in-tree
-# fixture, not a fetched tarball) — so native src resolution is done
-# directly here rather than through equiv_resolve_native_src's
-# flake-input branch.
+# Mirrors tests/drv-equivalence.sh's methodology (same shared
+# scaffolding in tests/lib/drv-equiv-common.sh) but for a fixture with
+# no flake-input source (examples/thin-archive/src is a small in-tree
+# fixture, not a fetched tarball), so native src resolution is done
+# directly here.
 #
-# Beyond the hash-set comparison, this script also realises the
-# sandbox build's own binary and runs it, and separately force-
-# realises the native build's binary and runs it — catching a bug
-# where both modes happen to agree on a drv hash but the underlying
-# mechanism is still wrong in a way that doesn't affect hashing (not
-# expected here, since the whole point of the Derivation struct is
-# that same struct -> same hash -> same script, but cheap insurance
-# given this is a newly-added Kind of dependency edge).
+# Beyond the hash-set comparison, this script also realises and runs
+# both builds' binaries directly, as cheap insurance against a bug
+# that doesn't affect the hash but does affect the mechanism.
 #
 # Env knobs: same as drv-equivalence.sh (ALT_STORE, PATCHED_NIX,
 # KEEP_STORE).
@@ -40,14 +32,12 @@ label="$attr"
 echo
 printf '\033[1;36m===== %s =====\033[0m\n' "$label"
 
-# -- 1. sandbox drvs --
 printf '==> sandbox: nix build .#%s (wrapper only) + derivation show -r\n' "$attr"
 sb_drvs=$(equiv_sandbox_drvs "$attr") || exit 1
 
-# -- 2. realise the sandbox build's own binary for the functional
-# check below. Same alt store equiv_sandbox_drvs just registered
-# into, so every drv it needs is already known — this only pays for
-# the actual TU/link builds, not re-registration.
+# Realise the sandbox build's own binary for the functional check
+# below. Same alt store equiv_sandbox_drvs just registered into, so
+# this only pays for the actual TU/link builds, not re-registration.
 sb_log="/tmp/nixgg-thin-archive-equiv-sandbox-realise.log"
 printf '==> sandbox: realising .#%s\n' "$attr"
 sb_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache --no-link \
@@ -58,21 +48,13 @@ sb_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache --no-link \
     exit 1
   }
 
-# -- 3. functional check: the sandbox binary actually runs --
-#
-# The binary's own content (its ELF interpreter reference, glibc
-# rpath, etc) always names the CANONICAL /nix/store/... path — the
-# alt store's `local?root=$ALT_STORE` prefix only changes where NIX
-# itself keeps things, not what path strings get baked into a build's
-# output. execve() resolves those embedded paths against the real
-# filesystem root, so exec'ing straight out of
-# "$ALT_STORE/nix/store/..." only works by coincidence (the real
-# /nix/store happens to already have the same paths cached from
-# unrelated Nix usage) — confirmed as a real, non-coincidental CI
-# failure ("cannot execute: required file not found") the first time
-# this ran on a fresh runner with no such cache. `nix copy` the
-# binary's own closure into the real (daemon) store first, same fix
-# already needed for examples/qemu's own end-to-end run.
+# The binary's own content (ELF interpreter reference, glibc rpath,
+# etc) always names the CANONICAL /nix/store/... path — execve()
+# resolves those against the real filesystem root, so exec'ing
+# straight out of "$ALT_STORE/nix/store/..." only works by coincidence
+# (confirmed as a real CI failure on a fresh runner with no such
+# cache). `nix copy` the binary's closure into the real (daemon) store
+# first.
 printf '==> functional: running sandbox-built binary\n'
 "$PATCHED_NIX/bin/nix" copy --from "local?root=$ALT_STORE" --to daemon \
   --no-check-sigs "$sb_out" >>"$sb_log" 2>&1 || {
@@ -92,7 +74,6 @@ if [[ "$sb_run_out" != "thin-archive: ok" ]]; then
 fi
 printf '\033[1;32mOK\033[0m       sandbox binary runs: %s\n' "$sb_run_out"
 
-# -- 4. native build --
 workdir="$(mktemp -d)"
 cp -a "$nixgg_root/examples/thin-archive/src"/. "$workdir/"
 chmod -R u+w "$workdir"
@@ -115,7 +96,6 @@ printf '==> native: nix develop .#%s-shell in %s\n' "$attr" "$workdir"
   exit 1
 }
 
-# -- 5. functional check: the native binary actually runs --
 printf '==> functional: running native-built binary\n'
 if [[ ! -x "$workdir/thin-archive" ]]; then
   echo "native binary missing or not executable: $workdir/thin-archive" >&2
@@ -130,7 +110,6 @@ if [[ "$nt_run_out" != "thin-archive: ok" ]]; then
 fi
 printf '\033[1;32mOK\033[0m       native binary runs: %s\n' "$nt_run_out"
 
-# -- 6. compare drv sets --
 thunk_files=$(equiv_collect_thunks "$workdir")
 if [[ -z "$thunk_files" ]]; then
   echo "native build produced no thunks; see $nt_log" >&2

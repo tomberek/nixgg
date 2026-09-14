@@ -35,11 +35,7 @@ func TestBuildReferencesEachStubOnce(t *testing.T) {
 		}
 	}
 
-	// Args must be a short, fixed string regardless of stub count — see
-	// Build's own docstring for why (the kernel's ARG_MAX, confirmed
-	// directly against openssl's 2230-stub build). The actual script
-	// content lives in Env["buildScript"], staged to a file at build
-	// time via passAsFile.
+	// Args stays a short fixed string (see Build's docstring re ARG_MAX); the real content is passAsFile'd here.
 	if len(drv.Args) != 2 || drv.Args[0] != "-c" {
 		t.Fatalf("Args = %v, want [\"-c\", ...]", drv.Args)
 	}
@@ -48,9 +44,6 @@ func TestBuildReferencesEachStubOnce(t *testing.T) {
 	}
 
 	script := drv.Env["buildScript"]
-	// .o artifacts stay flat inside their producing drv's $out
-	// (expr.ArtifactSubdir's documented rule) — the cp source must NOT
-	// insert a bin/ or lib/ segment for the compile-drv case.
 	if !strings.Contains(script, `"$out/src/hello.o"`) {
 		t.Errorf("script missing copy destination for src/hello.o:\n%s", script)
 	}
@@ -60,10 +53,7 @@ func TestBuildReferencesEachStubOnce(t *testing.T) {
 	if !strings.Contains(script, `"$out/lib/libfoo.a"`) {
 		t.Errorf("script missing copy destination for lib/libfoo.a:\n%s", script)
 	}
-	// The archive stub's producing drv places its OWN artifact under
-	// lib/ (expr.ArtifactSubdir(".a") == "lib") regardless of the
-	// stub's own RelPath — confirms the source side reads the
-	// PRODUCING drv's layout, not the caller's.
+	// Confirms the source side reads the PRODUCING drv's ArtifactSubdir layout, not the stub's own RelPath.
 	if !strings.Contains(script, "/lib/libfoo.a") {
 		t.Errorf("script's archive source should read from the producing drv's lib/ subdir:\n%s", script)
 	}
@@ -85,9 +75,6 @@ func TestBuildRestoresTreeBeforeOverlayingStubs(t *testing.T) {
 }
 
 func TestBuildDedupesRepeatedStubDrv(t *testing.T) {
-	// Two stubs from the SAME drv (e.g. a link drv whose "out" produced
-	// both a binary and a matching debug symlink some build systems
-	// leave behind) must not appear twice in inputs.drvs.
 	drv := Build(BuildParams{
 		Name:      "gg-tree-hello",
 		System:    "x86_64-linux",
@@ -104,11 +91,7 @@ func TestBuildDedupesRepeatedStubDrv(t *testing.T) {
 	}
 }
 
-// TestBuildArgsStaySmallAtScale pins the actual fix for openssl's
-// "Argument list too long" failure: with enough stubs, Args must stay
-// a short, fixed string — the real script content has to move to
-// Env["buildScript"] (passAsFile), never grow Args itself, no matter
-// how many stubs there are.
+// Pins the openssl "Argument list too long" fix: Args must stay short and fixed regardless of stub count.
 func TestBuildArgsStaySmallAtScale(t *testing.T) {
 	stubs := make([]Stub, 2230) // openssl's real count when this broke
 	for i := range stubs {

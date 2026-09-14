@@ -23,12 +23,10 @@ func thinTestLayout(t *testing.T) paths.Layout {
 }
 
 // TestClassifyInputsExpandsSandboxThinArchive pins the sandbox-mode
-// case this whole mechanism exists for: a link argv naming ONE thin
-// archive (a drvref stub, same as any other sandbox-mode archive
-// input) must pull in every one of that archive's OWN recorded
-// members as additional direct inputs — not just the archive's own
-// single drv reference, which is all a NORMAL (non-thin) archive ever
-// needs.
+// case this mechanism exists for: a link argv naming one thin archive
+// must pull in every one of that archive's own recorded members as
+// additional direct inputs, not just the archive's own single drv
+// reference.
 func TestClassifyInputsExpandsSandboxThinArchive(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -84,8 +82,8 @@ func TestClassifyInputsExpandsSandboxThinArchive(t *testing.T) {
 }
 
 // TestClassifyInputsExpandsNativeThinArchive is the native-mode analog:
-// a Thunk-classified archive input (a symlink to an unbuilt .nix
-// thunk) must pull in its own recorded members too.
+// a Thunk-classified archive input must pull in its own recorded
+// members too.
 func TestClassifyInputsExpandsNativeThinArchive(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -132,13 +130,10 @@ func TestClassifyInputsExpandsNativeThinArchive(t *testing.T) {
 	}
 }
 
-// TestClassifyInputsThinArchiveDedup pins the landmine the design doc
-// calls out explicitly: the SAME member reachable through two
-// different thin archives on one link line must appear exactly once
-// in the result, in BOTH the native and sandbox slice — native mode's
-// own serializer has no dedup of its own, so an undeduplicated
-// classifyInputs result would make native and sandbox mode's
-// rendered scripts diverge for the same logical input set.
+// TestClassifyInputsThinArchiveDedup pins that the same member reachable
+// through two different thin archives on one link line must appear
+// exactly once, in both the native and sandbox slice — native mode's
+// own serializer has no dedup of its own.
 func TestClassifyInputsThinArchiveDedup(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -174,7 +169,6 @@ func TestClassifyInputsThinArchiveDedup(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("classifyInputs failed: ok=%v err=%v", ok, err)
 	}
-	// The 2 archives are primary inputs; the shared member is dependency-only.
 	if len(ci.JSON) != 2 {
 		t.Fatalf("got %d primary jsonInputs, want 2 (the 2 archives): %+v", len(ci.JSON), ci.JSON)
 	}
@@ -187,11 +181,9 @@ func TestClassifyInputsThinArchiveDedup(t *testing.T) {
 }
 
 // TestClassifyInputsThinArchiveRecursion pins that a thin archive
-// consumed by ANOTHER thin archive expands transitively — necessary
-// for correctness in general (nothing in this codebase currently
-// constructs this shape; archive.go's own parseARArgs only accepts
-// .o members today), verified here with a synthetic 3-level chain
-// since no real fixture exercises depth > 1.
+// consumed by another thin archive expands transitively, verified here
+// with a synthetic 3-level chain since no real fixture exercises depth
+// > 1.
 func TestClassifyInputsThinArchiveRecursion(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -199,14 +191,11 @@ func TestClassifyInputsThinArchiveRecursion(t *testing.T) {
 	innerArchiveDrv := "/nix/store/" + strings.Repeat("3", 32) + "-ar-libinner.a.drv"
 	outerArchiveDrv := "/nix/store/" + strings.Repeat("4", 32) + "-ar-libouter.a.drv"
 
-	// libinner.a's own sidecar: just the one real member.
 	if _, err := members.Write(l, expr.StoreBasename(innerArchiveDrv), []members.Record{
 		{Kind: "drv", Ref: innerMember, Name: "inner.c.o"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// libouter.a's own sidecar: references libinner.a's own drv (as if
-	// it were consumed as one of libouter's members).
 	if _, err := members.Write(l, expr.StoreBasename(outerArchiveDrv), []members.Record{
 		{Kind: "drv", Ref: innerArchiveDrv, Name: "libinner.a"},
 	}); err != nil {
@@ -226,9 +215,6 @@ func TestClassifyInputsThinArchiveRecursion(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("classifyInputs failed: ok=%v err=%v", ok, err)
 	}
-	// libouter.a itself is the only primary input; libinner.a's own drv
-	// ref (recorded as libouter's member) and libinner.a's OWN member,
-	// pulled in transitively, are both dependency-only.
 	if len(ci.JSON) != 1 || ci.JSON[0].Ref != outerArchiveDrv {
 		t.Fatalf("primary jsonInputs = %+v, want exactly [outerArchiveDrv]", ci.JSON)
 	}
@@ -250,10 +236,9 @@ func TestClassifyInputsThinArchiveRecursion(t *testing.T) {
 }
 
 // TestClassifyInputsNonThinArchiveUnaffected pins that an ordinary
-// (non-thin) archive — every archive every existing fixture builds —
-// is completely untouched by this mechanism: no sidecar was ever
-// written for it, so the members.Read lookup is a guaranteed miss,
-// and classifyInputs' output is identical to what it always was.
+// (non-thin) archive is completely untouched by this mechanism: no
+// sidecar was ever written for it, so the members.Read lookup is a
+// guaranteed miss.
 func TestClassifyInputsNonThinArchiveUnaffected(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -283,19 +268,17 @@ func TestClassifyInputsNonThinArchiveUnaffected(t *testing.T) {
 }
 
 // TestClassifyInputsPreservesRepeatedPrimaryInput is a regression test
-// for a real bug found against a real LLVM build: CMake's own
-// generated link line for llvm-min-tblgen lists `libLLVMSupport.a
-// libLLVMTableGen.a libLLVMSupport.a` — Support repeated AFTER
-// TableGen, which is CMake's OWN fix for plain `ld`'s left-to-right,
-// no-`--start-group` archive resolution (TableGen's objects need
-// symbols FROM Support, so Support must be scanned again after it).
-// classifyInputs used to deduplicate the PRIMARY input list the same
-// way it (correctly) dedupes the EXTRA (thin-archive-member) list,
-// silently dropping the second occurrence — the link then failed with
-// "undefined reference to llvm::FoldingSetBase::..." because ld never
-// got a second pass at Support's own symbols. Confirmed directly:
-// building the real llvm-min-tblgen fixture reproduced this exact
-// failure before the fix (appendLinkNoDedup/appendJSONNoDedup) landed.
+// for a real bug found against a real LLVM build: CMake's own generated
+// link line for llvm-min-tblgen lists `libLLVMSupport.a
+// libLLVMTableGen.a libLLVMSupport.a` — Support repeated after
+// TableGen, CMake's own fix for plain `ld`'s left-to-right,
+// no-`--start-group` archive resolution. classifyInputs used to
+// deduplicate the primary input list the same way it (correctly)
+// dedupes the extra (thin-archive-member) list, silently dropping the
+// second occurrence — the link then failed with "undefined reference
+// to llvm::FoldingSetBase::..." because ld never got a second pass at
+// Support's own symbols. Confirmed directly against the real
+// llvm-min-tblgen fixture.
 func TestClassifyInputsPreservesRepeatedPrimaryInput(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -312,8 +295,6 @@ func TestClassifyInputsPreservesRepeatedPrimaryInput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Same shape as CMake's own LINK_LIBRARIES: Support, TableGen,
-	// Support again.
 	ci, err, ok := classifyInputs(&toolchain.Config{}, []string{supportPath, tablegenPath, supportPath}, "", l, "link", func() error {
 		t.Fatal("should not passthrough")
 		return nil
@@ -332,18 +313,11 @@ func TestClassifyInputsPreservesRepeatedPrimaryInput(t *testing.T) {
 
 // TestClassifyInputsNestedArchiveMember pins the shape Kbuild's own
 // recursive built-in.a construction needs: `ar rcs parent/built-in.a
-// a.o b.o child/built-in.a` — a PARENT archive whose member list
-// includes a CHILD directory's own built-in.a, not just object files.
-//
-// classifyInputs already dispatches purely on classify.Target's Kind,
-// never on file extension (see classifyInputs' own switch), so a .a
-// member classified as Drv (sandbox mode: a sibling archive's own
-// drvref stub) is handled identically to a .o member classified as
-// Drv — becomes one ordinary primary JSON input, referencing the
-// child archive's own drv. archive.go's parseARArgs is what used to
-// reject this shape outright (every input had to end in .o); this
-// test exercises classifyInputs the same way archive.go's own Archive
-// function does once parseARArgs accepts the .a member.
+// a.o b.o child/built-in.a` — a parent archive whose member list
+// includes a child directory's own built-in.a, not just object files.
+// classifyInputs dispatches purely on classify.Target's Kind, never on
+// file extension, so a .a member classified as Drv is handled
+// identically to a .o member classified as Drv.
 func TestClassifyInputsNestedArchiveMember(t *testing.T) {
 	l := thinTestLayout(t)
 
@@ -358,12 +332,9 @@ func TestClassifyInputsNestedArchiveMember(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// a.o resolves as Regular here (it's a plain on-disk file, not one
-	// of nixgg's own artifacts) — classifyInputs would passthrough on
-	// it. This test only needs to prove the .a member's OWN
-	// classification path works, so pass just the archive member,
-	// mirroring how the other thin-archive tests in this file isolate
-	// a single input.
+	// Only the archive member is passed; a.o would resolve as Regular
+	// (a plain on-disk file) and passthrough, which this test isn't
+	// exercising.
 	ci, err, ok := classifyInputs(&toolchain.Config{}, []string{childArchivePath}, "", l, "ar", func() error {
 		t.Fatal("should not passthrough — the nested archive resolves to one of our own drvref stubs")
 		return nil

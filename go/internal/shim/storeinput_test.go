@@ -7,9 +7,7 @@ import (
 
 // TestParseTargetMapDispatch pins that a plain single-target string
 // (splitStdenv's "/nonexistent/..." sentinel, or a bare target name)
-// is never mistaken for the JSON-map format, and vice versa — this
-// is the whole dispatch mechanism maybeSubmit/targetOutputKey rest
-// on, with no separate env var to say which shape is in play.
+// is never mistaken for the JSON-map format, and vice versa.
 func TestParseTargetMapDispatch(t *testing.T) {
 	if got := parseTargetMap("/nonexistent/nixgg-phase1-no-per-artifact-submit"); got != nil {
 		t.Errorf("plain sentinel string parsed as a JSON map: %v", got)
@@ -30,10 +28,6 @@ func TestParseTargetMapDispatch(t *testing.T) {
 	}
 }
 
-// TestTargetOutputKeySingleTarget pins that today's single-target
-// shape (plain string, matched via matchesTarget) always resolves to
-// "out" on a match — mkNixggBuild's existing single-target builds,
-// and any caller of the old convention, must keep working unchanged.
 func TestTargetOutputKeySingleTarget(t *testing.T) {
 	t.Setenv("NIXGG_SANDBOX_TARGET", "mosh-server")
 	if got := targetOutputKey("mosh-server"); got != "out" {
@@ -45,10 +39,8 @@ func TestTargetOutputKeySingleTarget(t *testing.T) {
 }
 
 // TestTargetOutputKeyMultiTarget pins the JSON-map format's own
-// lookup: each pattern is matched the same way a plain string would
-// be (matchesTarget's basename/relative/absolute rules), and the
-// FIRST match's value is the real output key to report — "out" is
-// never implied here, only whatever the map says.
+// lookup: each pattern is matched via matchesTarget, and the first
+// match's value is the real output key to report.
 func TestTargetOutputKeyMultiTarget(t *testing.T) {
 	t.Setenv("NIXGG_SANDBOX_TARGET", `{"mosh-server":"mosh-server.drv","mosh-client":"mosh-client.drv"}`)
 	if got := targetOutputKey("mosh-server"); got != "mosh-server.drv" {
@@ -62,10 +54,6 @@ func TestTargetOutputKeyMultiTarget(t *testing.T) {
 	}
 }
 
-// TestTargetOutputKeyUnset pins that no NIXGG_SANDBOX_TARGET at all
-// (native mode outside a shell replay, or any caller that never set
-// it) never matches anything — maybeSubmit's own defaultSubmit param
-// is what decides submission in that case, not this function.
 func TestTargetOutputKeyUnset(t *testing.T) {
 	os.Unsetenv("NIXGG_SANDBOX_TARGET")
 	if got := targetOutputKey("anything"); got != "" {
@@ -74,11 +62,10 @@ func TestTargetOutputKeyUnset(t *testing.T) {
 }
 
 // TestMultiTargetNameFormula pins the actual naming contract
-// submit-output enforces: outputPathName($name, key) == the
-// submitted drv's own real name (drvName + "-" + key stripped of its
-// own ".drv" suffix, since `nix derivation add` appends its OWN
-// separate ".drv"). Confirmed directly against a real builder-rpc-v0
-// sandbox before writing this — see multiTargetName's own docstring.
+// submit-output enforces: outputPathName($name, key) == the submitted
+// drv's own real name. Confirmed directly against a real
+// builder-rpc-v0 sandbox before writing this — see multiTargetName's
+// own docstring.
 func TestMultiTargetNameFormula(t *testing.T) {
 	t.Setenv("name", "nixgg-mosh")
 	t.Setenv("NIXGG_SANDBOX_TARGET", `{"mosh-server":"mosh-server.drv","mosh-client":"mosh-client.drv"}`)
@@ -92,11 +79,9 @@ func TestMultiTargetNameFormula(t *testing.T) {
 }
 
 // TestMultiTargetNameNoOverride pins that multiTargetName returns ""
-// — meaning "use the caller's own default bin-/ar- naming, no
-// override" — for every case that ISN'T a matched non-"out" multi-
-// target key: no env var set, a single-target "out" match, and a
-// path that doesn't match any declared target at all (e.g. one of a
-// multi-target build's own shared intermediate archives).
+// for every case that isn't a matched non-"out" multi-target key: no
+// env var set, a single-target "out" match, and a path that doesn't
+// match any declared target.
 func TestMultiTargetNameNoOverride(t *testing.T) {
 	t.Setenv("name", "nixgg-mosh")
 
