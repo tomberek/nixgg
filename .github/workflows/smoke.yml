@@ -29,6 +29,11 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v22
 
+      - uses: cachix/cachix-action@v15
+        with:
+          name: nixgg
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go/go.mod
@@ -111,6 +116,11 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v22
 
+      - uses: cachix/cachix-action@v15
+        with:
+          name: nixgg
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
       - name: Build patched-nix
         run: nix build --no-eval-cache --accept-flake-config .#patched-nix -o .patched-nix
 
@@ -136,6 +146,11 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - uses: DeterminateSystems/nix-installer-action@v22
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: nixgg
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
       - name: Build patched-nix
         run: nix build --no-eval-cache --accept-flake-config .#patched-nix -o .patched-nix
@@ -164,6 +179,11 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - uses: DeterminateSystems/nix-installer-action@v22
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: nixgg
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
 
       - name: Build patched-nix
         run: nix build --no-eval-cache --accept-flake-config .#patched-nix -o .patched-nix
