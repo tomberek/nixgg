@@ -32,6 +32,11 @@ const (
 	// ToolObjcopy: a generic object rewrite (symbol prefixing, section
 	// stripping — scripts/Makefile.lib's cmd_objcopy).
 	ToolObjcopy
+	// ToolRustc: a rustc crate compile. Unlike the C compilers, one
+	// invocation consumes a whole crate — a source file plus every
+	// module, `include!` and macro file it reaches — and may emit
+	// several artifacts from it.
+	ToolRustc
 )
 
 // Basename returns the argv[0] name we advertise to the sandbox.
@@ -57,6 +62,8 @@ func (t Tool) Basename() string {
 		return "objtool"
 	case ToolObjcopy:
 		return "objcopy"
+	case ToolRustc:
+		return "rustc"
 	}
 	return ""
 }
@@ -121,6 +128,8 @@ func FromArgv0(argv0 string) Tool {
 		return ToolObjtool
 	case "objcopy":
 		return ToolObjcopy
+	case "rustc":
+		return ToolRustc
 	}
 	return ToolUnknown
 }
@@ -160,6 +169,25 @@ func IsCompile(argv []string) bool {
 //
 // If no @-file is present the input is returned unchanged (no copy).
 func ExpandRspfiles(argv []string) []string {
+	return expandArgfiles(argv, splitRspLine)
+}
+
+// ExpandRustArgfiles is ExpandRspfiles for rustc, whose @-file format is
+// NOT the compiler-driver one: each LINE is exactly one argument, taken
+// verbatim, with no quote processing at all.
+//
+// The difference is not cosmetic. A kernel's generated cfg file holds
+// lines like `--cfg=CONFIG_RTC_DRV_CROS_EC="m"`, and rustc REQUIRES
+// those quotes — `--cfg key="value"` is its grammar. Tokenising the
+// line the compiler-driver way strips them and rustc rejects the
+// result outright ("invalid `--cfg` argument"). In the other
+// direction, a value containing spaces (legal on one line here) would
+// be split into several arguments by splitRspLine.
+func ExpandRustArgfiles(argv []string) []string {
+	return expandArgfiles(argv, func(line string) []string { return []string{line} })
+}
+
+func expandArgfiles(argv []string, split func(string) []string) []string {
 	// Fast path: no @-arg → no allocation.
 	hasRsp := false
 	for _, a := range argv {
@@ -179,7 +207,7 @@ func ExpandRspfiles(argv []string) []string {
 	out := make([]string, 0, len(argv))
 	for _, a := range argv {
 		if len(a) > 1 && a[0] == '@' {
-			if body, err := readRspfile(a[1:]); err == nil {
+			if body, err := readArgfile(a[1:], split); err == nil {
 				out = append(out, body...)
 				continue
 			}
@@ -189,7 +217,7 @@ func ExpandRspfiles(argv []string) []string {
 	return out
 }
 
-func readRspfile(path string) ([]string, error) {
+func readArgfile(path string, split func(string) []string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -199,7 +227,7 @@ func readRspfile(path string) ([]string, error) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
-		out = append(out, splitRspLine(sc.Text())...)
+		out = append(out, split(sc.Text())...)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err

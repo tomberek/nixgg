@@ -49,6 +49,11 @@ func Objcopy(args []string, cfg *toolchain.Config, l paths.Layout) error {
 		return Passthrough(real, args)
 	}
 
+	if carvedOut(output) {
+		logf("objcopy passthrough: %s is in a carved-out subtree", output)
+		return Passthrough(real, args)
+	}
+
 	logf("objcopy %s <- %s", output, filepath.Base(input))
 
 	outName := filepath.Base(output)

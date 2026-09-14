@@ -10,6 +10,7 @@ import (
 	"github.com/tbereknyei/nixgg/internal/classify"
 	"github.com/tbereknyei/nixgg/internal/expr"
 	"github.com/tbereknyei/nixgg/internal/members"
+	"github.com/tbereknyei/nixgg/internal/mode"
 	"github.com/tbereknyei/nixgg/internal/paths"
 	"github.com/tbereknyei/nixgg/internal/sandbox"
 	"github.com/tbereknyei/nixgg/internal/toolchain"
@@ -282,4 +283,37 @@ func multiTargetName(path string) string {
 		return ""
 	}
 	return os.Getenv("name") + "-" + strings.TrimSuffix(key, ".drv")
+}
+
+// storeAddLooseFile puts a plain, real file (not one of nixgg's own
+// staged trees) into the store so a derivation can depend on it — a
+// crate this shim didn't produce, or a rustc flag naming a file the
+// compile reads directly (its FILENAME has to survive; see
+// shim.storeFlagFiles).
+func storeAddLooseFile(cfg *toolchain.Config, path string) (string, error) {
+	base := filepath.Base(path)
+	tmp, err := os.MkdirTemp(os.Getenv("NIX_BUILD_TOP"), "gg-loose-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(tmp, base), src, 0o444); err != nil {
+		return "", err
+	}
+	return sandbox.StoreAddScan(cfg, base, tmp)
+}
+
+// carvedOut reports whether path falls in a caller-declared
+// passthrough subtree (mode.go's own NIXGG_PASSTHROUGH_PATHS). A
+// declared subtree means "model nothing here", so every shim that
+// produces an artifact there — not just Compile, which mode.For's own
+// doc covers — has to honour it directly rather than inherit it from
+// its inputs.
+func carvedOut(path string) bool {
+	return mode.For(path) == mode.Passthrough
 }

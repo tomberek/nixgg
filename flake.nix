@@ -181,8 +181,9 @@
               # objtool/objcopy aren't compilers: they're per-object
               # rewriters, reached only when a caller points the build's
               # own tool variable (objtool=, OBJCOPY=) here — nothing
-              # resolves them via PATH otherwise.
-              for t in ar c++ cc g++ gcc ranlib clang clang++ ld ld.bfd ld.gold ld.lld objtool objcopy; do
+              # resolves them via PATH otherwise. rustc IS reached via
+              # PATH (Kbuild's RUSTC default is a bare "rustc").
+              for t in ar c++ cc g++ gcc ranlib clang clang++ ld ld.bfd ld.gold ld.lld objtool objcopy rustc; do
                 ln -s ../bin/nixgg $out/shims/$t
               done
               for t in gcc g++ cc c++ ar ranlib ld; do
@@ -579,6 +580,17 @@
             thin-archive = {
               dir = ./examples/thin-archive;
               args = { inherit (pkgs) lib; };
+            };
+            # Two Rust crates built by make and bare rustc — the shape
+            # Kbuild uses, and the only one the rustc shim models. See
+            # its own docstring for what it covers that nothing else
+            # does.
+            rustc = {
+              dir = ./examples/rustc;
+              args = {
+                inherit (pkgs) rustc;
+                src = ./examples/rustc;
+              };
             };
             llvm = {
               dir = ./examples/llvm;

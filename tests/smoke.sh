@@ -53,6 +53,7 @@ QUICK=(
   "gcc|lib/libiberty.a|-"
   "mosh|bin/mosh-server|%s --version"
   "thin-archive|bin/thin-archive|%s"
+  "rustc|lib/libapp.a|-"
 )
 SLOW=(
   "redis|bin/redis-server|%s --version"

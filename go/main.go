@@ -42,9 +42,15 @@ func run() error {
 		return err
 	}
 
-	// Expand @rspfiles once at the top so every downstream parser sees
-	// the flattened form.
-	args := dispatch.ExpandRspfiles(os.Args[1:])
+	// Expand @argfiles once at the top so every downstream parser sees
+	// the flattened form. rustc's file format differs from the
+	// compiler drivers' — see dispatch.ExpandRustArgfiles.
+	var args []string
+	if tool == dispatch.ToolRustc {
+		args = dispatch.ExpandRustArgfiles(os.Args[1:])
+	} else {
+		args = dispatch.ExpandRspfiles(os.Args[1:])
+	}
 
 	switch tool {
 	case dispatch.ToolAR:
@@ -55,6 +61,8 @@ func run() error {
 		return shim.Objtool(args, cfg, l)
 	case dispatch.ToolObjcopy:
 		return shim.Objcopy(args, cfg, l)
+	case dispatch.ToolRustc:
+		return shim.Rustc(args, cfg, l)
 	case dispatch.ToolRanlib:
 		// Our archives are already indexed (ar handles `s` in the
 		// sandbox), so ranlib on them is a no-op.

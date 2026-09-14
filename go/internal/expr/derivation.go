@@ -30,6 +30,13 @@ const (
 	// that produced the object so the compile stays cacheable
 	// independently of the transform's own flags.
 	KindTransform
+	// KindRustc: one rustc crate compile. Sandbox mode only. Unlike
+	// KindCompile this isn't one source in, one object out: a crate
+	// is a whole source tree, and one invocation can emit several
+	// artifacts from it (an object, the .rmeta dependents resolve
+	// `--extern` against) — they share a derivation because rustc
+	// produces them from one front-end run.
+	KindRustc
 )
 
 // Derivation is the intermediate representation both serializers
@@ -61,12 +68,23 @@ type Derivation struct {
 	// itself (see shim.storeAddTool).
 	ToolBin string
 
+	// Rustc-only: absolute /nix/store/…/bin/rustc. Not taken from
+	// PATH like the compiler — a Rust build pins its toolchain, and a
+	// crate compiled by a different rustc can't be loaded by one that
+	// wasn't (rustc rejects mismatched metadata).
+	RustcBin string
+
 	// Transform-only: does the tool rewrite its operand in place
 	// (objtool: one operand) or read one file and write another
 	// (objcopy: `objcopy <flags> <in> <out>`)? In-place needs the
 	// input copied out of its read-only store path first; in/out does
 	// not.
 	ToolInPlace bool
+
+	// Rustc-only: the artifacts this invocation emits, in the
+	// caller's order. Each becomes an `--emit=<kind>=$out/<name>`
+	// argument.
+	Emits []RustEmit
 
 	Tool     string // "cc", "gcc", "c++", "g++"; used by Compile + Link
 	SrcStore string // staged src tree
@@ -144,6 +162,13 @@ type Derivation struct {
 	WrapperEnv map[string]string
 }
 
+// RustEmit is one `--emit=<kind>=$out/<name>` a KindRustc derivation
+// writes.
+type RustEmit struct {
+	Kind string
+	Name string
+}
+
 // derivInput is the internal per-input record used by Derivation's
 // serializers, kept separate from the shim-facing Input type in
 // expr.go. inputsFromExpr / inputsFromJSON convert between them.
@@ -161,6 +186,10 @@ type derivInput struct {
 	// producing derivation puts its artifact under one — see
 	// inputSubdirFor.
 	Name string
+	// Crate: KindRustc only. The name the consuming crate refers to
+	// this dependency by, not derivable from the filename — a crate's
+	// lib name and its `--crate-name` need not match.
+	Crate string
 }
 
 // inputSubdirFor returns the FHS subdirectory a sibling derivation's
@@ -207,6 +236,12 @@ func ArtifactSubdir(name string) string {
 		return ""
 	case strings.HasSuffix(base, ".a"):
 		return "lib"
+	case strings.HasSuffix(base, ".rmeta"), strings.HasSuffix(base, ".rlib"):
+		// Rust artifacts stay flat for the same reason .o does: a
+		// crate's metadata is an intermediate only the next rustc
+		// reads, not something buildEnv or `nix profile install`
+		// looks for.
+		return ""
 	}
 	return "bin"
 }
@@ -438,6 +473,71 @@ export PATH="%s/bin"
 mkdir -p "%s"
 "%s" %s -o "%s" %s
 `, d.Coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), d.outPath(), inputs())
+	case KindRustc:
+		// One front-end run, several artifacts. `--out-dir` is set even
+		// though every emit is named explicitly: rustc drops temporaries
+		// in the CURRENT directory otherwise, and the current directory
+		// here is the read-only staged source tree.
+		//
+		// Every input contributes a `-L` search path, and those the
+		// caller named also get an explicit `--extern <crate>=<path>`
+		// — the explicit extern is what turns a filesystem search into
+		// a derivation input (the caller's bare `--extern <crate>`
+		// searches `-L` dirs that are the build tree, absent in the
+		// sandbox). The search paths alone cover the crates the caller
+		// never named: a crate's own dependencies travel in its
+		// metadata, not the command line, so a kernel driver naming two
+		// externs can still need rustc to load ten crates through -L.
+		var parts []string
+		seenDir := map[string]bool{}
+		for _, in := range d.Inputs {
+			ref := in.Ref
+			name := in.Name
+			dir := ref
+			if in.InputKind == "store" {
+				if !strings.HasPrefix(ref, "/nix/store/") {
+					ref = "/nix/store/" + ref
+					dir = ref
+				}
+			} else {
+				ref = caOutputPlaceholder(in.Ref, "out")
+				dir = ref
+				// Only a sibling drv places its artifact under an FHS
+				// subdir; a store input sits flat. Applying the subdir
+				// to both would send the search path into a bin/ that
+				// doesn't exist.
+				if sub := inputSubdirFor(in.Name); sub != "" {
+					name = sub + "/" + name
+					dir = ref + "/" + sub
+				}
+			}
+			// Plain `-L`, not `-L dependency=`: the narrower kind only
+			// joins the search for a crate's own dependencies, and
+			// rustc looks for `core` (which a kernel compiles itself
+			// and passes here like any other crate) in the
+			// unrestricted path — `dependency=` dies on "can't find
+			// crate for `core`".
+			if !seenDir[dir] {
+				seenDir[dir] = true
+				parts = append(parts, fmt.Sprintf("-L '%s'", dir))
+			}
+			if in.Crate != "" {
+				parts = append(parts, fmt.Sprintf("--extern '%s=%s/%s'", in.Crate, ref, name))
+			}
+		}
+		for _, e := range d.Emits {
+			// Double quotes, not single: $out has to expand. Safe
+			// because both fields are a rustc emit kind and a basename
+			// this shim chose, never caller text.
+			parts = append(parts, fmt.Sprintf(`"--emit=%s=$out/%s"`, e.Kind, e.Name))
+		}
+		return fmt.Sprintf(
+			`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "$out"
+cd "$src"
+"%s" %s %s --out-dir "$out" "$source"
+`, d.Coreutils, d.RustcBin, shellQuoteFlags(d.Flags), strings.Join(parts, " "))
 	case KindTransform:
 		// PATH carries coreutils only — no compiler involved, and the
 		// transform binary is invoked by absolute path.
@@ -680,6 +780,11 @@ func (d *Derivation) envDict() map[string]string {
 		env["src"] = d.SrcStore
 		env["source"] = d.Source
 		env["outName"] = d.OutName
+	case d.Kind == KindRustc:
+		// Same staged-tree slot as Compile, minus outName: a crate's
+		// artifacts are named by the --emit flags, not one output.
+		env["src"] = d.SrcStore
+		env["source"] = d.Source
 	case d.Kind == KindLink && d.InlineFilesStore != "":
 		env["src"] = d.InlineFilesStore
 	}

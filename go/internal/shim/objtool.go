@@ -62,6 +62,11 @@ func Objtool(args []string, cfg *toolchain.Config, l paths.Layout) error {
 		return Passthrough(objtoolFallback(real), args)
 	}
 
+	if carvedOut(object) {
+		logf("objtool passthrough: %s is in a carved-out subtree", object)
+		return Passthrough(objtoolFallback(real), args)
+	}
+
 	logf("objtool %s", object)
 
 	toolStore, err := storeAddTool(cfg, "objtool", real)

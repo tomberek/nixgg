@@ -20,11 +20,20 @@ type Mode int
 const (
 	Placeholder Mode = iota
 	Realise
+	// Passthrough: run the real tool in the build tree and model
+	// nothing. Different reason from Realise — this is for a compile
+	// the build EXPECTS TO FAIL (the artifact is the compiler's
+	// stderr, not the object), where accelerating it is actively wrong:
+	// a failing derivation fails the whole build, but the caller was
+	// going to inspect the error and carry on.
+	Passthrough
 )
 
 // For returns the mode for a compile source/output path.
 //
-// Placeholder unless the path matches a known conftest/probe pattern:
+// Placeholder unless the path matches:
+//   - a caller-declared passthrough subtree (NIXGG_PASSTHROUGH_PATHS,
+//     see passthrough.go) — project-specific, not compiled in
 //   - autoconf conftests (basename starts with "conftest")
 //   - cmake compiler-detection files (test?Compiler…, CheckXXX…)
 //   - cmake TryCompile scratch (path contains CMakeFiles/CMake{Scratch,Tmp})
@@ -36,7 +45,11 @@ const (
 // mode.Realise's `nix build --file` doesn't work in sandbox mode (the
 // builder-rpc-v0 protocol has no "build now" op, only "register for
 // later"), and these probes have no headers worth CA-hashing, so
-// Passthrough loses nothing by skipping nixgg's graph for them.
+// Passthrough loses nothing by skipping nixgg's graph for them. Those
+// stay compiled in rather than moving to NIXGG_PASSTHROUGH_PATHS
+// because they're build-system CONVENTION (autoconf/cmake probe
+// naming), identical across every project that uses the tool — unlike
+// NIXGG_PASSTHROUGH_PATHS, which names a PROJECT's own layout.
 //
 // Not consulted by the link or archive shims (see ForLink for the one
 // exception): configure-time try_run/AC_RUN_IFELSE links happen under
@@ -47,6 +60,8 @@ const (
 func For(path string) Mode {
 	base := filepath.Base(path)
 	switch {
+	case matchesPassthrough(path):
+		return Passthrough
 	case strings.HasPrefix(base, "conftest"):
 		return Realise
 	case matchCMakeProbe(base):

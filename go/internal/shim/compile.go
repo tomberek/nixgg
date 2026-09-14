@@ -79,6 +79,17 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		output = defaultOutputName(source, flags)
 	}
 
+	// A caller-declared subtree (NIXGG_PASSTHROUGH_PATHS) that reads
+	// object bytes inline or expects the compile to fail — checked
+	// before the scan so header discovery isn't paid for and thrown
+	// away. Keyed on the output as well as the source: a declared
+	// subtree is about where the object LANDS, and a build may compile
+	// a source from elsewhere into it.
+	if mode.For(source) == mode.Passthrough || mode.For(output) == mode.Passthrough {
+		logf("  passthrough: caller declared this subtree")
+		return Passthrough(realTool, args)
+	}
+
 	logf("compile %s -> %s", source, output)
 
 	scannerCC := realTool

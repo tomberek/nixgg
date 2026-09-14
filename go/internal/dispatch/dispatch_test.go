@@ -191,3 +191,32 @@ func TestExpandRspfilesLeavesNonFilesAlone(t *testing.T) {
 		t.Errorf("ExpandRspfiles mangled a non-file @arg\n got: %q\nwant: %q", got, in)
 	}
 }
+
+// rustc's @-file format is not the compiler drivers': one line is one
+// argument, verbatim. The kernel's generated cfg file is the case that
+// matters, and it fails loudly rather than subtly — rustc requires the
+// quotes that shell tokenisation would remove:
+//
+//	error: invalid `--cfg` argument: `CONFIG_RTC_DRV_CROS_EC=m`
+func TestExpandRustArgfilesKeepsLinesVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rustc_cfg")
+	body := "--cfg=CONFIG_RTC_DRV_CROS_EC\n" +
+		"--cfg=CONFIG_RTC_DRV_CROS_EC=\"m\"\n" +
+		"--cfg=CONFIG_MSG=\"hello world\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := ExpandRustArgfiles([]string{"--edition=2021", "@" + path, "lib.rs"})
+	want := []string{
+		"--edition=2021",
+		"--cfg=CONFIG_RTC_DRV_CROS_EC",
+		`--cfg=CONFIG_RTC_DRV_CROS_EC="m"`,
+		`--cfg=CONFIG_MSG="hello world"`,
+		"lib.rs",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ExpandRustArgfiles =\n  %q\nwant\n  %q", got, want)
+	}
+}

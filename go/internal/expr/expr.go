@@ -266,6 +266,9 @@ type JSONDrvInput struct {
 	Kind string
 	Ref  string
 	Name string
+	// Crate: rustc externs only. The name the consuming crate binds
+	// this dependency to.
+	Crate string
 }
 
 // ArchiveJSONParams is the sandbox-mode analog of ArchiveParams.
@@ -371,6 +374,45 @@ func TransformJSON(p TransformJSONParams) JSONDrv {
 	return d.toJSON(p.ExtraSrcs)
 }
 
+// RustcJSONParams describes one rustc crate compile. Sandbox mode only.
+type RustcJSONParams struct {
+	Name      string
+	System    string
+	Bash      string
+	Coreutils string
+	RustcBin  string // absolute /nix/store/…/bin/rustc
+	SrcStore  string // staged crate tree
+	// Source is relative to SrcStore, or an absolute /nix/store path
+	// when the crate root is itself already store content — Rust's
+	// own `core` is compiled straight out of the rustc source tree.
+	Source    string
+	Flags     []string
+	Externs   []JSONDrvInput // each carries the crate name it binds to
+	Emits     []RustEmit
+	StoreDeps []string
+	ExtraSrcs []string
+	Env       map[string]string
+}
+
+func RustcJSON(p RustcJSONParams) JSONDrv {
+	d := &Derivation{
+		Kind:       KindRustc,
+		Name:       p.Name,
+		System:     p.System,
+		Bash:       p.Bash,
+		Coreutils:  p.Coreutils,
+		RustcBin:   p.RustcBin,
+		SrcStore:   p.SrcStore,
+		Source:     p.Source,
+		Flags:      p.Flags,
+		Inputs:     inputsFromJSON(p.Externs),
+		Emits:      p.Emits,
+		StoreDeps:  p.StoreDeps,
+		WrapperEnv: p.Env,
+	}
+	return d.toJSON(p.ExtraSrcs)
+}
+
 func LinkJSON(p LinkJSONParams) JSONDrv {
 	d := &Derivation{
 		Kind:               KindLink,
@@ -410,7 +452,7 @@ func inputsFromJSON(xs []JSONDrvInput) []derivInput {
 		if kind == "store" && !strings.HasPrefix(ref, "/nix/store/") {
 			ref = "/nix/store/" + ref
 		}
-		out[i] = derivInput{InputKind: kind, Ref: ref, Name: in.Name}
+		out[i] = derivInput{InputKind: kind, Ref: ref, Name: in.Name, Crate: in.Crate}
 	}
 	return out
 }
