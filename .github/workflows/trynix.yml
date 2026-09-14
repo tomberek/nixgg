@@ -1,0 +1,65 @@
+name: trynix
+
+# Comment a link on the PR that boots `hello` — the smallest example —
+# in the reviewer's browser via trynix.dev. Same-repo PRs only: forks
+# get no GITHUB_TOKEN/secrets under `pull_request`, so there's nothing
+# to authenticate the cachix push with and no link to post.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same AppArmor userns workaround smoke.yml uses — Nix's build
+      # sandbox needs unprivileged userns, which ubuntu-latest
+      # restricts by default.
+      - name: Allow unprivileged user namespaces (Nix sandbox needs this on ubuntu-latest)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: dynamicderivations
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build patched-nix
+        run: nix build --no-eval-cache --accept-flake-config .#patched-nix -o .patched-nix
+
+      # trynix's own action calls plain `nix` internally to resolve
+      # .#hello's store paths, so patched-nix and this repo's
+      # experimental-features/store settings (same as tests/smoke.sh)
+      # have to reach it too — persist via GITHUB_PATH/GITHUB_ENV,
+      # not just this step's own shell.
+      - name: Set up patched-nix env for later steps
+        run: |
+          echo "$PWD/.patched-nix/bin" >> "$GITHUB_PATH"
+          echo "NIX_REMOTE=" >> "$GITHUB_ENV"
+          mkdir -p /tmp/nixgg-trynix-store
+          {
+            echo "NIX_CONFIG<<NIXGGEOF"
+            echo "experimental-features = nix-command flakes ca-derivations dynamic-derivations configurable-impure-env"
+            echo "extra-system-features = builder-rpc-v0"
+            echo "store = local?root=/tmp/nixgg-trynix-store"
+            echo "NIXGGEOF"
+          } >> "$GITHUB_ENV"
+
+      # hello is the fixture used throughout tests/smoke.sh — same env
+      # (alt store, dynamic-derivations, builder-rpc-v0) that build
+      # needs everywhere else in this repo.
+      - name: Build hello
+        run: nix build --no-eval-cache --accept-flake-config .#hello
+
+      - uses: fzakaria/trynix@v1
+        with:
+          cache: https://dynamicderivations.cachix.org
+          publicKey: dynamicderivations.cachix.org-1:AmDuQASmWJsVYB/r0TGTZnQSnoxPzKP8ijfGw/6aT3k=
+          attrs: .#hello
