@@ -35,8 +35,7 @@ import (
 // role from the same bin/ dir NIXGG_REAL_CC points at. Nix's
 // gcc-wrapper has `cc → gcc` (C mode) and `c++ → g++` (C++ mode) —
 // invoking g++ on a `.c` source triggers cc-wrapper's isCxx=1 self-
-// check (see wrapper's `bin/gcc = *++` test) and breaks C-only build
-// systems. `cc` → `gcc`, `c++` → `g++`, unknown → the pinned RealCC.
+// check and breaks C-only build systems.
 func realToolFor(cfg *toolchain.Config, tool dispatch.Tool) string {
 	base := tool.Basename()
 	if base == "" {
@@ -47,17 +46,13 @@ func realToolFor(cfg *toolchain.Config, tool dispatch.Tool) string {
 
 // Compile is the shim entrypoint for `cc -c ...`. It parses argv,
 // stages source + headers, writes a thunk, and symlinks the output.
-//
-// tool is the caller's argv[0] role (cc / gcc / c++ / g++) — that name
-// is what gets baked into the derivation's compile command, so
-// `cc -c foo.c` produces a "cc" invocation inside the sandbox, not g++.
 func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layout) error {
 	realTool := realToolFor(cfg, tool)
 	if bypassed() {
-		// No logf here: configure/cmake probes (autoconf's
-		// ac_fn_c_check_header_preproc) treat ANY stderr output as a
-		// failed check regardless of exit code, so a "[nixgg] ..."
-		// line here silently flips HAVE_*_H results to "no".
+		// No logf: autoconf/cmake probes (ac_fn_c_check_header_preproc)
+		// treat ANY stderr output as a failed check regardless of exit
+		// code, so a "[nixgg] ..." line here silently flips HAVE_*_H
+		// results to "no".
 		return Passthrough(realTool, args)
 	}
 	source, output, depfile, flags, ok := parseCompileArgs(args)
@@ -72,45 +67,36 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 
 	// Kbuild probes/objects that get read back synchronously in the
 	// same recipe (mk_elfconfig on empty.o, cmd_pasyms's `nm` on the
-	// realmode objects, vdso32.so.dbg's own link inputs). mode.Realise's
-	// `nix build --file` can't serve these under sandbox mode — the
-	// builder-rpc-v0 protocol only supports "register for later", not
-	// "build now and give me output" — so a plain Passthrough (real
-	// files on disk) is required here, confirmed against real sandboxed
-	// kernel builds.
+	// realmode objects, vdso32.so.dbg's own link inputs) can't be
+	// served under sandbox mode — the builder-rpc-v0 protocol only
+	// supports "register for later", not "build now and give me
+	// output" — so passthrough with real files on disk is required.
 	if isKbuildElfProbe(source) || isKbuildRealmodeObj(source) || isKbuildVDSO32Obj(source) {
 		return Passthrough(realTool, args)
 	}
 
-	// Fill in a default output name if -o was omitted.
 	if output == "" {
 		output = defaultOutputName(source, flags)
 	}
 
 	logf("compile %s -> %s", source, output)
 
-	// Resolve the real cc for scan-headers to match the caller's tool
-	// role — same reason as the passthrough case above.
 	scannerCC := realTool
 
-	// 1. Discover headers.
 	scanResult, err := scan.Run(l, scannerCC, source, flags)
 	if err != nil {
 		return err
 	}
 
-	// Kbuild's own `cmd_and_fixdep` macro (scripts/Kbuild.include) runs
-	// `fixdep <depfile> <target> <cmdline>` synchronously, in the same
-	// recipe, right after this shim invocation returns to make — it
-	// expects a real `.d` file (from `-Wp,-MMD,<depfile>`) to already
-	// exist. nixgg's deferred-compile model means the real compiler
-	// that would eventually honor that flag may not run until much
-	// later (or never, if the `.o` is only ever consumed as a store
-	// reference) — too late for fixdep's synchronous call. Write a
-	// real substitute instead: fixdep doesn't care whether a `.d`
-	// file's dependency list came from genuine `-MD` output, only that
-	// every listed path is real and readable, which scan's own header
-	// list already is.
+	// Kbuild's own `cmd_and_fixdep` macro runs `fixdep <depfile> ...`
+	// synchronously right after this shim returns to make, expecting a
+	// real `.d` file to already exist. nixgg's deferred-compile model
+	// means the real compiler that would honor `-Wp,-MMD,<depfile>`
+	// may not run until much later (or never), too late for fixdep's
+	// synchronous call — so write a real substitute instead. fixdep
+	// doesn't care whether the dependency list came from genuine `-MD`
+	// output, only that every listed path is real and readable, which
+	// scan's own header list already is.
 	if depfile != "" {
 		if err := writeSynthesizedDepfile(depfile, output, source, scanResult.Headers); err != nil {
 			return err
@@ -118,23 +104,17 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		logf("  fixdep:     %s", depfile)
 	}
 
-	// 2. Stage source + headers into .nixgg/srcs/<tu-id>/.
 	srcAbs, err := filepath.Abs(source)
 	if err != nil {
 		return err
 	}
 	// The source's staged relpath is its position under the project
-	// root — the same layout every header uses. This matches the bash
-	// driver: sources aren't special.
+	// root — the same layout every header uses.
 	srcRel, err := filepath.Rel(scanResult.ProjectRoot, srcAbs)
 	if err != nil {
 		return err
 	}
 
-	// Opt-in batch classification, deferred until mode.For(source) is
-	// known below — a conftest/cmake-probe TU must never be deferred,
-	// it needs a synchronous real build now.
-	//
 	// Classify on srcAbs, NOT srcRel: srcRel is relative to
 	// scanResult.ProjectRoot, which can collapse to just the TU's own
 	// directory when nothing widens it (e.g. compiling from inside
@@ -166,14 +146,12 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		return err
 	}
 
-	// 3. Assemble the sandbox flag list. Strip the caller's -I family
-	// (both attached and separated forms) then re-add our staged -I
-	// flags (relative to project root) and any store-prefixed -I flags
-	// verbatim.
+	// Strip the caller's -I family (both attached and separated forms)
+	// then re-add our staged -I flags (relative to project root) and
+	// any store-prefixed -I flags verbatim.
 	sandboxFlags := rewriteFlags(flags, scanResult.StagedIFlags, scanResult.StoreIFlags,
 		scanResult.StagedIncludeFlags)
 
-	// 4. Build the expression.
 	wrapperEnvJSON, err := wrapperenv.JSON()
 	if err != nil {
 		return err
@@ -200,7 +178,6 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 		WrapperEnv: wrapperEnv,
 	})
 
-	// 5. Dispatch on mode.
 	if mode.For(source) == mode.Realise {
 		return realiseAndLink(e, output, "", cfg, l)
 	}
@@ -210,11 +187,10 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 			srcTreeLiteral, sandboxFlags, storeDeps, wrapperEnv)
 	}
 
-	// Sandbox mode (or EagerDrv, its unrestricted-daemon variant —
-	// see sandbox.EagerDrv): submit a JSON drv directly to the daemon
-	// and symlink/stub the output at the returned drv path. No .nix
-	// thunk on disk; downstream link/archive shims resolve this via
-	// classify.Drv.
+	// Sandbox mode (or EagerDrv, its unrestricted-daemon variant): submit
+	// a JSON drv directly to the daemon and symlink/stub the output at
+	// the returned drv path. No .nix thunk on disk; downstream link/
+	// archive shims resolve this via classify.Drv.
 	if sandbox.Enabled() || sandbox.EagerDrv() {
 		return compileSandbox(cfg, l, tool, tuID, filepath.Base(output), output, srcRel, sandboxFlags, storeDeps, wrapperEnvJSON)
 	}
@@ -231,10 +207,9 @@ func Compile(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.L
 }
 
 // submitCompileThunk writes e's thunk, symlinks output at it, and
-// records the symlink — native mode's per-TU submission, factored out
-// so a later individually-resolved batch member (see
-// ResolvePendingMember) can reach the identical code path Compile's
-// own native branch uses, without duplicating it.
+// records the symlink — factored out so a later individually-resolved
+// batch member (see ResolvePendingMember) can reach the identical code
+// path without duplicating it.
 func submitCompileThunk(l paths.Layout, e, output string) (thunkPath string, err error) {
 	id := thunk.Compute(e)
 	thunkPath, err = thunk.Write(l, id, e)
@@ -254,20 +229,17 @@ func submitCompileThunk(l paths.Layout, e, output string) (thunkPath string, err
 // this compile, hand it to `nix derivation add`, symlink the output
 // at the returned drv path.
 //
-// The staged src tree is uploaded via a plain (non-scanning) `nix
-// store add` so its store path matches native mode's plain Nix
-// path-literal import byte-for-byte (sandbox.StoreAddDirectory) — a
-// scanning add would pick up any /nix/store/... substring in staged
-// content as a NAR reference, diverging the store path from native
-// mode for identical bytes. See #14/ARCHITECTURE.md.
+// The staged src tree is uploaded via a plain (non-scanning)
+// sandbox.StoreAddDirectory so its store path matches native mode's
+// plain Nix path-literal import byte-for-byte — a scanning add would
+// pick up any /nix/store/... substring in staged content as a NAR
+// reference, diverging the store path from native mode for identical
+// bytes. See #14/ARCHITECTURE.md.
 func compileSandbox(
 	cfg *toolchain.Config, l paths.Layout,
 	tool dispatch.Tool, tuID, outName, output, srcRel string,
 	flags []string, storeDeps []string, wrapperEnvJSON string,
 ) error {
-	// tuID as the store-path name matches what native mode's .nix
-	// thunk produces for the same content — same store path, same drv
-	// hash.
 	srcStore, err := sandbox.StoreAddDirectory(cfg, tuID, filepath.Join(l.Srcs, tuID))
 	if err != nil {
 		return fmt.Errorf("stage src to store: %w", err)
@@ -282,29 +254,21 @@ func compileSandbox(
 // submitCompileSandboxDrv is compileSandbox's logic from AFTER the
 // src tree is already uploaded and wrapper env decoded — factored
 // out so a resolved batch member (whose src tree was uploaded once,
-// at defer time, by deferCompileToBatch, and whose WrapperEnv is
-// already a decoded map in its MemberRecord) can reach the same
-// drv-assembly/submission code without paying for a second,
-// redundant upload of unchanged content or a pointless
-// decode-then-reencode-then-redecode of the same map.
+// at defer time, and whose WrapperEnv is already a decoded map) can
+// reach the same drv-assembly/submission code without a redundant
+// upload or a pointless decode-then-reencode-then-redecode.
 func submitCompileSandboxDrv(
 	cfg *toolchain.Config, toolName, outName, output, srcRel, srcStore string,
 	flags []string, storeDeps []string, wrapperEnv map[string]string,
 ) error {
-	// Resolve toolchain roots for the drv. cfg carries the store
-	// paths we bootstrapped from NIXGG_COMPILER_ROOT / _BASH_ROOT /
-	// _COREUTILS_ROOT.
 	bash := cfg.BashRoot
 	coreutils := cfg.CoreutilsRoot
 	compiler := cfg.CompilerRoot
 
-	// Compute the drv's own $out placeholder. `builtins.placeholder
-	// "out"` is sha256("nix-output:out") base32'd. Every derivation
-	// gets the same value; the caOutputPlaceholder we compute for
-	// referring downstream is different.
+	// `builtins.placeholder "out"` is sha256("nix-output:out")
+	// base32'd; every derivation gets the same value.
 	outPlaceholder := "/" + expr.OutPlaceholderNix32
 
-	// Assemble the JSON drv.
 	drv := expr.CompileJSON(expr.CompileJSONParams{
 		Name:        "tu-" + outName,
 		OutName:     outName,
@@ -388,15 +352,11 @@ func parseCompileArgs(args []string) (source, output, depfile string, flags []st
 			i++
 		case strings.HasPrefix(a, "-o") && len(a) > 2:
 			output = a[2:]
-		// Dep-file generation flags — drop them. They target paths
-		// outside our sandbox (relative to make's cwd), so gcc inside
-		// the derivation would try to open cachedObjs/… and fail.
-		// scan-headers already gave us the header list we need. The
-		// depfile path itself is captured above, not discarded, so a
-		// caller relying on a post-compile fixdep-style step (Kbuild)
+		// Dep-file flags target paths outside our sandbox (relative to
+		// make's cwd); drop them. The depfile path itself is captured
+		// above via -MF/-Wp, so a Kbuild-style post-compile fixdep step
 		// still finds a real file waiting for it.
 		case a == "-M" || a == "-MM" || a == "-MG" || a == "-MP":
-			// no-op (single-arg forms; no depfile path implied)
 		case a == "-MD" || a == "-MMD":
 			hasDepFlag = true
 		case a == "-MF":
@@ -406,48 +366,37 @@ func parseCompileArgs(args []string) (source, output, depfile string, flags []st
 			depfile = args[i+1]
 			i++
 		case a == "-MT" || a == "-MQ":
-			// two-arg forms; skip the value too
 			if i+1 >= len(args) {
 				return "", "", "", nil, false
 			}
 			i++
 		case strings.HasPrefix(a, "-Wp,"):
 			// GCC's comma-joined pass-to-cpp form, e.g.
-			// `-Wp,-MMD,path/to/foo.d` or `-Wp,-MMD,path,-MP` — Kbuild's
-			// own c_flags (scripts/Makefile.lib) always uses this
-			// instead of separate -MD/-MF tokens.
+			// `-Wp,-MMD,path/to/foo.d` — Kbuild's own c_flags always
+			// uses this instead of separate -MD/-MF tokens. Not
+			// appended to flags: meaningless inside the sandbox.
 			if p := depfileFromWp(a); p != "" {
 				depfile = p
 			}
-			// Not appended to flags: these target the caller's own
-			// cpp/depfile bookkeeping, meaningless inside the sandbox.
 		case a == "-x" || a == "-Xlinker" || a == "-Xassembler":
-			// Two-arg forms with values that aren't sources; keep both.
 			if i+1 >= len(args) {
 				return "", "", "", nil, false
 			}
 			flags = append(flags, a, args[i+1])
-			// `-x <lang>` overrides extension-based language detection,
-			// so the source that follows need not have a known suffix.
-			// The canonical case is a precompiled header:
-			//
-			//	g++ -x c++-header -c pch.h -o pch.h.gch
-			//
+			// `-x <lang>` overrides extension-based language detection
+			// (e.g. `g++ -x c++-header -c pch.h -o pch.h.gch`);
 			// isSource rejects .h, so without this the whole TU fell to
-			// Passthrough — correct output, never cached or distributed.
+			// Passthrough.
 			if a == "-x" {
 				explicitLang = args[i+1]
 			}
 			i++
 		case isSource(a):
 			if source != "" {
-				// Multiple sources — we don't model that in a single TU.
 				return "", "", "", nil, false
 			}
 			source = a
 		case explicitLang != "" && source == "" && !strings.HasPrefix(a, "-"):
-			// A bare token after `-x <lang>`: the source, by the driver's
-			// own rules, even though its extension says nothing.
 			source = a
 		default:
 			flags = append(flags, a)
@@ -458,9 +407,7 @@ func parseCompileArgs(args []string) (source, output, depfile string, flags []st
 	}
 	// gcc's documented default when -MD/-MMD appears without -MF: the
 	// depfile path is the object's own path with its extension
-	// replaced by .d (computed after `output` is fully resolved, since
-	// a caller's `-MDfoo.d` attached form doesn't exist — only -MF
-	// carries an explicit path — so this is the only implicit case).
+	// replaced by .d.
 	if depfile == "" && hasDepFlag {
 		out := output
 		if out == "" {
@@ -496,15 +443,12 @@ func depfileFromObjName(obj string) string {
 }
 
 // isSource returns true if a token looks like a source file that the
-// driver would compile into a single .o. Matches the bash driver's
-// extension set.
+// driver would compile into a single .o.
 func isSource(a string) bool {
 	switch strings.ToLower(filepath.Ext(a)) {
 	case ".c", ".cc", ".cpp", ".cxx", ".s":
 		return true
 	}
-	// Uppercase .C, .S are also sources (C++ / preprocessed asm) — keep
-	// case-sensitive check for those.
 	ext := filepath.Ext(a)
 	if ext == ".C" || ext == ".S" {
 		return true
@@ -513,15 +457,14 @@ func isSource(a string) bool {
 }
 
 // rewriteFlags produces the sandbox-flag list. Strip -I/-isystem/etc
-// pairs (both forms) since our staged -I flags cover the same
-// directories in the sandbox's layout; then append staged + store.
+// pairs since our staged -I flags cover the same directories in the
+// sandbox's layout; then append staged + store.
 //
-// `-include <file>` is handled separately via forceInc rather than being
-// stripped: its value is a header to prepend to the TU, not a directory
-// to search, so dropping it changes the preprocessor state the caller
-// asked for. scan.StagedIncludeFlags supplies the re-pointed form.
-// They go last so the -I flags they may resolve against are already in
-// effect.
+// `-include <file>` is handled separately via forceInc: its value is
+// a header to prepend to the TU, not a directory to search, so
+// dropping it would change the preprocessor state the caller asked
+// for. scan.StagedIncludeFlags supplies the re-pointed form, appended
+// last so the -I flags it resolves against are already in effect.
 func rewriteFlags(caller, staged, store, forceInc []string) []string {
 	pathFlags := map[string]bool{
 		"-I": true, "-isystem": true, "-iquote": true,
@@ -538,8 +481,6 @@ func rewriteFlags(caller, staged, store, forceInc []string) []string {
 			continue
 		case strings.HasPrefix(a, "-I") && len(a) > 2:
 			continue
-		// Drop the caller's `-include <file>`; forceInc carries the
-		// staged-relative replacement appended below.
 		case a == "-include":
 			if i+1 < len(caller) {
 				i++
@@ -561,18 +502,14 @@ func rewriteFlags(caller, staged, store, forceInc []string) []string {
 // realmode.elf/vmlinux.o/vmlinux.
 //
 // subdir is the caller's own knowledge of where its Kind places this
-// artifact — NOT re-derived from output's name here, because
+// artifact — NOT re-derived from output's name, because
 // expr.ArtifactSubdir's name-based guess is wrong for vmlinux.o (a
-// LINK output that happens to be named like a compile one, so it
-// guesses flat instead of bin/).
+// LINK output named like a compile one).
 //
 // Copies the result rather than symlinking it: link-vmlinux.sh's
 // `sorttable` rewrites vmlinux in place, which fails "Permission
 // denied" through a symlink into the read-only store.
 func realiseAndLink(exprBody, output, subdir string, cfg *toolchain.Config, l paths.Layout) error {
-	// Write to a tempfile alongside the real thunks so relative-path
-	// imports resolve. Reuse the id-based path to keep the file if the
-	// same expression comes back later.
 	id := thunk.Compute(exprBody)
 	thunkPath, err := thunk.Write(l, id, exprBody)
 	if err != nil {

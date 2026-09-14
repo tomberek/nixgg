@@ -1,11 +1,6 @@
-// Package expr builds the Nix expression string that a shim writes to
-// .nixgg/thunks/<id>.nix. Every expression is one `import <helper>
-// { ... }` call — the helper (builder.nix / linker.nix / archiver.nix)
-// lives in the realised nix/ package alongside toolchain.nix which
-// supplies the pinned compiler/bash/coreutils store paths.
-//
-// The expression body must be byte-deterministic: same inputs → same
-// string → same thunk id, for idempotent Write and Nix's eval cache.
+// Package expr builds the Nix expression string a shim writes to
+// .nixgg/thunks/<id>.nix; the expression body must be byte-deterministic
+// since the thunk id is derived from it.
 package expr
 
 import (
@@ -14,9 +9,6 @@ import (
 	"strings"
 )
 
-// Compile builds a per-TU compile expression via the shared
-// Derivation struct, which also drives CompileJSON in sandbox mode —
-// see derivation.go for the cross-format equivalence property.
 func Compile(p CompileParams) string {
 	return compileDerivation(p).ToNix(p.Helpers)
 }
@@ -36,18 +28,16 @@ func compileDerivation(p CompileParams) *Derivation {
 
 // CompileParams is the input for one compile expression.
 type CompileParams struct {
-	Helpers    string            // /nix/store/…-nixgg-nix
-	Tool       string            // "cc", "gcc", "c++", "g++"
-	SrcTree    string            // Nix path literal, e.g. "../srcs/foo"
-	Source     string            // relative path inside srcTree, e.g. "src/foo.c"
-	OutName    string            // "foo.o"
-	Flags      []string          // sandbox-relative flags
-	StoreDeps  []string          // /nix/store/... roots referenced by Flags/WrapperEnv
-	WrapperEnv map[string]string // NIX_CFLAGS_COMPILE etc.
+	Helpers    string
+	Tool       string
+	SrcTree    string
+	Source     string
+	OutName    string
+	Flags      []string
+	StoreDeps  []string
+	WrapperEnv map[string]string
 }
 
-// Link builds a link expression via the same Derivation-based flow
-// as Compile.
 func Link(p LinkParams) string {
 	return linkDerivation(p).ToNix(p.Helpers)
 }
@@ -76,32 +66,22 @@ type LinkParams struct {
 	Helpers string
 	Tool    string
 	OutName string
-	// Name overrides linker.nix's default "bin-<OutName>" derivation
-	// name — empty means use that default. Set by a multi-target
-	// mkNixggBuild build, whose non-primary targets need a name of
-	// the form "<outerBuildName>-<targetKey>" to satisfy Nix's own
-	// outputPathName check — see go/internal/shim/link.go's
-	// linkSandbox docstring.
-	Name   string
-	Inputs []Input
-	// See Derivation.ExtraInputs.
-	ExtraInputs []Input
-	Flags       []string
-	// GroupInputs wraps the input list in --start-group/--end-group.
-	// See Derivation.GroupInputs.
-	GroupInputs bool
-	// See Derivation.WholeArchiveInputs.
+	// Name overrides linker.nix's default "bin-<OutName>"; needed by
+	// mkNixggBuild's non-primary multi-target outputs to satisfy Nix's
+	// outputPathName check.
+	Name               string
+	Inputs             []Input
+	ExtraInputs        []Input
+	Flags              []string
+	GroupInputs        bool
 	WholeArchiveInputs []string
-	// See Derivation.InlineFilesStore.
-	InlineFilesStore string
-	// See Derivation.AbsFilePath/AbsFileContent.
-	AbsFilePath    string
-	AbsFileContent string
-	StoreDeps      []string
-	WrapperEnv     map[string]string
+	InlineFilesStore   string
+	AbsFilePath        string
+	AbsFileContent     string
+	StoreDeps          []string
+	WrapperEnv         map[string]string
 }
 
-// Archive builds an `ar` expression. Same Derivation-based flow.
 func Archive(p ArchiveParams) string {
 	return archiveDerivation(p).ToNix(p.Helpers)
 }
@@ -119,8 +99,6 @@ func archiveDerivation(p ArchiveParams) *Derivation {
 	}
 }
 
-// inputsToDeriv translates the shim-facing Input type (Kind="store"/"nix")
-// to the internal derivInput used by Derivation.
 func inputsToDeriv(xs []Input) []derivInput {
 	out := make([]derivInput, len(xs))
 	for i, in := range xs {
@@ -135,33 +113,25 @@ func inputsToDeriv(xs []Input) []derivInput {
 
 // ArchiveParams is the input for one archive expression.
 type ArchiveParams struct {
-	Helpers string
-	OutName string
-	// Name overrides archiver.nix's default "ar-<OutName>" — see
-	// LinkParams.Name's own docstring for when/why.
-	Name   string
-	Inputs []Input
-	// See Derivation.ExtraInputs.
+	Helpers     string
+	OutName     string
+	Name        string
+	Inputs      []Input
 	ExtraInputs []Input
 	ARFlags     string
 	StoreDeps   []string
 	WrapperEnv  map[string]string
 }
 
-// Input describes one linker/archiver input.
+// Input describes one linker/archiver input. Kind is "store" for
+// realised inputs or "nix" for unrealised sibling thunks.
 type Input struct {
-	// Kind is "store" for realised inputs (rendered as builtins.storePath)
-	// or "nix" for unrealised sibling thunks (rendered as an `import`).
 	Kind string
-	// Ref is either a /nix/store/… root (Kind=store) or an absolute
-	// path to a sibling thunk .nix file (Kind=nix). Absolute paths let
-	// the thunk file survive `cp`: Makefile steps that copy a thunk
-	// symlink to a peer location (e.g. `cp obj/foo.o dest/foo.o`)
-	// dereference the symlink and produce a regular file with the same
-	// bytes. Absolute imports still resolve; relative ones wouldn't.
-	Ref string
-	// Name is the basename that will appear inside the derivation
-	// output — same as the caller-visible symlink's basename.
+	// Ref must be an absolute path for Kind=="nix": a Makefile step
+	// that `cp`s a thunk symlink to a peer path dereferences it into a
+	// regular file, and only an absolute import still resolves from
+	// there.
+	Ref  string
 	Name string
 }
 
@@ -186,25 +156,12 @@ func jsonArrayIndented(items []string) string {
 }
 
 // ---------------------------------------------------------------------
-// JSON-drv emission (sandbox / dyn-drv mode): serializes the same shim
-// intent as above for `nix derivation add` (JSON on stdin) instead of a
-// `.nix` text file. Used when NIXGG_SANDBOX=1.
-//
-// This JSON shape is what `nix derivation add` accepts, which is NOT
-// the same shape `nix derivation show` prints. Notably:
-//
-//   - `inputs.srcs` is an array of BASENAMES (hash+name), not full
-//     /nix/store/... paths. Full paths trigger "illegal base-32
-//     character '/'" at parse time.
-//   - `env.out` must be the placeholder string returned by
-//     `builtins.placeholder "out"` for this specific derivation.
-//   - `inputs.drvs` maps a full drv store path to `{ outputs = […]; }`
-//     — those are the drv-references we get back from previous
-//     `nix derivation add` calls.
+// JSON-drv emission (sandbox / dyn-drv mode, NIXGG_SANDBOX=1): the
+// `nix derivation add` JSON shape, which differs from `nix derivation
+// show`'s output shape. inputs.srcs entries must be BASENAMES — a full
+// /nix/store/... path triggers "illegal base-32 character '/'".
 
-// JSONDrv is the JSON shape `nix derivation add` accepts. Fields
-// mirror the Nix internal derivation type; we assemble it in-Go and
-// let json.Marshal handle the wire encoding.
+// JSONDrv is the JSON shape `nix derivation add` accepts.
 type JSONDrv struct {
 	Name    string             `json:"name"`
 	System  string             `json:"system"`
@@ -216,23 +173,16 @@ type JSONDrv struct {
 	Version int                `json:"version"`
 }
 
-// JSONDrvInputs holds the two input slots Nix distinguishes.
+// JSONDrvInputs holds the two input slots Nix distinguishes. Both
+// Drvs keys and Srcs entries are store-path BASENAMES, not full paths.
 type JSONDrvInputs struct {
-	// Drvs maps a drv's store-path BASENAME (not a full path — same
-	// convention as Srcs below; confirmed against derivation.go's own
-	// toJSON, which populates this via StoreBasename(in.Ref)) to the
-	// set of outputs of that drv we depend on.
 	Drvs map[string]JSONDrvRef `json:"drvs"`
-	// Srcs is a list of already-realised store objects the sandbox
-	// needs mounted. BASENAMES ONLY (see file docstring above).
-	Srcs []string `json:"srcs"`
+	Srcs []string              `json:"srcs"`
 }
 
-// JSONDrvRef is the value side of an inputs.drvs entry. Nix's
-// derivation-JSON parser requires `dynamicOutputs` to be present
-// (empty is fine); the `omitempty` tag would drop the key when the
-// map is nil and trigger "Expected JSON object to contain key
-// 'dynamicOutputs' but it doesn't".
+// JSONDrvRef is the value side of an inputs.drvs entry. DynamicOutputs
+// must be present (empty map is fine) or Nix's parser rejects the JSON
+// with "Expected JSON object to contain key 'dynamicOutputs'".
 type JSONDrvRef struct {
 	Outputs        []string       `json:"outputs"`
 	DynamicOutputs map[string]any `json:"dynamicOutputs"`
@@ -240,36 +190,30 @@ type JSONDrvRef struct {
 
 // JSONOut describes an output of the derivation.
 type JSONOut struct {
-	Method   string `json:"method"`   // "nar" for a directory, "flat" for a single file
-	HashAlgo string `json:"hashAlgo"` // "sha256"
+	Method   string `json:"method"`
+	HashAlgo string `json:"hashAlgo"`
 }
 
 // CompileJSONParams is the sandbox-mode analog of CompileParams.
-// SrcTree is a store-path basename (e.g. "abc123-src-foo") — the
-// caller has already `nix store add`ed the staged src tree and put
-// it in Inputs.Srcs.
+// SrcTree is a store-path basename already `nix store add`ed by the
+// caller and present in Srcs.
 type CompileJSONParams struct {
-	Name      string   // derivation name, e.g. "tu-foo.o" — no .drv suffix
-	OutName   string   // "foo.o"; the builder writes to $out/<outName>
-	System    string   // "x86_64-linux"
-	Bash      string   // full /nix/store/... path to bash (for builder)
-	Coreutils string   // full /nix/store/... path to coreutils (added to PATH)
-	Compiler  string   // full /nix/store/... path to gcc-wrapper (added to PATH)
-	Tool      string   // "cc", "g++", etc.
-	SrcStore  string   // full /nix/store/... path to the staged src tree
-	Source    string   // relative path inside SrcStore, e.g. "src/foo.c"
-	Flags     []string // compile flags
-	StoreDeps []string // full /nix/store/... roots referenced by flags/env — same as
-	// native's storeDepsJSON, flattened to colon-separated for the
-	// _storeDeps env var (matches builder.nix).
-	Placeholder string            // builtins.placeholder "out" for this drv
-	Srcs        []string          // basenames for inputs.srcs — bash, coreutils, compiler, srcStore
-	Env         map[string]string // extra env (NIX_CFLAGS_COMPILE etc.); merged over defaults
+	Name        string
+	OutName     string
+	System      string
+	Bash        string
+	Coreutils   string
+	Compiler    string
+	Tool        string
+	SrcStore    string
+	Source      string
+	Flags       []string
+	StoreDeps   []string
+	Placeholder string
+	Srcs        []string
+	Env         map[string]string
 }
 
-// CompileJSON produces a JSONDrv for one compile TU. Delegates to
-// Derivation for the env/script shape so this stays in lockstep with
-// the native `.nix` emitter — see derivation.go.
 func CompileJSON(p CompileJSONParams) JSONDrv {
 	d := &Derivation{
 		Kind:       KindCompile,
@@ -290,44 +234,35 @@ func CompileJSON(p CompileJSONParams) JSONDrv {
 }
 
 // LinkJSONParams is the sandbox-mode analog of LinkParams. Inputs
-// coming from prior shim calls have Kind="drv" and Ref=<drv-path>.
-// Inputs coming from already-realised store paths (e.g. system libs
-// referenced via -I on a compile) have Kind="src" and Ref=<basename>.
+// from prior shim calls have Kind="drv" and Ref=<drv-path>; inputs
+// from already-realised store paths have Kind="src" and Ref=<basename>.
 type LinkJSONParams struct {
-	Name      string
-	OutName   string
-	System    string
-	Bash      string
-	Coreutils string
-	Compiler  string
-	Tool      string
-	Inputs    []JSONDrvInput // per-input drv or store-path reference
-	// See Derivation.ExtraInputs.
-	ExtraInputs []JSONDrvInput
-	Flags       []string
-	GroupInputs bool // wrap inputs in --start-group/--end-group
-	// See Derivation.WholeArchiveInputs.
+	Name               string
+	OutName            string
+	System             string
+	Bash               string
+	Coreutils          string
+	Compiler           string
+	Tool               string
+	Inputs             []JSONDrvInput
+	ExtraInputs        []JSONDrvInput
+	Flags              []string
+	GroupInputs        bool
 	WholeArchiveInputs []string
-	// See Derivation.InlineFilesStore.
-	InlineFilesStore string
-	// See Derivation.AbsFilePath/AbsFileContent.
-	AbsFilePath    string
-	AbsFileContent string
-	StoreDeps      []string // full /nix/store/... roots referenced; joined into _storeDeps env
-	Placeholder    string
-	ExtraSrcs      []string          // additional basenames for inputs.srcs (bash, coreutils, compiler)
-	Env            map[string]string // wrapper env
+	InlineFilesStore   string
+	AbsFilePath        string
+	AbsFileContent     string
+	StoreDeps          []string
+	Placeholder        string
+	ExtraSrcs          []string
+	Env                map[string]string
 }
 
-// JSONDrvInput is one entry in a linker/archiver's input list. Either
-// references a drv (whose "out" we'll dereference at build time via a
-// placeholder) or a real store path we already have (basename in
-// inputs.srcs, path fragment in args).
+// JSONDrvInput is one entry in a linker/archiver's input list.
+// Kind=="drv" means Ref is a full drv store path and Name is the file
+// inside that drv's out dir. Kind=="src" means Ref is a store-path
+// basename (goes in srcs) and Name is the file inside that store path.
 type JSONDrvInput struct {
-	// Kind = "drv" or "src". "drv" means Ref is a full drv store path
-	// (/nix/store/…-….drv) and Name is the file inside that drv's out
-	// dir. "src" means Ref is a store-path basename (goes in srcs) and
-	// Name is the file inside that store path.
 	Kind string
 	Ref  string
 	Name string
@@ -335,24 +270,21 @@ type JSONDrvInput struct {
 
 // ArchiveJSONParams is the sandbox-mode analog of ArchiveParams.
 type ArchiveJSONParams struct {
-	Name      string
-	OutName   string
-	System    string
-	Bash      string
-	Coreutils string
-	AR        string // full /nix/store/... path to gnu binutils (for `ar`)
-	ARFlags   string // e.g. "rcs"
-	Inputs    []JSONDrvInput
-	// See Derivation.ExtraInputs.
+	Name        string
+	OutName     string
+	System      string
+	Bash        string
+	Coreutils   string
+	AR          string
+	ARFlags     string
+	Inputs      []JSONDrvInput
 	ExtraInputs []JSONDrvInput
-	StoreDeps   []string // full /nix/store/... roots; joined into _storeDeps env
+	StoreDeps   []string
 	Placeholder string
 	ExtraSrcs   []string
 	Env         map[string]string
 }
 
-// ArchiveJSON produces a JSONDrv for an ar step. Delegates to
-// Derivation for env/script shape.
 func ArchiveJSON(p ArchiveJSONParams) JSONDrv {
 	d := &Derivation{
 		Kind:        KindArchive,
@@ -371,8 +303,6 @@ func ArchiveJSON(p ArchiveJSONParams) JSONDrv {
 	return d.toJSON(p.ExtraSrcs)
 }
 
-// LinkJSON produces a JSONDrv for a link step. Delegates to
-// Derivation for env/script shape.
 func LinkJSON(p LinkJSONParams) JSONDrv {
 	d := &Derivation{
 		Kind:               KindLink,
@@ -397,9 +327,8 @@ func LinkJSON(p LinkJSONParams) JSONDrv {
 	return d.toJSON(p.ExtraSrcs)
 }
 
-// inputsFromJSON translates the shim-facing JSONDrvInput type
-// ("drv"/"src") into Derivation's internal Input type ("nix"/"store").
-// Same semantics; two names for historical reasons.
+// inputsFromJSON translates JSONDrvInput's "drv"/"src" kinds into
+// derivInput's "nix"/"store" kinds.
 func inputsFromJSON(xs []JSONDrvInput) []derivInput {
 	out := make([]derivInput, len(xs))
 	for i, in := range xs {
@@ -409,9 +338,6 @@ func inputsFromJSON(xs []JSONDrvInput) []derivInput {
 		} else if kind == "src" {
 			kind = "store"
 		}
-		// For store inputs, LinkJSON was previously formatting
-		// '/nix/store/%s/%s' from a basename; keep that behavior by
-		// making Ref look like a canonical path.
 		ref := in.Ref
 		if kind == "store" && !strings.HasPrefix(ref, "/nix/store/") {
 			ref = "/nix/store/" + ref
@@ -421,23 +347,12 @@ func inputsFromJSON(xs []JSONDrvInput) []derivInput {
 	return out
 }
 
-// caOutputPlaceholder returns the `/<nix32-hash>` downstream
-// placeholder for a specific output of a CA derivation. Nix
-// substitutes this string with the resolved store path at build
-// time. The formula (mirrored from NixOS/nix
-// src/libstore/downstream-placeholder.cc:unknownCaOutput):
-//
-//	drvName    = drvBasename with trailing ".drv" stripped
-//	pathName   = drvName + (outputName == "out" ? "" : "-" + outputName)
-//	clearText  = "nix-upstream-output:" + drvHashPart + ":" + pathName
-//	digest     = sha256(clearText)
-//	rendered   = "/" + nix32(digest)
-//
-// drvPath is expected to be a full store path — /nix/store/<hash>-<name>.drv.
+// caOutputPlaceholder mirrors NixOS/nix's
+// src/libstore/downstream-placeholder.cc:unknownCaOutput:
+// sha256("nix-upstream-output:" + drvHashPart + ":" + pathName),
+// nix32-encoded with a leading '/'.
 func caOutputPlaceholder(drvPath, output string) string {
 	base := StoreBasename(drvPath)
-	// A store-path basename is "<32-char-hash>-<name>".
-	// storeHashLen = 32 chars (Nix32 encoding of 160-bit compressed hash).
 	if len(base) <= storeHashLen+1 {
 		return "/INVALID_DRV_PATH_" + base
 	}
@@ -454,44 +369,28 @@ func caOutputPlaceholder(drvPath, output string) string {
 	return "/" + nix32Encode(digest[:])
 }
 
-// storeHashLen is the number of Nix32 characters in the hash prefix
-// of a store-path basename. Nix's internal constant is `HashLen = 32`.
+// storeHashLen is Nix's HashLen constant: nix32-encoded hash prefix
+// length in a store-path basename.
 const storeHashLen = 32
 
-// CAOutputPlaceholder is caOutputPlaceholder, exported for
-// internal/assemble: assembling a tree of resolved drvref stubs needs
-// the exact same downstream-placeholder substitution link/archive
-// already use for their own "nix" inputs, just driven by a set of
-// (relative path -> drv) pairs discovered by walking a directory
-// instead of by argv parsing.
+// CAOutputPlaceholder is exported for internal/assemble, which needs
+// the same downstream-placeholder substitution for drvref stubs found
+// by walking a directory rather than by argv parsing.
 func CAOutputPlaceholder(drvPath, output string) string { return caOutputPlaceholder(drvPath, output) }
 
-// OutPlaceholderNix32 is the Nix32-encoded sha256 of "nix-output:out"
-// — the string Nix substitutes for a placeholder-`$out` reference at
-// build time. Since every derivation with a single "out" output
-// uses the same placeholder, we hardcode it. Verified:
-//
-//	nix eval --raw --expr 'builtins.placeholder "out"'
-//	=> /1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9
-//
-// (The leading '/' is the placeholder prefix; drop it if you need
-// the bare digest.)
+// OutPlaceholderNix32 is the Nix32-encoded sha256 of "nix-output:out",
+// i.e. `nix eval --raw --expr 'builtins.placeholder "out"'` minus its
+// leading '/'. Every single-"out"-output derivation shares this value.
 const OutPlaceholderNix32 = "1rz4g4znpzjwh1xymhjpm42vipw92pr73vdgl6xs1hycac8kf2n9"
 
-// nix32Chars is the alphabet used by Nix's base32 encoding. Copied
-// verbatim from NixOS/nix src/libutil/include/nix/util/base-nix-32.hh
-// — "omitted: E O U T" (and case-folded).
+// nix32Chars is Nix's base32 alphabet (src/libutil/include/nix/util/base-nix-32.hh): digits 0-9 and lowercase a-z minus E,O,U,T.
 const nix32Chars = "0123456789abcdfghijklmnpqrsvwxyz"
 
-// nix32Encode encodes bytes into Nix's flavour of base32. Iterates
-// characters back-to-front, taking 5 bits at a time from a virtual
-// bit-shifted view of the input. Mirrors BaseNix32::encode in
-// src/libutil/base-nix-32.cc.
+// nix32Encode mirrors BaseNix32::encode in src/libutil/base-nix-32.cc.
 func nix32Encode(bs []byte) string {
 	if len(bs) == 0 {
 		return ""
 	}
-	// encodedLength(n) = (n*8 - 1) / 5 + 1.
 	n := (len(bs)*8-1)/5 + 1
 	out := make([]byte, n)
 	for k := n - 1; k >= 0; k-- {
@@ -517,8 +416,6 @@ func appendUnique(xs []string, s string) []string {
 	return append(xs, s)
 }
 
-// shellQuoteFlags renders a list of flags for a bash `-c` script,
-// single-quoted so no shell interpretation happens.
 func shellQuoteFlags(flags []string) string {
 	if len(flags) == 0 {
 		return ""
@@ -530,10 +427,6 @@ func shellQuoteFlags(flags []string) string {
 	return strings.Join(parts, " ")
 }
 
-// shellQuote single-quotes one string for a bash `-c` script — the
-// same escaping shellQuoteFlags applies per-element, factored out for
-// callers (e.g. Derivation.absFileScript) that need to quote exactly
-// one path rather than a flag list.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

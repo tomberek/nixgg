@@ -32,10 +32,9 @@ func Enabled() bool {
 // EagerDrv reports whether NIXGG_EAGER_DRV=1 is set: a variant of
 // sandbox mode that runs over an ordinary, unrestricted daemon
 // connection (e.g. `nix develop`) rather than a live builder-rpc-v0
-// sandbox. It shares sandbox mode's drv-emission path, but since the
-// registered .drv is a real, permanent store object right away,
-// PointOutputAtDrv can symlink straight to it instead of writing a
-// drvref stub (see PointOutputAtDrv).
+// sandbox. Since the registered .drv is a real, permanent store
+// object right away, PointOutputAtDrv can symlink straight to it
+// instead of writing a drvref stub.
 func EagerDrv() bool {
 	return os.Getenv("NIXGG_EAGER_DRV") == "1"
 }
@@ -47,8 +46,6 @@ func rpcEnabled() bool {
 	return os.Getenv("NIXGG_RPC") == "1"
 }
 
-// dialRPC connects to the daemon socket the sandbox exposes via
-// NIX_REMOTE (unix://<path>).
 func dialRPC() (*rpc.Conn, error) {
 	remote := os.Getenv("NIX_REMOTE")
 	if remote == "" {
@@ -57,10 +54,9 @@ func dialRPC() (*rpc.Conn, error) {
 	return rpc.Dial(remote)
 }
 
-// rpcBackend is satisfied by *rpc.Conn (NIXGG_RPC=1). Letting
-// DerivationAdd/StoreAddScan/StoreAddDirectory/SubmitOutput each pick
-// it via selectBackend collapses the rpc/CLI branching into one
-// selection plus one CLI fallback per function.
+// rpcBackend is satisfied by *rpc.Conn (NIXGG_RPC=1). Letting each
+// exported function pick it via selectBackend collapses the rpc/CLI
+// branching into one selection plus one CLI fallback per function.
 type rpcBackend interface {
 	AddDerivation(name string, contents []byte, refs []string) (string, error)
 	AddToStoreScanning(name string, narDump []byte) (string, error)
@@ -88,10 +84,6 @@ func selectBackend() (b rpcBackend, close func(), ok bool, err error) {
 // and returns the resulting drv store path. --offline: this should
 // never need substituters, but some sandbox configs try anyway and
 // stall on name resolution.
-//
-// Under NIXGG_RPC=1, renders the same ATerm bytes via internal/aterm
-// and uploads them over internal/rpc's AddToStore op instead of
-// fork+exec'ing `nix derivation add`.
 func DerivationAdd(cfg *toolchain.Config, drv expr.JSONDrv) (string, error) {
 	name := drv.Name + ".drv"
 	if b, closeB, ok, err := selectBackend(); err != nil {
@@ -131,10 +123,6 @@ func DerivationAdd(cfg *toolchain.Config, drv expr.JSONDrv) (string, error) {
 // daemon scan the tree for references to already-present store
 // objects and record them — required inside a sandbox where
 // unregistered references cause build-time errors.
-//
-// Under NIXGG_RPC=1, encodes path as a NAR via internal/nar and
-// uploads it over internal/rpc's AddToStoreScanning op instead of
-// fork+exec'ing `nix store add --scan`.
 func StoreAddScan(cfg *toolchain.Config, name, path string) (string, error) {
 	if b, closeB, ok, err := selectBackend(); err != nil {
 		return "", fmt.Errorf("rpc store add --scan: %w", err)
@@ -166,17 +154,12 @@ func StoreAddScan(cfg *toolchain.Config, name, path string) (string, error) {
 }
 
 // StoreAddDirectory uploads a directory via a plain (non-scanning)
-// `nix store add -n name path` and returns the resulting store path.
-//
-// Unlike StoreAddScan, this does not scan content for
-// /nix/store/... substrings, so the result's reference set is always
-// empty — matching what native mode's plain path-literal import
-// produces for identical bytes. Using --scan here would let an
-// incidental /nix/store/... substring in staged content (e.g. a
-// generated header baking in a runtime tool's store path) become a
-// real NAR reference on the sandbox side, producing a different,
-// mode-divergent store path for otherwise byte-identical content
-// (confirmed against examples/nix-util's store-api.cc TU).
+// `nix store add -n name path`. Unlike StoreAddScan, it never scans
+// for /nix/store/... substrings, so an incidental one in staged
+// content (e.g. a generated header baking in a runtime tool's store
+// path) can't become a spurious reference and diverge the resulting
+// store path from native mode's (confirmed against
+// examples/nix-util's store-api.cc TU).
 func StoreAddDirectory(cfg *toolchain.Config, name, path string) (string, error) {
 	if b, closeB, ok, err := selectBackend(); err != nil {
 		return "", fmt.Errorf("rpc store add: %w", err)
@@ -215,9 +198,6 @@ func StoreAddDirectory(cfg *toolchain.Config, name, path string) (string, error)
 // outputPathName(outerDrvName, outputName). mkNixggBuild names the
 // outer drv "bin-<target>.drv" precisely so our inner link drv
 // (also "bin-<target>.drv") satisfies this without a rename step.
-//
-// Under NIXGG_RPC=1, calls internal/rpc directly over the sandbox's
-// daemon socket instead of fork+exec'ing `nix store submit-output`.
 func SubmitOutput(cfg *toolchain.Config, drvPath, outputName string) error {
 	if b, closeB, ok, err := selectBackend(); err != nil {
 		return fmt.Errorf("rpc submit-output: %w", err)
@@ -237,19 +217,16 @@ func SubmitOutput(cfg *toolchain.Config, drvPath, outputName string) error {
 	return nil
 }
 
-// PointOutputAtDrv records which drv produced the artifact that
-// would otherwise live at `output`. Two forms, chosen by EagerDrv():
-//
-//   - Default (sandbox mode): writes a drvref text stub. Required
-//     because builder-rpc-v0 registers .drv files with the daemon
-//     but never materialises them into the sandbox filesystem, so a
-//     symlink would dangle — fatal for a downstream Makefile `test
-//     -e` check mid-build. See internal/drvref for the format.
-//   - EagerDrv: writes a real symlink straight at drvPath. Safe only
-//     because this mode never runs inside a live builder-rpc-v0
-//     sandbox, so the just-registered .drv is a real, permanent
-//     store object immediately. classify.Target and resolveLibFlag
-//     already treat a symlink to a .drv as Kind.Drv without changes.
+// PointOutputAtDrv records which drv produced the artifact that would
+// otherwise live at `output`. In sandbox mode it writes a drvref text
+// stub, since builder-rpc-v0 registers .drv files with the daemon but
+// never materialises them into the sandbox filesystem — a symlink
+// would dangle, fatal for a downstream Makefile `test -e` check
+// mid-build (see internal/drvref). Under EagerDrv it instead writes a
+// real symlink straight at drvPath, safe because that mode never runs
+// inside a live builder-rpc-v0 sandbox so the just-registered .drv is
+// already a permanent store object; classify.Target and
+// resolveLibFlag already treat a symlink to a .drv as Kind.Drv.
 //
 // KNOWN LIMITATION (EagerDrv only): RealiseThunkArgsAndPassthrough's
 // `!sandboxEnabled` fallback only realises classify.Thunk args before

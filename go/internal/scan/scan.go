@@ -22,34 +22,18 @@ import (
 	"github.com/tbereknyei/nixgg/internal/paths"
 )
 
-// Header is a discovered dependency: Abs is its current on-disk
-// location, Rel is where it should land inside the staging dir
-// (relative to Result.ProjectRoot).
 type Header struct {
 	Abs, Rel string
 }
 
-// Result is the full output of a scan.
 type Result struct {
-	Headers []Header
-	// ProjectRoot is the common ancestor of cwd and every user -I dir;
-	// the staging dir mirrors it, so headers land at
-	// $stagingDir/<rel-to-project-root>.
-	ProjectRoot string
-	// StagedIFlags are `-I<rel>` flags for gcc inside the sandbox,
-	// relative to the staged project root. Always includes "-I.".
-	StagedIFlags []string
-	// StoreIFlags are `-I/nix/store/...` flags passed through verbatim.
-	StoreIFlags []string
-	// StagedIncludeFlags are `-include <rel>` flags rewritten to point
-	// at the staged copy of each force-included header. A force-include
-	// that resolves outside projectRoot is passed through verbatim.
+	Headers            []Header
+	ProjectRoot        string
+	StagedIFlags       []string
+	StoreIFlags        []string
 	StagedIncludeFlags []string
 }
 
-// Run scans a single compile invocation (cc, source, and flags being
-// everything else on argv besides -c/-o), using the cache under
-// l.Scans if all deps' mtimes still match.
 func Run(l paths.Layout, cc, source string, flags []string) (*Result, error) {
 	if err := os.MkdirAll(l.Scans, 0o755); err != nil {
 		return nil, err
@@ -67,7 +51,6 @@ func Run(l paths.Layout, cc, source string, flags []string) (*Result, error) {
 		}
 	}
 
-	// Cache miss — do the real work.
 	r, deps, err := runScanner(cc, source, flags)
 	if err != nil {
 		return nil, err
@@ -76,17 +59,15 @@ func Run(l paths.Layout, cc, source string, flags []string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Write cache best-effort. If it fails we still return the result.
 	if err := writeAtomic(outPath, body); err == nil {
 		_ = writeAtomic(depsPath, encodeDeps(deps))
 	}
 	return r, nil
 }
 
-// depEntry is one line in the .deps file: <abs>\t<mtime-nsec>.
 type depEntry struct {
 	abs   string
-	mtime int64 // unix nanoseconds; -1 if the file was missing when scanned
+	mtime int64 // -1 if missing when scanned
 }
 
 func depsStillFresh(path string) (bool, error) {
@@ -94,8 +75,6 @@ func depsStillFresh(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// Format: one line per file, `<abs>\t<mtime-nsec>`. Batch the stats
-	// to keep the syscall count linear.
 	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte{'\n'})
 	for _, line := range lines {
 		tab := bytes.IndexByte(line, '\t')
@@ -106,7 +85,7 @@ func depsStillFresh(path string) (bool, error) {
 		recorded := string(line[tab+1:])
 		info, err := os.Stat(abs)
 		if err != nil {
-			return false, nil // vanished file → invalidate
+			return false, nil
 		}
 		cur := fmt.Sprintf("%d", info.ModTime().UnixNano())
 		if cur != recorded {
@@ -128,24 +107,18 @@ func cacheKey(cc, source string, flags []string) string {
 	h := sha256.New()
 	fmt.Fprintln(h, cc)
 	fmt.Fprintln(h, source)
-	// Preserve order — flag order can affect semantics.
 	for _, f := range flags {
 		fmt.Fprintln(h, f)
 	}
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
-// runScanner executes `gcc -MM -MG` and turns its output into a Result.
-// The scanner runs in the caller's cwd; that's where relative headers
-// live and where -I flags are interpreted.
+// runScanner executes `gcc -M -MG` and turns its output into a Result.
 func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, nil, err
 	}
-	// Collect user-supplied include dirs from flags. Both attached
-	// (-I/path) and separated (-I /path) forms; also -isystem, -iquote,
-	// -idirafter, -include.
 	includeDirs := extractIncludeDirs(flags)
 	forceIncludes := extractForceIncludes(flags)
 
@@ -178,8 +151,6 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	}
 	projectRoot := commonAncestor(projectRootHints)
 
-	// Strip -M* dep-generation flags from the scanner's argv — we
-	// supply our own -MM -MG -MF -.
 	scanFlags := stripDepFlags(flags)
 
 	// -M, not -MM: -MM omits headers gcc classifies as "system" by
@@ -188,10 +159,9 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	// even though the TU needs them staged. -M has no such exclusion;
 	// -MG still tolerates a missing header as a bare name.
 	cmd := exec.Command(cc, append([]string{"-M", "-MG", "-MF", "-", source}, scanFlags...)...)
-	cmd.Stderr = nil // best-effort — we tolerate cc's warnings
+	cmd.Stderr = nil
 	out, err := cmd.Output()
 	if err != nil {
-		// Show stderr on failure so users can see what went wrong.
 		var stderr string
 		if ee, ok := err.(*exec.ExitError); ok {
 			stderr = string(ee.Stderr)
@@ -212,8 +182,6 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 		tokens = append(tokens, incTokens...)
 	}
 
-	// Resolve each token: absolute path, or search cwd + user -I dirs.
-	// Widen projectRoot to cover any dep found outside its current span.
 	var resolved []string
 	for _, tok := range tokens {
 		if tok == filepath.Base(source) || tok == source {
@@ -221,7 +189,7 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 		}
 		abs, ok := resolveDep(tok, projectRootHints)
 		if !ok {
-			continue // -MG bare name we couldn't find; ignore
+			continue
 		}
 		if abs == srcAbs {
 			continue
@@ -232,16 +200,13 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 		resolved = append(resolved, abs)
 	}
 
-	// Widen project root to include every resolved header.
 	for _, abs := range resolved {
 		projectRoot = widen(projectRoot, filepath.Dir(abs))
 	}
 
-	// Now build the Result.
 	seen := make(map[string]bool)
 	var headers []Header
 	var deps []depEntry
-	// Source itself is a dep for cache invalidation but not a header.
 	deps = append(deps, statOr(srcAbs))
 	for _, abs := range resolved {
 		if seen[abs] {
@@ -255,19 +220,14 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 		headers = append(headers, Header{Abs: abs, Rel: rel})
 		deps = append(deps, statOr(abs))
 	}
-	// Sort headers by staging rel path so thunk content is stable.
 	sort.Slice(headers, func(i, j int) bool { return headers[i].Rel < headers[j].Rel })
 
 	iflags := stagedIFlags(projectRoot, callerDirs)
-	// Store dirs pass through unchanged.
 	var storeFlags []string
 	for _, d := range storeDirs {
 		storeFlags = append(storeFlags, "-I"+d)
 	}
 
-	// `-include <file>` rewritten to point at the staged copy (the file
-	// is already in `headers`). A force-include outside projectRoot
-	// (e.g. /nix/store) isn't staged, so it's passed through verbatim.
 	var includeFlags []string
 	for _, f := range forceIncludes {
 		abs := f
@@ -280,8 +240,6 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 		}
 		rel, err := filepath.Rel(projectRoot, abs)
 		if err != nil || strings.HasPrefix(rel, "..") {
-			// Outside the staged tree entirely; keep the absolute path
-			// rather than emitting a relative path that won't resolve.
 			includeFlags = append(includeFlags, "-include", abs)
 			continue
 		}
@@ -297,15 +255,12 @@ func runScanner(cc, source string, flags []string) (*Result, []depEntry, error) 
 	}, deps, nil
 }
 
-// stagedIFlags rewrites callerDirs (the caller's -I/-isystem/-iquote/
-// -idirafter dirs) relative to the staged project root. cwd and the
-// source's own directory are deliberately excluded — they are
-// projectRoot hints only, not real -I flags: leaking srcDir out as an
-// -I (e.g. ffmpeg's libavutil/ from its root) can shadow a libc header
-// with a same-named project one, since -I is searched before -isystem.
-//
-// "-I." is always first so the staged root is on the include path.
-// Results are deduped by rel path.
+// stagedIFlags rewrites callerDirs relative to the staged project
+// root. cwd and the source's own directory are deliberately excluded
+// — they are projectRoot hints only, not real -I flags: leaking srcDir
+// out as an -I (e.g. ffmpeg's libavutil/ from its root) can shadow a
+// libc header with a same-named project one, since -I is searched
+// before -isystem.
 func stagedIFlags(projectRoot string, callerDirs []string) []string {
 	iflags := []string{"-I."}
 	seenRel := map[string]bool{".": true}
@@ -337,10 +292,9 @@ func statOr(abs string) depEntry {
 	return depEntry{abs: abs, mtime: info.ModTime().UnixNano()}
 }
 
-// extractIncludeDirs pulls user-supplied include DIRECTORIES from the
-// -I family (attached and separated forms). `-include` is deliberately
-// excluded: its value is a file to force-include, not a search dir —
-// see extractForceIncludes.
+// extractIncludeDirs pulls user-supplied include dirs from the -I
+// family (attached and separated forms). `-include` is excluded — its
+// value is a file to force-include, not a search dir.
 func extractIncludeDirs(flags []string) []string {
 	var out []string
 	pathFlags := map[string]bool{
@@ -423,7 +377,6 @@ func scanIncbinTargets(cc, source string, flags []string) ([]string, error) {
 }
 
 func parseMakeDeps(out []byte) []string {
-	// Join line-continuations first.
 	var buf bytes.Buffer
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
@@ -437,12 +390,10 @@ func parseMakeDeps(out []byte) []string {
 		buf.Write(line)
 		buf.WriteByte(' ')
 	}
-	// Strip the "target:" prefix.
 	joined := buf.String()
 	if colon := strings.IndexByte(joined, ':'); colon >= 0 {
 		joined = joined[colon+1:]
 	}
-	// Split on whitespace.
 	var toks []string
 	for _, f := range strings.Fields(joined) {
 		toks = append(toks, f)
@@ -450,11 +401,11 @@ func parseMakeDeps(out []byte) []string {
 	return toks
 }
 
+// resolveDep must return a *cleaned* absolute path: gcc -MM emits
+// paths like "common/../common/zstd_deps.h" that resolve to the same
+// file as "common/zstd_deps.h", and dedup downstream keys on the abs
+// string.
 func resolveDep(tok string, userDirs []string) (string, bool) {
-	// Both branches must return a *cleaned* absolute path: gcc -MM
-	// emits paths like "common/../common/zstd_deps.h" that resolve to
-	// the same underlying file as "common/zstd_deps.h", and we dedup
-	// downstream on the abs string. filepath.Clean collapses "..".
 	if filepath.IsAbs(tok) {
 		clean := filepath.Clean(tok)
 		if _, err := os.Stat(clean); err == nil {
@@ -463,7 +414,7 @@ func resolveDep(tok string, userDirs []string) (string, bool) {
 		return "", false
 	}
 	for _, d := range userDirs {
-		p := filepath.Join(d, tok) // Join cleans
+		p := filepath.Join(d, tok)
 		if _, err := os.Stat(p); err == nil {
 			abs, err := filepath.Abs(p)
 			if err == nil {
@@ -510,14 +461,8 @@ func isPrefixOfPath(root, path string) bool {
 	return strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
-// The scan cache stores enough to reconstruct a Result without redoing
-// the fs walk. We use a compact newline-delimited format instead of
+// The cache format is a compact newline-delimited scheme instead of
 // JSON to keep parse cost low.
-//
-//	line 0:   PROJECT_ROOT=<path>
-//	line 1..: STAGED_IFLAG=<flag>  (repeated, order preserved)
-//	line ..:  STORE_IFLAG=<flag>   (repeated)
-//	line ..:  HEADER=<abs>\t<rel>  (repeated)
 func encodeResult(r *Result) ([]byte, error) {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "PROJECT_ROOT=%s\n", r.ProjectRoot)
@@ -527,9 +472,6 @@ func encodeResult(r *Result) ([]byte, error) {
 	for _, f := range r.StoreIFlags {
 		fmt.Fprintf(&b, "STORE_IFLAG=%s\n", f)
 	}
-	// One line per element, not per pair: StagedIncludeFlags is a flat
-	// ["-include", "<rel>", ...] slice and decode appends in order, so
-	// the pairing is preserved without special-casing.
 	for _, f := range r.StagedIncludeFlags {
 		fmt.Fprintf(&b, "STAGED_INCLUDE=%s\n", f)
 	}

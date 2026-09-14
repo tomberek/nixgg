@@ -24,22 +24,12 @@ import (
 )
 
 // Link is the shim entrypoint for `cc ... foo.o bar.o -o baz` (no -c).
-// It classifies every input by inspecting its symlink and produces a
-// link thunk that references each input either by store path (already
-// realised) or by relative sibling thunk import (deferred).
-//
-// If any input isn't a nixgg symlink at all — a plain .o that make
-// left behind, or a system library the caller passes by name — we
-// fall back to passthrough. We can't model the link without knowing
-// how to represent every input in the Nix expression.
 func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layout) error {
 	realTool := realToolFor(cfg, tool)
 	if bypassed() {
-		// See compile.go: no logf, autoconf/cmake link probes
-		// (AC_LINK_IFELSE, try_compile) treat any stderr as failure.
+		// No logf: autoconf/cmake link probes treat any stderr as failure.
 		return Passthrough(realTool, args)
 	}
-	// Refuse compile-family invocations that only *look* like a link.
 	for _, a := range args {
 		switch a {
 		case "-c", "-E", "-S", "-M", "-MM":
@@ -54,10 +44,8 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 	if !ok {
 		logf("link passthrough: unparseable link line (%s)", joinBase(args))
 		activitylog.Emit("link", "passthrough", activitylog.Fields{"reason": "unparseable", "argv": args})
-		// RealiseThunkArgsAndPassthrough, not a bare Passthrough: an
-		// unparseable link line may still name real nixgg thunk siblings
-		// among its inputs, which must be realised before the real
-		// linker reads them — see that function's own docstring.
+		// Not a bare Passthrough: other inputs on this line may still be
+		// real nixgg thunk siblings that need realising first.
 		return RealiseThunkArgsAndPassthrough(cfg, l, realTool, args, sandbox.Enabled())
 	}
 
@@ -65,27 +53,18 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 
 	// A linker-script flag (-Wl,--version-script=<path>, -Wl,-T,<path>,
 	// -Xlinker --dynamic-list=<path>) names a file some unshimmed tool
-	// in the caller's own build wrote moments earlier (openssl's
-	// `mkdef.pl`, meson's configure_file()) — never something nixgg
-	// produced. The link runs in its own fresh sandbox that never saw
-	// this file, so its content must be staged explicitly, same as
-	// compile.go does for local headers.
+	// in the caller's own build wrote moments earlier, never something
+	// nixgg produced; the link's own sandbox never saw it and must
+	// stage its content explicitly.
 	//
-	// Two mechanisms, chosen by whether the path is relative or
-	// absolute:
-	//
-	//   - Relative (openssl): staged via stage.ContentFiles (+
-	//     sandbox.StoreAddDirectory in sandbox mode), not embedded as
-	//     script text — a large linker script plus hundreds of object
-	//     paths on one link line can exceed the kernel's argv limit if
-	//     baked into the script body (confirmed: openssl's
-	//     libcrypto.so.3, "Argument list too long").
-	//   - Absolute (QEMU): meson bakes the build tree's own absolute
-	//     path into the generated file's name at configure time, so
-	//     the relative mechanism above has nothing to copy into.
-	//     Embedded directly as script text instead — every fixture
-	//     that hits this is a small generated file (QEMU's is 59
-	//     lines), so the argv-limit concern doesn't apply.
+	// Relative paths (openssl) are staged via stage.ContentFiles rather
+	// than embedded as script text: a large script plus hundreds of
+	// object paths on one link line can exceed the kernel's argv limit
+	// (confirmed: openssl's libcrypto.so.3, "Argument list too long").
+	// Absolute paths (QEMU/meson) bake the build tree's own path into
+	// the generated file's name, so there's nothing to copy into —
+	// embedded directly as script text instead (QEMU's is 59 lines,
+	// well under the argv limit).
 	var inlineFilesStore, absFilePath, absFileContent string
 	if path := linkerScriptPath(args); path != "" {
 		c := classify.Target(path, altStorePrefix(cfg.Store), l)
@@ -108,9 +87,8 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 				return fmt.Errorf("stage linker script %s: %w", path, err)
 			}
 			if sandbox.Enabled() || sandbox.EagerDrv() {
-				// Non-scanning upload for store-path parity with native
-				// mode's plain path-literal import — same reason as
-				// compile.go's SrcStore.
+				// Non-scanning upload, for store-path parity with native
+				// mode (see compile.go's SrcStore).
 				inlineFilesStore, err = sandbox.StoreAddDirectory(cfg, id, stageDir)
 				if err != nil {
 					return fmt.Errorf("stage linker script %s to store: %w", path, err)
@@ -124,13 +102,9 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 	// Classify each input.
 	altPrefix := altStorePrefix(cfg.Store)
 	ci, err, ok := classifyInputs(cfg, inputs, altPrefix, l, "link", func() error {
-		// One sibling input couldn't be classified, so the WHOLE link
-		// falls back to the real, unshimmed linker — but the OTHER,
-		// already-classified inputs may still be real nixgg thunks.
-		// Realize them first; see archive.go's identical reasoning
-		// and RealiseThunkArgsAndPassthrough's own docstring for the
-		// concrete failure this prevents (a real `ld` reading a
-		// placeholder thunk symlink as if it were an object file).
+		// The other, already-classified inputs may still be real nixgg
+		// thunks that need realising before falling back to the real
+		// linker — see RealiseThunkArgsAndPassthrough.
 		return RealiseThunkArgsAndPassthrough(cfg, l, realTool, args, sandbox.Enabled())
 	})
 	if !ok {
@@ -144,9 +118,6 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 	storeDeps := storedeps.From(flags, wrapperEnvJSON, cfg.KnownStorePaths)
 
 	// Sandbox mode (or EagerDrv): emit JSON, register the drv.
-	// linkSandbox's own maybeSubmit call is a no-op unless
-	// sandbox.Enabled() is the real kind — EagerDrv has no outer
-	// builder-rpc-v0 derivation to submit an output for.
 	if sandbox.Enabled() || sandbox.EagerDrv() {
 		return linkSandbox(cfg, tool, output, ci.JSON, ci.ExtraJSON, flags, group, wholeArchiveInputs, inlineFilesStore, absFilePath, absFileContent, storeDeps, wrapperEnvJSON)
 	}
@@ -176,7 +147,8 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 	// tool reads back synchronously in the same recursive make (Linux
 	// Kbuild's arch/x86/tools/relocs on realmode.elf — see mode.go).
 	// "bin" is passed explicitly rather than guessed from output's
-	// name — see realiseAndLink's own docstring for why (vmlinux.o).
+	// name, since realiseAndLink's own name-based guess is wrong for
+	// vmlinux.o.
 	if mode.ForLink(output) == mode.Realise {
 		return realiseAndLink(e, output, "bin", cfg, l)
 	}
@@ -201,9 +173,8 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 	// NIXGG_AUTOFORCE=1: realise the link's DAG inline, so a plain
 	// `NIXGG_AUTOFORCE=1 make` produces real binaries in the working
 	// tree without a wrapper (`nixgg build …`). Only the link shim
-	// does this; compile/archive shims stay placeholder so we don't
-	// force intermediate .o/.a files that are just going to be linked
-	// into something else on the next line.
+	// does this; compile/archive shims stay placeholder so intermediate
+	// .o/.a files aren't forced ahead of the link that consumes them.
 	if os.Getenv("NIXGG_AUTOFORCE") == "1" {
 		if err := realise.Realise(l, cfg, thunkPath, output); err != nil {
 			return err
@@ -213,9 +184,7 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 }
 
 // parseLinkArgs pulls out -o OUT and every .o/.a input token, treating
-// everything else as a flag. Order matters for the flags — link line
-// order affects symbol resolution — but not for the inputs (the
-// linker.nix helper preserves order).
+// everything else as a flag.
 //
 // `-L<dir> -l<name>` pairs get resolved against local files: if
 // `<dir>/lib<name>.a` exists as a nixgg drvref stub (or thunk
@@ -226,8 +195,7 @@ func Link(tool dispatch.Tool, args []string, cfg *toolchain.Config, l paths.Layo
 // because the produced `.a` isn't on the sandbox's link path.
 
 // isGroupBracket reports whether a token opens or closes a linker
-// archive group. Both spellings ld accepts are handled; verified that
-// `-Wl,-(` / `-Wl,-)` link the same circular case as the long form.
+// archive group. Both spellings ld accepts are handled.
 func isGroupBracket(a string) bool {
 	switch a {
 	case "-Wl,--start-group", "-Wl,--end-group", "-Wl,-(", "-Wl,-)",
@@ -239,11 +207,10 @@ func isGroupBracket(a string) bool {
 
 // isWholeArchiveStart/isWholeArchiveEnd report whether a token opens
 // or closes a --whole-archive span. Unlike isGroupBracket's single
-// global group (safe to widen — see GroupInputs' docstring),
-// --whole-archive's span changes archive MEMBER SELECTION (force
-// every member in, vs. only members something else references), so it
-// must track exactly which inputs the caller's own line put inside it
-// — see WholeArchiveInputs' own docstring.
+// global group, --whole-archive's span changes archive MEMBER
+// SELECTION (force every member in, vs. only members something else
+// references), so it must track exactly which inputs the caller's own
+// line put inside it.
 func isWholeArchiveStart(a string) bool {
 	return a == "-Wl,--whole-archive" || a == "--whole-archive"
 }
@@ -257,10 +224,9 @@ func parseLinkArgs(args []string) (output string, inputs, flags []string, group,
 }
 
 // parseLinkArgsWholeArchive is parseLinkArgs' real implementation,
-// also returning the WholeArchiveInputs subset (see the Derivation
-// field of the same name). Split out so parseLinkArgs' own signature
-// — used at every existing call site — stays unchanged; only the one
-// caller that needs to plumb WholeArchiveInputs through to expr.Link/
+// also returning the WholeArchiveInputs subset. Split out so
+// parseLinkArgs' own signature stays unchanged; only the one caller
+// that needs to plumb WholeArchiveInputs through to expr.Link/
 // LinkJSON calls this directly.
 func parseLinkArgsWholeArchive(args []string, wholeArchive *[]string) (output string, inputs, flags []string, group, ok bool) {
 	var libDirs []string
@@ -280,9 +246,7 @@ func parseLinkArgsWholeArchive(args []string, wholeArchive *[]string) (output st
 		// DT_SONAME metadata, not a link input, but isSharedLib's
 		// generous `.so.N` match would otherwise misclassify a value
 		// like Kbuild's `-soname linux-gate.so.1` as a shared-library
-		// input — confirmed: without this case the whole vdso32.so.dbg
-		// link fell to Passthrough (classifyInputs correctly reported
-		// "linux-gate.so.1" absent, since it names nothing on disk).
+		// input.
 		case a == "-soname":
 			if i+1 < len(args) {
 				flags = append(flags, a, args[i+1])
@@ -295,14 +259,12 @@ func parseLinkArgsWholeArchive(args []string, wholeArchive *[]string) (output st
 		// inputs, which would leave the pair spanning nothing. Record
 		// that a group was requested and re-emit it around the whole
 		// input list instead. Objects inside a group are harmless
-		// (verified against ld), so widening the span is safe where
-		// preserving the exact original span is not expressible.
+		// (verified against ld), so widening the span is safe here.
 		case isGroupBracket(a):
 			group = true
-		// --whole-archive is ALSO positional, but unlike the group
-		// brackets above its span cannot be widened (see
-		// isWholeArchiveStart's own docstring) — track exactly which
-		// inputs fall inside it instead.
+		// --whole-archive is ALSO positional, but its span cannot be
+		// widened like a group bracket's (see isWholeArchiveStart) —
+		// track exactly which inputs fall inside it instead.
 		case isWholeArchiveStart(a):
 			inWholeArchive = true
 		case isWholeArchiveEnd(a):
@@ -335,14 +297,12 @@ func parseLinkArgsWholeArchive(args []string, wholeArchive *[]string) (output st
 			// skip
 		case a == "-MF" || a == "-MT" || a == "-MQ":
 			i++ // skip value
-		// Drop `-Wl,--dependency-file=<path>`. CMake 4 emits this on link
-		// lines so ninja can track link-time deps; it makes ld *write* a
-		// makefile fragment to a build-tree-relative path. That path
-		// doesn't exist in the link drv's sandbox (we only stage inputs,
-		// not the caller's build tree), so ld fails with "cannot open
-		// dependency file …/link.d". Same rationale as the -M* family
-		// above: dep tracking is the caller's build system's concern, and
-		// Nix's CA hashing already handles rebuild correctness.
+		// Drop `-Wl,--dependency-file=<path>`: CMake 4 emits this so ld
+		// writes a link-time dep makefile fragment to a build-tree-
+		// relative path that doesn't exist in the link drv's sandbox
+		// (only staged inputs do), which otherwise fails "cannot open
+		// dependency file". Dep tracking is the caller's build system's
+		// concern; Nix's CA hashing already handles rebuild correctness.
 		case strings.HasPrefix(a, "-Wl,--dependency-file="):
 			// skip
 		case a == "-Wl,--dependency-file":
@@ -360,21 +320,15 @@ func parseLinkArgsWholeArchive(args []string, wholeArchive *[]string) (output st
 // linkerScriptPath scans a link line for a linker-script flag and
 // returns the path it names, or "" if none is present. Handles:
 //
-//   - `-Wl,--version-script=<path>` / `-Wl,-T,<path>` (comma-joined,
-//     gcc's usual form)
-//   - plain `-T <path>` / `-T<path>` (rare on a driver's own command
-//     line, but ld itself accepts them)
-//   - `-Wl,--dynamic-list=<path>` — same shape, different flag; QEMU's
-//     meson build uses it for its plugin-symbol-export list
-//   - `-Xlinker <value>` (two argv tokens, gcc passes <value> to the
-//     linker verbatim) — QEMU emits `-Xlinker --dynamic-list=<path>`
-//     this way rather than the comma-joined form
-//   - bare `--script=<path>` — ld's long-form spelling with no
-//     `-Wl,`/`-Xlinker` wrapper, used when raw `ld` is invoked
-//     directly; Linux Kbuild's link-vmlinux.sh does this (confirmed:
-//     without this case vmlinux's own link failed "cannot open linker
-//     script file ... vmlinux.lds", the relative path existing in the
-//     caller's build tree but never staged into the sandbox)
+//   - `-Wl,--version-script=<path>` / `-Wl,-T,<path>` (gcc's usual
+//     comma-joined form)
+//   - plain `-T <path>` / `-T<path>`
+//   - `-Wl,--dynamic-list=<path>` — QEMU's meson build uses it for its
+//     plugin-symbol-export list
+//   - `-Xlinker <value>` (two argv tokens) — QEMU emits
+//     `-Xlinker --dynamic-list=<path>` this way instead
+//   - bare `--script=<path>` — used when raw `ld` is invoked directly;
+//     Linux Kbuild's link-vmlinux.sh does this
 //
 // Excludes `-Ttext=`/`-Tdata=`/`-Tbss=` — same `-T` prefix, but an
 // address override, not a script path.
@@ -435,19 +389,15 @@ func linkerScriptPath(args []string) string {
 //
 // Returns "" when nothing matched, or when the match is a file we did
 // not create — a vendored or system archive must stay a `-l` flag so
-// the linker resolves it normally. Claiming one would reference a drv
-// input that doesn't exist.
+// the linker resolves it normally.
 func resolveLibFlag(name string, libDirs []string) string {
 	if name == "" {
 		return ""
 	}
-	// Candidate filename(s) to look for in each -L dir.
 	var files []string
 	if strings.HasPrefix(name, ":") {
 		exact := name[1:]
 		if exact == "" || strings.ContainsRune(exact, filepath.Separator) {
-			// `-l:` with nothing, or with a path separator, is not a
-			// plain filename — leave it to the linker.
 			return ""
 		}
 		files = []string{exact}
@@ -468,19 +418,12 @@ func resolveLibFlag(name string, libDirs []string) string {
 				continue
 			}
 			if fi.Mode()&os.ModeSymlink != 0 {
-				// Native mode: symlink to a .nix thunk or a .drv path.
 				return cand
 			}
 			// Sandbox mode: drvref stub is a small regular file with
-			// our magic header. Peek at the first byte cheaply.
-			//
-			// batchpending.Is covers the deferred-batch-member case: a
-			// still-pending compile matched via -l rather than a direct
-			// path. Without this check a wholly-batched static lib
-			// referenced as -lfoo would silently resolve to nothing
-			// inside the sandbox; classifyInputs' own fallback resolves
-			// it once claimed as an input, same as any other pending
-			// member.
+			// our magic header. batchpending.Is covers the deferred-
+			// batch-member case: a still-pending compile matched via
+			// -l rather than a direct path.
 			if fi.Mode().IsRegular() && fi.Size() < 4096 {
 				if drvref.Is(cand) || batchpending.Is(cand) {
 					return cand
@@ -496,18 +439,15 @@ func resolveLibFlag(name string, libDirs []string) string {
 //
 // A token we fail to recognize here does NOT fall through to
 // Passthrough — parseLinkArgs files it under `flags`, so it gets baked
-// into the drv as a bare relative path. Inside the sandbox that path
-// doesn't exist (only staged inputs do), so the link fails at best and
-// silently resolves to something else at worst. Recognizing a token is
-// what routes it through classify.Target, which is the actual safety
-// net: an unowned file classifies as Regular and triggers Passthrough.
+// into the drv as a bare relative path, which doesn't exist inside
+// the sandbox. Recognizing a token is what routes it through
+// classify.Target, which is the actual safety net: an unowned file
+// classifies as Regular and triggers Passthrough.
 //
 // Anything starting with `-` is a flag, never a file. Without that
 // guard `-l:libfoo.a` (the exact-name form of -l) has filepath.Ext
-// ".a" and is mistaken for an archive; classify.Target then stats a
-// file literally named "-l:libfoo.a", gets Absent, and passes through —
-// accidentally safe, but for the wrong reason. resolveLibFlag handles
-// that form properly.
+// ".a" and is mistaken for an archive; resolveLibFlag handles that
+// form properly.
 func isLinkInput(a string) bool {
 	if a == "" || strings.HasPrefix(a, "-") {
 		return false
@@ -518,14 +458,11 @@ func isLinkInput(a string) bool {
 	if ext == ".o" || ext == ".a" || ext == ".xo" || ext == ".lo" {
 		return true
 	}
-	// Shared libraries, including the versioned `libfoo.so.1.2.3` form
-	// that filepath.Ext reports as ".3". A positional .so on the link
-	// line is an input like any other.
 	return isSharedLib(a)
 }
 
 // isSharedLib matches `libfoo.so` and versioned `libfoo.so.1[.2[.3]]`.
-// Checked as a `.so` segment rather than a suffix so that a file merely
+// Checked as a `.so` segment rather than a suffix so a file merely
 // ending in a number (`foo.1`) doesn't match.
 func isSharedLib(a string) bool {
 	base := strings.ToLower(filepath.Base(a))
@@ -536,8 +473,6 @@ func isSharedLib(a string) bool {
 	if i < 0 {
 		return false
 	}
-	// Every remaining segment after `.so.` must be numeric, so
-	// `libfoo.so.1.2` matches but `libfoo.solid.txt` does not.
 	for _, seg := range strings.Split(base[i+len(".so."):], ".") {
 		if seg == "" {
 			return false
@@ -551,8 +486,6 @@ func isSharedLib(a string) bool {
 	return true
 }
 
-// altStorePrefix returns the on-disk root for `local?root=...` stores.
-// For a system or `auto` store, returns "".
 func altStorePrefix(storeURL string) string {
 	const prefix = "local?root="
 	if strings.HasPrefix(storeURL, prefix) {
@@ -576,21 +509,18 @@ func joinBase(inputs []string) string {
 // this link, hand it to `nix derivation add`, and submit the returned
 // .drv as the current outer derivation's output.
 //
-// Every link in a sandbox is a candidate final output. That's fine —
-// nix store submit-output only allows one submission per output name,
-// so a build with multiple links must arrange for only one to be
-// "the" output (via NIXGG_SANDBOX_TARGET, matched against the -o
-// output). Other link steps just add their drvs to the store without
+// Every link in a sandbox is a candidate final output. `nix store
+// submit-output` only allows one submission per output name, so a
+// build with multiple links must arrange for only one to be "the"
+// output (via NIXGG_SANDBOX_TARGET, matched against the -o output).
+// Other link steps just add their drvs to the store without
 // submitting; the consumer's `builtins.outputOf` reaches them
 // transitively through the target's inputs.drvs.
 //
-// A multi-target build (NIXGG_SANDBOX_TARGET is the JSON-map shape —
-// see maybeSubmit's docstring) needs this link's own drv NAMED to
-// match Nix's outputPathName($name, outputKey) check, not just
-// submitted under the right key: $name (the outer wrapper's own
-// derivation name, e.g. "nixgg-mosh") comes from Nix's own env var of
-// that name, always present. See LinkJSONParams.Name's docstring for
-// why "bin-<outName>" alone isn't enough once there's more than one
+// A multi-target build needs this link's own drv NAMED to match
+// Nix's outputPathName($name, outputKey) check, not just submitted
+// under the right key — see LinkJSONParams.Name's docstring for why
+// "bin-<outName>" alone isn't enough once there's more than one
 // target sharing an outer wrapper.
 func linkSandbox(
 	cfg *toolchain.Config,
@@ -658,8 +588,7 @@ func linkSandbox(
 
 	// Single-target builds: mkNixggBuild names the outer drv
 	// "bin-<target>.drv" to match our inner link drv's name, so no
-	// rename is needed there — the `name` override above only
-	// triggers for a matched multi-target key.
+	// rename is needed there.
 	maybeSubmit(cfg, drvPath, output, true)
 	return nil
 }
@@ -668,19 +597,15 @@ func linkSandbox(
 // a relative path, or an absolute path) refers to `output`.
 //
 // The basename fallback ONLY fires when target itself has no
-// directory component — i.e. the caller declared a bare name and
-// expects it to match wherever the real build put it (every existing
-// fixture's own single-target case: "mosh-server", "libfmt.a", …).
-// If target itself is a relative/absolute PATH (contains a "/"),
-// matching drops to exact/absolute comparison only — confirmed
-// necessary directly: Linux Kbuild's own recursive build produces
-// MANY archives sharing a basename ("lib.a" at both lib/lib.a and
-// arch/x86/lib/lib.a; "built-in.a" at dozens of directories). A path-
-// aware target ("lib/lib.a") that still fell through to basename
-// comparison would ALSO match "arch/x86/lib/lib.a"'s own call —
-// `filepath.Base` strips every directory component, not just "target
-// has none" — and maybeSubmit would try to SubmitOutput the SAME
-// output key twice, for two different (and only one correct) drvs.
+// directory component — a caller that declared a bare name expects it
+// to match wherever the real build put it. If target is itself a
+// relative/absolute PATH (contains a "/"), matching drops to exact/
+// absolute comparison only — necessary because Linux Kbuild's
+// recursive build produces many archives sharing a basename
+// ("lib.a" at both lib/lib.a and arch/x86/lib/lib.a); a path-aware
+// target still falling through to basename comparison would match
+// both, and maybeSubmit would try to submit the same output key
+// twice for two different drvs.
 func matchesTarget(target, output string) bool {
 	if target == output {
 		return true

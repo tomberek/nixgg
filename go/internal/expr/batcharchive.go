@@ -1,33 +1,15 @@
-// Package expr's batch-archive emitters: a derivation shape that
-// combines N compiles + 1 archive into ONE derivation, for a
-// same-group batch (see internal/batch). Purely additive — does not
-// touch Derivation, Kind, buildScript, ToNix, or toJSON, keeping the
-// byte-pinned output of the three existing Kinds
-// (KindCompile/KindLink/KindArchive) untouched, since
-// tests/drv-equivalence.sh depends on it matching exactly.
+// Package expr's batch-archive emitters combine N compiles + 1 archive
+// into ONE derivation for a same-group batch (see internal/batch).
+// Native mode leaves each member's srcTree as an unquoted Nix path
+// literal for nix/batchArchiver.nix to interpolate at eval time (Go
+// never sees the resolved store path); everything else in the compile
+// line is pre-quoted shell text.
 //
-// Unlike every existing Kind, this derivation's inputs are never an
-// unrealized sibling drv/thunk: the caller (internal/shim's
-// tryBatchArchive) only reaches this once every input is confirmed to
-// be a plain staged source tree in the same batch group. So none of
-// internal/expr's own @NIXGG_*@-marker / native-mode
-// resolve-script.nix substitution machinery applies here.
-//
-// Sandbox mode's script is fully-resolved text, same as any Kind's
-// own script() with tag=="". Native mode splits differently: Go
-// renders each member's compile line as plain, already shell-quoted
-// text (memberCompileLine), but leaves the member's own srcTree as a
-// Nix path literal for nix/batchArchiver.nix itself to interpolate at
-// eval time, the same way builder.nix interpolates its own srcTree.
-// Go never sees the resolved store path; Nix never re-quotes shell
-// text.
-//
-// Named "batch-<outName>" rather than "ar-<outName>", deliberately:
-// tests/drv-equivalence.sh's filter (^[a-z0-9]+-(tu-|ar-|bin-)) is
-// regex-based and would otherwise see this as an ar-produced drv with
-// no native-mode counterpart of the SAME shape, and report a
-// false-positive "only in sandbox" mismatch. tests/batch-drv-equivalence.sh
-// is this shape's own, separate equivalence check.
+// Named "batch-<outName>" rather than "ar-<outName>" so
+// tests/drv-equivalence.sh's regex filter (which expects tu-/ar-/bin-
+// prefixed names) doesn't mistake it for a plain archive with no
+// native counterpart; tests/batch-drv-equivalence.sh covers this
+// shape's own equivalence separately.
 package expr
 
 import (
@@ -36,15 +18,14 @@ import (
 )
 
 // BatchCompileMember is one compile folded into a combined batch
-// archive, in the archive's own `ar` argv order (order matters: it
-// determines both compile-then-archive script order and the
-// resulting archive's own member order).
+// archive, in the archive's own `ar` argv order (also the compile
+// script order, and the resulting archive's member order).
 type BatchCompileMember struct {
-	Tool     string // "cc", "gcc", "c++", "g++"
-	SrcTree  string // native: Nix path literal, e.g. "../srcs/foo" (unused in sandbox JSON path)
-	SrcStore string // sandbox: full /nix/store/... path, already uploaded (unused in native path)
-	Source   string // relative path inside the src tree, e.g. "sds.c"
-	OutName  string // "sds.o"
+	Tool     string
+	SrcTree  string // native mode only
+	SrcStore string // sandbox mode only
+	Source   string
+	OutName  string
 	Flags    []string
 }
 
@@ -52,7 +33,7 @@ type BatchCompileMember struct {
 // batch-archive expression.
 type BatchArchiveParams struct {
 	Helpers    string
-	OutName    string // the archive's own output name, e.g. "libhiredis.a"
+	OutName    string
 	ARFlags    string
 	Members    []BatchCompileMember
 	StoreDeps  []string
@@ -60,18 +41,9 @@ type BatchArchiveParams struct {
 }
 
 // BatchArchive renders a native-mode `import
-// <helpers>/batchArchiver.nix { ... }` expression. Mirrors
-// Derivation.ToNix's KindArchive case in shape, but constructs the
-// call directly since this Kind's argument shape (a members list, not
-// a single scriptTemplate) doesn't fit ToNix's per-Kind switch.
-//
-// Each member's compileLine is fully shell-quoted plain text (see
-// memberCompileLine) with no reference to its own srcTree —
-// nix/batchArchiver.nix splices `cd ${member.srcTree} && ` onto the
-// front at eval time, the same way builder.nix interpolates its own
-// srcTree. This keeps every value Go computes here shell-safe without
-// this package needing Nix's own string-escaping rules for a value it
-// never resolves.
+// <helpers>/batchArchiver.nix { ... }` expression. Constructs the call
+// directly rather than through Derivation.ToNix since this shape's
+// members list doesn't fit ToNix's per-Kind switch.
 func BatchArchive(p BatchArchiveParams) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "import %s/batchArchiver.nix {\n", p.Helpers)
@@ -86,12 +58,9 @@ func BatchArchive(p BatchArchiveParams) string {
 	return b.String()
 }
 
-// batchMembersList renders `[ { srcTree = ...; outName = ...;
-// compileLine = ”...”; } ... ]` — srcTree stays an unquoted Nix
-// path literal (Nix resolves it to a store path at eval time, same
-// convention as builder.nix's own srcTree argument); compileLine is
-// a Nix indented string (may contain the double quotes memberCompileLine
-// itself already emitted, so a plain %q would double-escape them).
+// compileLine uses a Nix indented string, not %q, because
+// memberCompileLine already contains double quotes that %q would
+// double-escape.
 func batchMembersList(members []BatchCompileMember) string {
 	if len(members) == 0 {
 		return "[ ]"
@@ -100,7 +69,7 @@ func batchMembersList(members []BatchCompileMember) string {
 	b.WriteString("[\n")
 	for _, m := range members {
 		b.WriteString("    { ")
-		fmt.Fprintf(&b, "srcTree = %s; ", m.SrcTree) // unquoted path literal
+		fmt.Fprintf(&b, "srcTree = %s; ", m.SrcTree)
 		fmt.Fprintf(&b, "outName = %q; ", m.OutName)
 		fmt.Fprintf(&b, "compileLine = %s; ", nixIndentedStringLiteral(memberCompileLine(m)))
 		b.WriteString("}\n")
@@ -109,11 +78,10 @@ func batchMembersList(members []BatchCompileMember) string {
 	return b.String()
 }
 
-// memberCompileLine renders one member's compile invocation as plain
-// shell text, everything already resolved and quoted EXCEPT the
-// leading `cd` into its own srcTree (left to the Nix side — see
-// package docstring). Shape matches buildScript's own KindCompile
-// case exactly, just without the surrounding `cd "$src"`.
+// memberCompileLine renders one member's compile invocation as plain,
+// already shell-quoted text, matching buildScript's KindCompile case
+// minus the `cd "$src"` (left to nix/batchArchiver.nix's own srcTree
+// interpolation).
 func memberCompileLine(m BatchCompileMember) string {
 	return fmt.Sprintf(`"%s" %s -c "%s" -o "$objroot/%s"`,
 		m.Tool, shellQuoteFlags(m.Flags), m.Source, m.OutName)
@@ -122,15 +90,12 @@ func memberCompileLine(m BatchCompileMember) string {
 // BatchArchiveJSONParams is the sandbox-mode input for one combined
 // batch-archive JSON drv.
 type BatchArchiveJSONParams struct {
-	Name      string // derivation name, e.g. "batch-libhiredis.a" — no .drv suffix
-	OutName   string // the archive's own output name, e.g. "libhiredis.a"
+	Name      string
+	OutName   string
 	System    string
 	Bash      string
 	Coreutils string
-	AR        string // full /nix/store/... path to gnu binutils (for `ar`); also
-	// put on PATH for compiling — every member's Tool must be reachable
-	// from the same bin/ dir, same convention compileSandbox already
-	// assumes for a single build's toolchain.
+	AR        string // also put on PATH for compiling, alongside every member's Tool
 	ARFlags   string
 	Members   []BatchCompileMember // SrcStore populated, not SrcTree
 	StoreDeps []string
@@ -139,17 +104,13 @@ type BatchArchiveJSONParams struct {
 }
 
 // BatchArchiveJSON produces a JSONDrv for a combined batch-archive
-// step: N compiles then 1 archive, one derivation, one "out" output
-// (same single-output shape as an ordinary KindArchive derivation, so
-// downstream consumption needs no changes).
+// step: N compiles then 1 archive, one derivation, one "out" output.
 //
-// The script text goes into Env["batchScript"] + passAsFile rather
-// than Args: a same-group batch large enough to matter (ffmpeg's
-// per-library archives, LLVM's libLLVMSupport) embeds one full
-// compile invocation per member, and `args = ["-c", script]` exceeds
-// the kernel's ARG_MAX past ~350 members ("Argument list too long",
-// confirmed against real projects). passAsFile writes the env var's
-// value to a file at build time instead, exposed via `${name}Path`.
+// The script goes into Env["batchScript"] + passAsFile rather than
+// Args: `args = ["-c", script]` exceeds the kernel's ARG_MAX past
+// ~350 members ("Argument list too long", confirmed against real
+// projects); passAsFile writes it to a file instead, exposed via
+// `${name}Path`.
 func BatchArchiveJSON(p BatchArchiveJSONParams) JSONDrv {
 	script := batchArchiveScript(p.Coreutils, p.AR, p.ARFlags, p.OutName, p.Members)
 	srcs := append([]string{}, p.ExtraSrcs...)
@@ -202,33 +163,16 @@ func BatchArchiveJSON(p BatchArchiveJSONParams) JSONDrv {
 	}
 }
 
-// batchArchiveScript renders the combined shell script: N compiles
-// into an objects dir, then one `ar` over all of them, in member
-// order. $objroot is captured before any `cd` so each member's -o
-// target stays absolute regardless of which srcTree the compile runs
-// from.
-//
-// $objroot's LOCATION depends on arFlags: a THIN archive (`T`) stores
-// each member's file PATH rather than its bytes, so those paths must
-// survive after this derivation's build sandbox is torn down — a
-// build-tmp scratch dir does not, but $out/lib/.nixgg-objs/ does (Nix
-// rewrites the archive's own self-references to the final resolved
-// store path). This makes a thin batch archive fully self-contained
-// in one store output. A non-thin archive keeps the original
-// build-tmp scratch dir: `ar` copies members into its own bytes, so
-// nothing needs to survive the build.
-//
-// Compiles run with bounded concurrency, capped at $NIX_BUILD_CORES
-// (falls back to 1 if unset/unparseable): folding N TUs into one
-// derivation trades away Nix's own per-derivation scheduling, so
-// without this every member compiles strictly one at a time
-// regardless of available cores (confirmed via `ps aux` on ffmpeg's
-// libavcodec batch). The FIFO wait below (oldest launched member
-// first) is deliberate: `wait -n` only reliably reports a job's exit
-// code if the job is still running when called — a job that already
-// finished can get silently reaped, and a later `wait -n` returns 127
-// instead of the real exit code, losing a real compile failure.
-// `wait "$pid"` on an explicit pid does not have this problem.
+// batchArchiveScript renders N compiles into an objects dir, then one
+// `ar` over all of them in member order. For a THIN archive (`T`),
+// $objroot must be $out/lib/.nixgg-objs (survives past sandbox
+// teardown, since a thin archive stores member paths not bytes);
+// otherwise a build-tmp scratch dir is fine since `ar` copies bytes in.
+// Compiles run at bounded concurrency (capped by $NIX_BUILD_CORES,
+// default 1) since folding N TUs into one derivation loses Nix's own
+// per-derivation scheduling. Waits are FIFO on explicit pids, not
+// `wait -n`, because `wait -n` can return 127 instead of the real exit
+// code for a job that already finished before it was called.
 func batchArchiveScript(coreutils, ar, arFlags, archiveOutName string, members []BatchCompileMember) string {
 	thin := strings.ContainsRune(arFlags, 'T')
 	var b strings.Builder
@@ -255,21 +199,13 @@ func batchArchiveScript(coreutils, ar, arFlags, archiveOutName string, members [
 	return b.String()
 }
 
-// batchConcurrencyPreamble/batchConcurrencyDrain implement a bounded-
-// concurrency job runner in plain POSIX-ish bash (no external tool —
-// this script's only PATH entries are coreutils + the compiler/ar
-// root). Each member backgrounds itself (`... &`) and immediately
-// calls gg_after with its own $! — gg_after can't take the member's
-// whole compound command as its own argument list (a subshell isn't
-// a valid argv), so backgrounding stays at each call site and only
-// the pid bookkeeping is shared. Once gg_pids reaches gg_max, the
-// OLDEST pid is waited on (FIFO) before returning — see
-// batchArchiveScript's own docstring for why FIFO, not `wait -n`.
-// gg_fail accumulates non-zero exit codes across the whole batch so
-// one early failure doesn't get lost behind later successes (plain
-// `wait` with no args only ever returns the LAST job's exit status,
-// which would silently swallow an earlier failure — confirmed
-// directly).
+// gg_after backgrounds bookkeeping for a bounded-concurrency job
+// runner (plain POSIX-ish bash, no external tool available on PATH).
+// Backgrounding happens at each compile's own call site since a
+// subshell isn't a valid argv for gg_after to take as one command;
+// only pid tracking is shared. gg_fail accumulates failures across the
+// whole batch because plain `wait` with no args only reports the LAST
+// job's exit status, which would swallow an earlier failure.
 const batchConcurrencyPreamble = `gg_max="${NIX_BUILD_CORES:-1}"
 case "$gg_max" in ''|*[!0-9]*) gg_max=1 ;; esac
 [ "$gg_max" -ge 1 ] || gg_max=1
@@ -286,10 +222,9 @@ gg_after() {
 }
 `
 
-// batchConcurrencyDrain waits out every still-running member once the
-// launch loop is done, then fails the WHOLE script if anything did —
-// deliberately after the loop, not per-member, so a later member's
-// failure is never masked by ar running anyway on a subset.
+// batchConcurrencyDrain waits out remaining members after the launch
+// loop, not per-member, so a later member's failure is never masked by
+// ar running anyway on a partial set.
 const batchConcurrencyDrain = `for gg_pid in $gg_pids; do
   wait "$gg_pid" || gg_fail=1
 done
