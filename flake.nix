@@ -178,7 +178,11 @@
               # A shim only fires if a symlink with that exact name is on
               # PATH; not exhaustive (the triple x version cross product is
               # unbounded) — add more if a real project needs them.
-              for t in ar c++ cc g++ gcc ranlib clang clang++ ld ld.bfd ld.gold ld.lld; do
+              # objtool/objcopy aren't compilers: they're per-object
+              # rewriters, reached only when a caller points the build's
+              # own tool variable (objtool=, OBJCOPY=) here — nothing
+              # resolves them via PATH otherwise.
+              for t in ar c++ cc g++ gcc ranlib clang clang++ ld ld.bfd ld.gold ld.lld objtool objcopy; do
                 ln -s ../bin/nixgg $out/shims/$t
               done
               for t in gcc g++ cc c++ ar ranlib ld; do

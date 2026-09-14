@@ -163,3 +163,34 @@ func TestStageForScanIsSelfExcluding(t *testing.T) {
 		t.Errorf("a.txt should be staged: %v", err)
 	}
 }
+
+// .nixgg is nixgg's own scratch dir (staged source trees, thunks,
+// memo caches) — never real build output, but capturing it drags
+// every store path a memo file's own content names into the captured
+// tree's closure. Neither Walk nor StageForScan may look inside it,
+// at any depth: it sits at the project root, usually several levels
+// down, not at the tree's own top level.
+func TestNixggScratchDirIsExcluded(t *testing.T) {
+	root := t.TempDir()
+	farm := filepath.Join(root, "src-1.0", "build", ".nixgg", "srcs", "tu0")
+	if err := os.MkdirAll(farm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/nix/store/aaa-hdr.h", filepath.Join(farm, "hdr.h")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src-1.0", "build", "real.txt"), []byte("out"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, err := StageForScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(staged, "src-1.0", "build", ".nixgg")); !os.IsNotExist(err) {
+		t.Error(".nixgg was copied into the staged tree; its closure would pull in every staged source object")
+	}
+	if _, err := os.Lstat(filepath.Join(staged, "src-1.0", "build", "real.txt")); err != nil {
+		t.Errorf("real build output was not staged: %v", err)
+	}
+}

@@ -51,6 +51,10 @@ func run() error {
 		return shim.Archive(args, cfg, l)
 	case dispatch.ToolLD:
 		return shim.LD(args, cfg, l)
+	case dispatch.ToolObjtool:
+		return shim.Objtool(args, cfg, l)
+	case dispatch.ToolObjcopy:
+		return shim.Objcopy(args, cfg, l)
 	case dispatch.ToolRanlib:
 		// Our archives are already indexed (ar handles `s` in the
 		// sandbox), so ranlib on them is a no-op.

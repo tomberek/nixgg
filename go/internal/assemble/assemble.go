@@ -28,10 +28,16 @@ type Stub struct {
 // skipNames are sandbox-infrastructure entries that are never real
 // build output. ".nix-socket" is builder-rpc-v0's own unix socket —
 // `nix store add --scan` can't ingest a socket. ".gg-stage" is
-// StageForScan's own working directory.
+// StageForScan's own working directory. ".nixgg" is nixgg's own
+// scratch (staged source trees, thunks, memo caches) — capturing it
+// drags every store path referenced by a memo file's own content into
+// the captured tree's closure, which at kernel scale exceeds the
+// sandbox's mount limit ("bind mount ... failed: No space left on
+// device", naming neither the cache nor the assembly).
 var skipNames = map[string]bool{
 	".nix-socket": true,
 	".gg-stage":   true,
+	".nixgg":      true,
 }
 
 // Walk finds every drvref stub under root, in deterministic
@@ -136,6 +142,13 @@ func copyRecursive(src, dst string) error {
 			return err
 		}
 		for _, e := range entries {
+			// skipNames applies at every depth, not just root:
+			// StageForScan's own top-level loop already filters, but a
+			// scratch dir named .nixgg can appear several levels down
+			// wherever paths.Resolve rooted it.
+			if skipNames[e.Name()] {
+				continue
+			}
 			if err := copyRecursive(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
 				return err
 			}

@@ -25,6 +25,13 @@ const (
 	ToolAR
 	ToolRanlib
 	ToolLD
+	// ToolObjtool: rewrites an object in place after compiling it.
+	// Reached only when the caller points the build's own `objtool=`
+	// make variable at this shim.
+	ToolObjtool
+	// ToolObjcopy: a generic object rewrite (symbol prefixing, section
+	// stripping — scripts/Makefile.lib's cmd_objcopy).
+	ToolObjcopy
 )
 
 // Basename returns the argv[0] name we advertise to the sandbox.
@@ -46,6 +53,10 @@ func (t Tool) Basename() string {
 		return "ranlib"
 	case ToolLD:
 		return "ld"
+	case ToolObjtool:
+		return "objtool"
+	case ToolObjcopy:
+		return "objcopy"
 	}
 	return ""
 }
@@ -53,7 +64,7 @@ func (t Tool) Basename() string {
 // FromArgv0 classifies the tool role from argv[0] (the basename of a
 // symlink like "cc", not its target).
 //
-// Beyond the six canonical names, real build systems invoke compilers
+// Beyond the canonical names, real build systems invoke compilers
 // under target-triple and version decorations:
 //
 //	x86_64-unknown-linux-gnu-gcc   (cross / explicit-triple toolchains)
@@ -67,9 +78,9 @@ func (t Tool) Basename() string {
 // unaccelerated. That is why this matcher is generous.
 //
 // Widening the INPUT side cannot change derivation content: every
-// accepted spelling maps onto one of the six roles, and Tool.Basename()
+// accepted spelling maps onto one of these roles, and Tool.Basename()
 // — what the drv's compile command invokes — returns one of the same
-// six canonical strings it always did. `gcc-15` is dispatched as
+// canonical strings it always did. `gcc-15` is dispatched as
 // ToolGCC and the drv still says "gcc", so the sandbox resolves the
 // pinned compiler rather than the caller's versioned one; the drv must
 // name a tool that exists inside it.
@@ -106,6 +117,10 @@ func FromArgv0(argv0 string) Tool {
 		return ToolRanlib
 	case "ld", "ld.bfd", "ld.gold", "ld.lld":
 		return ToolLD
+	case "objtool":
+		return ToolObjtool
+	case "objcopy":
+		return ToolObjcopy
 	}
 	return ToolUnknown
 }

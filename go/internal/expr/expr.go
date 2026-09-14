@@ -336,6 +336,41 @@ func PartialLinkJSON(p PartialLinkJSONParams) JSONDrv {
 	return d.toJSON(p.ExtraSrcs)
 }
 
+// TransformJSONParams describes an in-place rewrite (objtool) or
+// read/write rewrite (objcopy) of one object. Sandbox mode only.
+type TransformJSONParams struct {
+	Name      string
+	OutName   string
+	System    string
+	Bash      string
+	Coreutils string
+	ToolBin   string // absolute /nix/store/… path of the rewriting binary
+	InPlace   bool   // true: tool rewrites its single operand (objtool)
+	Flags     []string
+	Input     JSONDrvInput
+	StoreDeps []string
+	ExtraSrcs []string
+	Env       map[string]string
+}
+
+func TransformJSON(p TransformJSONParams) JSONDrv {
+	d := &Derivation{
+		Kind:        KindTransform,
+		ToolInPlace: p.InPlace,
+		Name:        p.Name,
+		System:      p.System,
+		Bash:        p.Bash,
+		Coreutils:   p.Coreutils,
+		OutName:     p.OutName,
+		ToolBin:     p.ToolBin,
+		Flags:       p.Flags,
+		Inputs:      inputsFromJSON([]JSONDrvInput{p.Input}),
+		StoreDeps:   p.StoreDeps,
+		WrapperEnv:  p.Env,
+	}
+	return d.toJSON(p.ExtraSrcs)
+}
+
 func LinkJSON(p LinkJSONParams) JSONDrv {
 	d := &Derivation{
 		Kind:               KindLink,

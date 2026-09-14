@@ -24,6 +24,12 @@ const (
 	// no native-mode helper exists, since the tools that need it only
 	// appear in builds that already require the sandbox.
 	KindPartialLink
+	// KindTransform: rewrite one existing object (objtool, in place)
+	// or read one and write another (objcopy). Sandbox mode only, same
+	// reasoning as KindPartialLink. Kept separate from the compile
+	// that produced the object so the compile stays cacheable
+	// independently of the transform's own flags.
+	KindTransform
 )
 
 // Derivation is the intermediate representation both serializers
@@ -48,10 +54,19 @@ type Derivation struct {
 	Compiler        string // gcc-wrapper root; unused by Archive
 	AR              string // binutils root (parent of bin/ar); Archive only
 
-	// PartialLink-only: absolute /nix/store/…/bin/ld path. Not taken
-	// from PATH like the compiler — a raw ld invocation is already an
-	// absolute-or-PATH-resolved binary the caller named directly.
+	// PartialLink/Transform-only: absolute /nix/store/…/bin/<tool>
+	// path. Not taken from PATH like the compiler — ld is already an
+	// absolute-or-PATH-resolved binary the caller named directly, and
+	// a Transform tool is often one the wrapped project just built
+	// itself (see shim.storeAddTool).
 	ToolBin string
+
+	// Transform-only: does the tool rewrite its operand in place
+	// (objtool: one operand) or read one file and write another
+	// (objcopy: `objcopy <flags> <in> <out>`)? In-place needs the
+	// input copied out of its read-only store path first; in/out does
+	// not.
+	ToolInPlace bool
 
 	Tool     string // "cc", "gcc", "c++", "g++"; used by Compile + Link
 	SrcStore string // staged src tree
@@ -423,6 +438,31 @@ export PATH="%s/bin"
 mkdir -p "%s"
 "%s" %s -o "%s" %s
 `, d.Coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), d.outPath(), inputs())
+	case KindTransform:
+		// PATH carries coreutils only — no compiler involved, and the
+		// transform binary is invoked by absolute path.
+		if !d.ToolInPlace {
+			// `tool <flags> <in> <out>` — objcopy's shape. Nothing to
+			// copy: the tool reads the store path and writes $out.
+			return fmt.Sprintf(
+				`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "%s"
+"%s" %s %s "%s"
+`, d.Coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), inputs(), d.outPath())
+		}
+		// In-place tools (objtool) rewrite their operand, so the input
+		// has to be copied out of its read-only store path first;
+		// chmod because store paths arrive without write permission.
+		return fmt.Sprintf(
+			`set -euo pipefail
+export PATH="%s/bin"
+mkdir -p "%s"
+cp %s "%s"
+chmod u+w "%s"
+"%s" %s "%s"
+`, d.Coreutils, d.outDir(), inputs(), d.outPath(), d.outPath(),
+			d.ToolBin, shellQuoteFlags(d.Flags), d.outPath())
 	}
 	return ""
 }
