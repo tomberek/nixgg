@@ -28,10 +28,6 @@
   # --impure because getFlake wants a real path.
   nixgg ? builtins.getFlake (toString ../..),
   system ? builtins.currentSystem,
-  # Stage each TU as a symlink farm into per-file store objects rather
-  # than copying. Without it a kernel stages ~150 GB of duplicated
-  # headers; with it, a fraction of that.
-  sharedStaging ? true,
 }:
 
 let
@@ -120,7 +116,6 @@ pkgs.linux.override {
   stdenv = splitStdenv {
     stdenv = pkgs.stdenv;
     splitAtBuild = true;
-    inherit sharedStaging;
 
     # Subtrees whose build reads object BYTES inline, which no derivation
     # can model because the answer is needed before make continues. They

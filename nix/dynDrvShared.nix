@@ -9,6 +9,11 @@
   gcc,
   gnumake,
   system,
+  # Subtrees the caller has declared unmodellable (internal/mode's
+  # NIXGG_PASSTHROUGH_PATHS); the shims pass work under them straight
+  # through. Empty by default, so a caller that never mentions this
+  # emits exactly the environment it did before the parameter existed.
+  passthroughPaths ? [ ],
 }:
 
 {
@@ -35,6 +40,7 @@
     export NIXGG_SYSTEM="${system}"
     export NIXGG_SANDBOX_TARGET="/nonexistent/nixgg-phase1-no-per-artifact-submit"
     export NIXGG_KNOWN_STORE_PATHS=${lib.escapeShellArg knownStorePathsJSON}
+    export NIXGG_PASSTHROUGH_PATHS=${lib.escapeShellArg (builtins.toJSON passthroughPaths)}
     # Worker-protocol client for the sandbox daemon socket (internal/rpc)
     # instead of per-call fork+exec. NIXGG_RPC=0 is the CLI-fallback escape hatch.
     export NIXGG_RPC=1

@@ -43,6 +43,11 @@
   extraBuildAttrs ? (finalAttrs: old: old),
   extraInstallAttrs ? (finalAttrs: old: old),
   configureSrcFilter ? null,
+  # Subtrees the wrapped package's build reads object BYTES inline, or
+  # expects to fail and reads the diagnostic — neither can be modelled
+  # as a derivation. Project-specific (a kernel names six; most
+  # packages need none) — see internal/mode's NIXGG_PASSTHROUGH_PATHS.
+  passthroughPaths ? [ ],
 }:
 
 let
@@ -64,6 +69,7 @@ let
       gcc
       gnumake
       system
+      passthroughPaths
       ;
   };
   inherit (shared) ggShimsOnPath submitBuildTreeScript outputPlaceholder;
