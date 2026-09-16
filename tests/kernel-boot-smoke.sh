@@ -33,6 +33,18 @@
 #   tests/kernel-boot-smoke.sh
 #   PATCHED_NIX=/path/to/patched-nix tests/kernel-boot-smoke.sh
 #   ALT_STORE=/tmp/my-store tests/kernel-boot-smoke.sh
+#
+# QEMU itself is run via `nix shell nixpkgs#qemu --command
+# qemu-system-x86_64 ...` rather than a bare exec of its predicted
+# on-disk path: qemu-system-x86_64 is a dynamically-linked ELF, and its
+# interpreter/RPATH entries are resolved by the KERNEL's own ELF loader
+# against the real filesystem root, which never has $ALT_STORE's
+# closure — a bare exec fails "No such file or directory" for a reason
+# unrelated to the build (confirmed directly in CI). `nix shell
+# --command` runs inside Nix's own private mount-namespace bind mount
+# of $ALT_STORE onto /nix/store, the same mechanism tests/smoke.sh's
+# own `nix run` fallback relies on for exactly this reason (see its
+# check_example's own comment).
 
 set -uo pipefail
 
@@ -43,7 +55,7 @@ ALT_STORE="${ALT_STORE:-/tmp/nixgg-kernel-boot-smoke-store}"
 PATCHED_NIX="${PATCHED_NIX:-$nixgg_root/.patched-nix}"
 if [[ ! -x "$PATCHED_NIX/bin/nix" ]]; then
   echo "==> building patched nix (one-time)" >&2
-  nix build --no-eval-cache "$nixgg_root#patched-nix" -o "$PATCHED_NIX" >&2 || exit 2
+  nix build --no-eval-cache --accept-flake-config "$nixgg_root#patched-nix" -o "$PATCHED_NIX" >&2 || exit 2
 fi
 mkdir -p "$ALT_STORE"
 
@@ -56,12 +68,8 @@ store = local?root=$ALT_STORE
 
 echo "==> building .#linux-kernel" >&2
 build_log="/tmp/nixgg-kernel-boot-smoke-build.log"
-# -o (not --no-link) pins a GC root: CI runners are disk-constrained
-# enough that Nix's automatic GC can trigger under this build's own
-# closure size, and a --no-link result has nothing keeping it alive
-# between this build and the QEMU exec below — confirmed directly
-# (qemu's own binary vanished mid-script in CI with "No such file or
-# directory" despite the build having just reported success).
+# -o (not --no-link) pins a GC root so the result can't be reaped
+# between this build and the QEMU run below.
 build_root="/tmp/nixgg-kernel-boot-smoke.result"
 out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$build_root" \
   --print-out-paths "$nixgg_root#linux-kernel" 2>"$build_log")
@@ -77,30 +85,22 @@ if [[ ! -s "$vmlinux" ]]; then
   exit 1
 fi
 
-echo "==> building nixpkgs#qemu (substituted, one-time)" >&2
-qemu_log="/tmp/nixgg-kernel-boot-smoke-qemu.log"
-qemu_root="/tmp/nixgg-kernel-boot-smoke-qemu.result"
-qemu_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$qemu_root" \
-  --print-out-paths "nixpkgs#qemu" 2>"$qemu_log")
-if [[ -z "$qemu_out" ]]; then
-  echo "QEMU BUILD FAILED; see $qemu_log:" >&2
-  tail -20 "$qemu_log" >&2
-  exit 1
-fi
-qemu_bin="$ALT_STORE$qemu_out/bin/qemu-system-x86_64"
-if [[ ! -x "$qemu_bin" ]]; then
-  echo "MISSING: $qemu_bin" >&2
-  exit 1
-fi
-
 echo "==> booting $vmlinux under QEMU (TCG, no KVM)" >&2
 boot_log="/tmp/nixgg-kernel-boot-smoke-boot.log"
-timeout 30 "$qemu_bin" \
-  -kernel "$vmlinux" \
+qemu_log="/tmp/nixgg-kernel-boot-smoke-qemu.log"
+"$PATCHED_NIX/bin/nix" shell --no-eval-cache nixpkgs#qemu --command \
+  timeout 30 qemu-system-x86_64 \
+  -kernel "$out/vmlinux" \
   -nographic -no-reboot -m 256 \
   -append "console=ttyS0 panic=-1" \
   -serial mon:stdio \
-  >"$boot_log" 2>&1
+  >"$boot_log" 2>"$qemu_log"
+qemu_status=$?
+if [[ $qemu_status -ne 0 && $qemu_status -ne 124 ]]; then
+  echo "QEMU FAILED (exit $qemu_status); see $qemu_log:" >&2
+  tail -20 "$qemu_log" >&2
+  exit 1
+fi
 
 fail=0
 if ! grep -q "Linux version 6.12.0" "$boot_log"; then
