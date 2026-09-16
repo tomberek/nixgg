@@ -79,7 +79,7 @@ if [[ -z "$qemu_out" ]]; then
   tail -20 "$qemu_log" >&2
   exit 1
 fi
-qemu_bin="$qemu_out/bin/qemu-system-x86_64"
+qemu_bin="$ALT_STORE$qemu_out/bin/qemu-system-x86_64"
 if [[ ! -x "$qemu_bin" ]]; then
   echo "MISSING: $qemu_bin" >&2
   exit 1
