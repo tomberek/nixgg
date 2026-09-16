@@ -56,7 +56,14 @@ store = local?root=$ALT_STORE
 
 echo "==> building .#linux-kernel" >&2
 build_log="/tmp/nixgg-kernel-boot-smoke-build.log"
-out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache --no-link \
+# -o (not --no-link) pins a GC root: CI runners are disk-constrained
+# enough that Nix's automatic GC can trigger under this build's own
+# closure size, and a --no-link result has nothing keeping it alive
+# between this build and the QEMU exec below — confirmed directly
+# (qemu's own binary vanished mid-script in CI with "No such file or
+# directory" despite the build having just reported success).
+build_root="/tmp/nixgg-kernel-boot-smoke.result"
+out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$build_root" \
   --print-out-paths "$nixgg_root#linux-kernel" 2>"$build_log")
 if [[ -z "$out" ]]; then
   echo "BUILD FAILED; see $build_log:" >&2
@@ -72,7 +79,8 @@ fi
 
 echo "==> building nixpkgs#qemu (substituted, one-time)" >&2
 qemu_log="/tmp/nixgg-kernel-boot-smoke-qemu.log"
-qemu_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache --no-link \
+qemu_root="/tmp/nixgg-kernel-boot-smoke-qemu.result"
+qemu_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$qemu_root" \
   --print-out-paths "nixpkgs#qemu" 2>"$qemu_log")
 if [[ -z "$qemu_out" ]]; then
   echo "QEMU BUILD FAILED; see $qemu_log:" >&2
