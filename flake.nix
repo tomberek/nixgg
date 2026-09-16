@@ -564,7 +564,7 @@
             # rather than another mkNixggBuild call.
             linux-kernel = {
               dir = ./examples/linux-kernel;
-              args = { inherit (pkgs) stdenv flex bison elfutils pkg-config bc; src = linux-src; };
+              args = { inherit (pkgs) stdenv flex bison elfutils pkg-config bc; inherit nixggBin; src = linux-src; };
             };
             # Two sources, no single `src`: phase 1 builds the codegen
             # tool, phase 2 execs it mid-build.

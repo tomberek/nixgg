@@ -197,3 +197,40 @@ jobs:
       # this shape); this is the minimal, dedicated reproduction.
       - name: Run thin-archive-equivalence
         run: PATCHED_NIX="$PWD/.patched-nix" bash tests/thin-archive-equivalence.sh
+
+  kernel-boot-smoke:
+    runs-on: ubuntu-latest
+    # A from-scratch native-mode reference build of this exact target
+    # set (vmlinux + lib/test_dhry.o, tinyconfig + serial + PVH)
+    # measured 53s wall on 22 cores; sandbox mode's per-drv
+    # registration overhead is the dominant unknown, plus a one-time
+    # qemu substitution. Every other non-"quick" job in this file
+    # already budgets 15 minutes for a comparable-or-larger fixture.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same AppArmor userns workaround as the smoke job above — see
+      # its comment for why this is needed on ubuntu-latest.
+      - name: Allow unprivileged user namespaces (Nix sandbox needs this on ubuntu-latest)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: dynamicderivations
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build patched-nix
+        run: nix build --no-eval-cache --accept-flake-config .#patched-nix -o .patched-nix
+
+      # Builds examples/linux-kernel in sandbox mode, boots the plain
+      # vmlinux output directly under QEMU (TCG, no KVM — GitHub-hosted
+      # runners don't guarantee /dev/kvm), and asserts on the kernel's
+      # own real-entry banner plus its deterministic no-rootfs panic.
+      # See the script's own header comment for why this proves nixgg's
+      # Kbuild output actually boots, not just that it builds.
+      - name: Run kernel-boot-smoke
+        run: PATCHED_NIX="$PWD/.patched-nix" bash tests/kernel-boot-smoke.sh
+

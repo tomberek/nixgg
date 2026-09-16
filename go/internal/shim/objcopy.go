@@ -21,10 +21,11 @@ import (
 // Same KindTransform as Objtool, different operand shape: this reads
 // one file and writes another, so nothing has to be copied out of the
 // store first. The binary is normally already a store path, so it
-// needs no store-add step either.
+// needs no store-add step either. Modelled in both modes for the same
+// reason Objtool now is — see Objtool's docstring.
 func Objcopy(args []string, cfg *toolchain.Config, l paths.Layout) error {
 	real := realBinutil(cfg, "NIXGG_REAL_OBJCOPY", "objcopy")
-	if bypassed() || (!sandbox.Enabled() && !sandbox.EagerDrv()) {
+	if bypassed() {
 		return Passthrough(real, args)
 	}
 
@@ -37,51 +38,97 @@ func Objcopy(args []string, cfg *toolchain.Config, l paths.Layout) error {
 		return Passthrough(real, args)
 	}
 
-	t := classify.Target(input, altStorePrefix(cfg.Store), l)
-	var in expr.JSONDrvInput
-	switch t.Kind {
-	case classify.Drv:
-		in = expr.JSONDrvInput{Kind: "drv", Ref: t.Ref, Name: filepath.Base(input)}
-	case classify.Store:
-		in = expr.JSONDrvInput{Kind: "src", Ref: expr.StoreBasename(t.Ref), Name: filepath.Base(input)}
-	default:
-		logf("objcopy passthrough: can't model input %s (%s)", input, t.Reason())
-		return Passthrough(real, args)
-	}
-
 	if carvedOut(output) {
 		logf("objcopy passthrough: %s is in a carved-out subtree", output)
 		return Passthrough(real, args)
 	}
 
+	t := classify.Target(input, altStorePrefix(cfg.Store), l)
+	outName := filepath.Base(output)
+
+	if sandbox.Enabled() || sandbox.EagerDrv() {
+		var in expr.JSONDrvInput
+		switch t.Kind {
+		case classify.Drv:
+			in = expr.JSONDrvInput{Kind: "drv", Ref: t.Ref, Name: filepath.Base(input)}
+		case classify.Store:
+			in = expr.JSONDrvInput{Kind: "src", Ref: expr.StoreBasename(t.Ref), Name: filepath.Base(input)}
+		default:
+			logf("objcopy passthrough: can't model input %s (%s)", input, t.Reason())
+			return Passthrough(real, args)
+		}
+
+		logf("objcopy %s <- %s", output, filepath.Base(input))
+
+		// See Objtool's sandbox branch: real is not scanned for
+		// references here (objcopy's own binary is usually an
+		// already-realised store path, unlike objtool's self-built
+		// one), but declaring its known-store-path deps explicitly
+		// keeps this drv's srcs set equal to native mode's, which has
+		// no scan RPC and must always declare them explicitly.
+		drv := expr.TransformJSON(expr.TransformJSONParams{
+			Name:      "oc-" + outName,
+			OutName:   outName,
+			System:    cfg.System,
+			Bash:      cfg.BashRoot,
+			Coreutils: cfg.CoreutilsRoot,
+			ToolBin:   real,
+			InPlace:   false,
+			Flags:     flags,
+			Input:     in,
+			StoreDeps: storedeps.FromFile(real, cfg.KnownStorePaths),
+			ExtraSrcs: []string{
+				baseNameOf(cfg.BashRoot),
+				baseNameOf(cfg.CoreutilsRoot),
+				baseNameOf(toolRootOf(real)),
+			},
+		})
+		drvPath, err := sandbox.DerivationAdd(cfg, drv)
+		if err != nil {
+			return err
+		}
+		if err := sandbox.PointOutputAtDrv(output, drvPath); err != nil {
+			return err
+		}
+		logf("  drv:        %s", drvPath)
+		return nil
+	}
+
+	// Native mode: same rewrite, modelled as a sibling .nix thunk —
+	// see Objtool's own native-mode branch for the classify.Store/
+	// classify.Thunk shapes this reuses.
+	var in expr.Input
+	switch t.Kind {
+	case classify.Store:
+		in, _ = storeInput(t, input)
+	case classify.Thunk:
+		in = expr.Input{Kind: "nix", Ref: t.Ref, Name: filepath.Base(input)}
+	default:
+		logf("objcopy passthrough: can't model input %s (%s)", input, t.Reason())
+		return Passthrough(real, args)
+	}
+
 	logf("objcopy %s <- %s", output, filepath.Base(input))
 
-	outName := filepath.Base(output)
-	drv := expr.TransformJSON(expr.TransformJSONParams{
+	// See Objtool's own native-mode branch: scan the tool binary's
+	// bytes for known store paths client-side, since native mode has
+	// no `nix store add --scan` RPC to do it server-side.
+	e := expr.Transform(expr.TransformParams{
+		Helpers:   cfg.Helpers,
 		Name:      "oc-" + outName,
 		OutName:   outName,
-		System:    cfg.System,
-		Bash:      cfg.BashRoot,
-		Coreutils: cfg.CoreutilsRoot,
 		ToolBin:   real,
 		InPlace:   false,
 		Flags:     flags,
 		Input:     in,
-		StoreDeps: storedeps.From(nil, "", cfg.KnownStorePaths),
-		ExtraSrcs: []string{
-			baseNameOf(cfg.BashRoot),
-			baseNameOf(cfg.CoreutilsRoot),
-			baseNameOf(toolRootOf(real)),
-		},
+		StoreDeps: storedeps.FromFile(real, cfg.KnownStorePaths),
 	})
-	drvPath, err := sandbox.DerivationAdd(cfg, drv)
+
+	thunkPath, err := submitTransformThunk(l, e, output)
 	if err != nil {
 		return err
 	}
-	if err := sandbox.PointOutputAtDrv(output, drvPath); err != nil {
-		return err
-	}
-	logf("  drv:        %s", drvPath)
+	logf("  thunk:      %s", thunkPath)
 	return nil
 }
 

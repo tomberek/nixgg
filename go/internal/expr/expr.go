@@ -123,6 +123,73 @@ type ArchiveParams struct {
 	WrapperEnv  map[string]string
 }
 
+func Transform(p TransformParams) string {
+	return transformDerivation(p).ToNix(p.Helpers)
+}
+
+func transformDerivation(p TransformParams) *Derivation {
+	return &Derivation{
+		Kind:        KindTransform,
+		Name:        p.Name,
+		OutName:     p.OutName,
+		ToolBin:     p.ToolBin,
+		ToolInPlace: p.InPlace,
+		Flags:       p.Flags,
+		Inputs:      inputsToDeriv([]Input{p.Input}),
+		StoreDeps:   p.StoreDeps,
+		WrapperEnv:  p.WrapperEnv,
+	}
+}
+
+// TransformParams is the input for one native-mode transform
+// expression (objtool rewriting an object in place, or objcopy
+// reading one object and writing another). Sandbox mode's analog is
+// TransformJSONParams; the two must agree field-for-field so both
+// modes hash identically for the same rewrite.
+type TransformParams struct {
+	Helpers    string
+	Name       string
+	OutName    string
+	ToolBin    string
+	InPlace    bool
+	Flags      []string
+	Input      Input
+	StoreDeps  []string
+	WrapperEnv map[string]string
+}
+
+func PartialLink(p PartialLinkParams) string {
+	return partialLinkDerivation(p).ToNix(p.Helpers)
+}
+
+func partialLinkDerivation(p PartialLinkParams) *Derivation {
+	return &Derivation{
+		Kind:       KindPartialLink,
+		Name:       p.Name,
+		OutName:    p.OutName,
+		ToolBin:    p.ToolBin,
+		Flags:      p.Flags,
+		Inputs:     inputsToDeriv(p.Inputs),
+		StoreDeps:  p.StoreDeps,
+		WrapperEnv: p.WrapperEnv,
+	}
+}
+
+// PartialLinkParams is the input for one native-mode `ld -r` expression:
+// several objects in, one object out. Sandbox mode's analog is
+// PartialLinkJSONParams; the two must agree field-for-field so both
+// modes hash identically for the same partial link.
+type PartialLinkParams struct {
+	Helpers    string
+	Name       string
+	OutName    string
+	ToolBin    string
+	Flags      []string
+	Inputs     []Input
+	StoreDeps  []string
+	WrapperEnv map[string]string
+}
+
 // Input describes one linker/archiver input. Kind is "store" for
 // realised inputs or "nix" for unrealised sibling thunks.
 type Input struct {

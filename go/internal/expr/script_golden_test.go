@@ -257,14 +257,30 @@ func TestNativeTemplateResolvesToSandboxScript(t *testing.T) {
 			Kind: KindArchive, OutName: "libfoo.a", ARFlags: "rcs", Inputs: twoInputs}},
 		{"archive, no inputs", &Derivation{
 			Kind: KindArchive, OutName: "libempty.a", ARFlags: "rcs"}},
+
+		{"transform, in-place (objtool)", &Derivation{
+			Kind: KindTransform, OutName: "foo.o", ToolInPlace: true,
+			Flags:  []string{"--orc", "--retpoline"},
+			Inputs: []derivInput{{InputKind: "store", Ref: fakeObj, Name: "foo.o"}}}},
+		{"transform, in/out (objcopy)", &Derivation{
+			Kind: KindTransform, OutName: "foo.stub.o", ToolInPlace: false,
+			Flags:  []string{"--prefix-symbols=__pi_"},
+			Inputs: []derivInput{{InputKind: "store", Ref: fakeObj, Name: "foo.o"}}}},
+
+		{"partial link (ld -r)", &Derivation{
+			Kind: KindPartialLink, OutName: "test_dhry.o",
+			Flags: []string{"-r"}, Inputs: twoInputs}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := tc.d
 			d.Coreutils = fakeCoreutils
 			d.Bash = fakeBash
-			if d.Kind == KindArchive {
+			switch d.Kind {
+			case KindArchive:
 				d.AR = fakeAR
-			} else {
+			case KindTransform, KindPartialLink:
+				d.ToolBin = fakeCompiler
+			default:
 				d.Compiler = fakeCompiler
 			}
 

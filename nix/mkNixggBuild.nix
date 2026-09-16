@@ -31,6 +31,12 @@
   # batcharchive.go's tryBatchArchive batches matching groups into one
   # derivation instead of one-per-TU.
   batchGroups ? [ ],
+  # Subtrees the caller has declared unmodellable (internal/mode's
+  # NIXGG_PASSTHROUGH_PATHS); the shims pass work under them straight
+  # through instead of registering a derivation. Empty by default — see
+  # nix/dynDrvShared.nix's own copy of this parameter for the mechanism
+  # this mirrors (splitStdenv's equivalent).
+  passthroughPaths ? [ ],
 }:
 
 let
@@ -118,6 +124,7 @@ let
     export NIX_CFLAGS_COMPILE NIX_LDFLAGS
     export NIXGG_KNOWN_STORE_PATHS=${lib.escapeShellArg knownStorePathsJSON}
     export NIXGG_BATCH_GROUPS=${lib.escapeShellArg batchGroupsJSON}
+    export NIXGG_PASSTHROUGH_PATHS=${lib.escapeShellArg (builtins.toJSON passthroughPaths)}
   '';
 
   drv = stdenv.mkDerivation (

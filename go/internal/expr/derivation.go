@@ -348,9 +348,17 @@ func (d *Derivation) absFileScript() string {
 // compilerOrAR reports which store path provides the tools on PATH:
 // Compile and Link use the compiler; Archive uses whatever supplies
 // `ar` (compilerRoot in native mode, AR in sandbox mode).
+//
+// Transform has no "compiler" of its own — d.ToolBin is the rewriting
+// binary (objtool/objcopy), invoked the same way a compiler would be,
+// so it rides the same tag/marker plumbing scriptTemplate already
+// provides for KindArchive's AR.
 func (d *Derivation) compilerOrAR() string {
-	if d.Kind == KindArchive {
+	switch d.Kind {
+	case KindArchive:
 		return d.AR
+	case KindTransform, KindPartialLink:
+		return d.ToolBin
 	}
 	return d.Compiler
 }
@@ -467,12 +475,17 @@ ar D%s "%s" %s
 	case KindPartialLink:
 		// `-r` comes from the caller's own Flags, not added here — it's
 		// what identified this as a partial link in the first place.
+		// ToolBin arrives through the compiler parameter (see
+		// compilerOrAR), same reasoning as KindTransform: native mode
+		// needs a marker here too, so the emitted script carries a
+		// real dependency edge on ld's own store path via
+		// resolve-script.nix, not a bare unmarked literal.
 		return fmt.Sprintf(
 			`set -euo pipefail
 export PATH="%s/bin"
 mkdir -p "%s"
 "%s" %s -o "%s" %s
-`, d.Coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), d.outPath(), inputs())
+`, coreutils, d.outDir(), compiler, shellQuoteFlags(d.Flags), d.outPath(), inputs())
 	case KindRustc:
 		// One front-end run, several artifacts. `--out-dir` is set even
 		// though every emit is named explicitly: rustc drops temporaries
@@ -540,7 +553,12 @@ cd "$src"
 `, d.Coreutils, d.RustcBin, shellQuoteFlags(d.Flags), strings.Join(parts, " "))
 	case KindTransform:
 		// PATH carries coreutils only — no compiler involved, and the
-		// transform binary is invoked by absolute path.
+		// transform binary is invoked by absolute path. That path
+		// comes through the `compiler` parameter (see compilerOrAR),
+		// not d.ToolBin directly, so native mode gets a marker here
+		// too and the emitted script carries a real dependency edge
+		// on the tool's store path via resolve-script.nix, same as
+		// every other Kind's toolchain reference.
 		if !d.ToolInPlace {
 			// `tool <flags> <in> <out>` — objcopy's shape. Nothing to
 			// copy: the tool reads the store path and writes $out.
@@ -549,7 +567,7 @@ cd "$src"
 export PATH="%s/bin"
 mkdir -p "%s"
 "%s" %s %s "%s"
-`, d.Coreutils, d.outDir(), d.ToolBin, shellQuoteFlags(d.Flags), inputs(), d.outPath())
+`, coreutils, d.outDir(), compiler, shellQuoteFlags(d.Flags), inputs(), d.outPath())
 		}
 		// In-place tools (objtool) rewrite their operand, so the input
 		// has to be copied out of its read-only store path first;
@@ -561,8 +579,8 @@ mkdir -p "%s"
 cp %s "%s"
 chmod u+w "%s"
 "%s" %s "%s"
-`, d.Coreutils, d.outDir(), inputs(), d.outPath(), d.outPath(),
-			d.ToolBin, shellQuoteFlags(d.Flags), d.outPath())
+`, coreutils, d.outDir(), inputs(), d.outPath(), d.outPath(),
+			compiler, shellQuoteFlags(d.Flags), d.outPath())
 	}
 	return ""
 }
@@ -611,6 +629,39 @@ func (d *Derivation) ToNix(helpers string) string {
 		if len(d.ExtraInputs) > 0 {
 			fmt.Fprintf(&b, "  extraInputs    = %s;\n", derivInputsList(d.ExtraInputs))
 		}
+		fmt.Fprintf(&b, "  scriptTemplate = %s;\n", nixIndentedStringLiteral(tmpl))
+		fmt.Fprintf(&b, "  markerTag      = %q;\n", tag)
+		fmt.Fprintf(&b, "  storeDepsJSON  = ''%s'';\n", jsonArrayIndented(d.StoreDeps))
+		fmt.Fprintf(&b, "  wrapperEnvJSON = ''%s'';\n", jsonObjectSorted(d.WrapperEnv))
+	case KindTransform:
+		fmt.Fprintf(&b, "import %s/transform.nix {\n", helpers)
+		fmt.Fprintf(&b, "  outName        = %q;\n", d.OutName)
+		fmt.Fprintf(&b, "  name           = %q;\n", d.Name)
+		// toolBin is always an already-realised store path in native
+		// mode too — objcopy's tool already is one (realBinutil), and
+		// objtool's self-built binary is staged there first via
+		// nix/stage-tool.nix (see go/internal/shim/objtool.go's
+		// stageToolForNative): an ordinary Nix build whose own
+		// reference scan records the binary's real RPATH deps, the
+		// same set sandbox mode's `nix store add --scan` would.
+		// Rendered as a quoted string, same as any other store-path
+		// string field (transform.nix wraps it with pureStorePath).
+		fmt.Fprintf(&b, "  toolBin        = %q;\n", d.ToolBin)
+		fmt.Fprintf(&b, "  inputs         = %s;\n", derivInputsList(d.Inputs))
+		fmt.Fprintf(&b, "  scriptTemplate = %s;\n", nixIndentedStringLiteral(tmpl))
+		fmt.Fprintf(&b, "  markerTag      = %q;\n", tag)
+		fmt.Fprintf(&b, "  storeDepsJSON  = ''%s'';\n", jsonArrayIndented(d.StoreDeps))
+		fmt.Fprintf(&b, "  wrapperEnvJSON = ''%s'';\n", jsonObjectSorted(d.WrapperEnv))
+	case KindPartialLink:
+		fmt.Fprintf(&b, "import %s/partiallink.nix {\n", helpers)
+		fmt.Fprintf(&b, "  outName        = %q;\n", d.OutName)
+		fmt.Fprintf(&b, "  name           = %q;\n", d.Name)
+		// ToolBin (ld) is an already-realised store path in native
+		// mode too — the caller's own realLDFor resolution, same shape
+		// objcopy's ToolBin already has. Rendered as a quoted string,
+		// wrapped with pureStorePath by partiallink.nix.
+		fmt.Fprintf(&b, "  toolBin        = %q;\n", d.ToolBin)
+		fmt.Fprintf(&b, "  inputs         = %s;\n", derivInputsList(d.Inputs))
 		fmt.Fprintf(&b, "  scriptTemplate = %s;\n", nixIndentedStringLiteral(tmpl))
 		fmt.Fprintf(&b, "  markerTag      = %q;\n", tag)
 		fmt.Fprintf(&b, "  storeDepsJSON  = ''%s'';\n", jsonArrayIndented(d.StoreDeps))

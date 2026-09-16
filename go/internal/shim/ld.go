@@ -10,6 +10,7 @@ import (
 	"github.com/tbereknyei/nixgg/internal/paths"
 	"github.com/tbereknyei/nixgg/internal/sandbox"
 	"github.com/tbereknyei/nixgg/internal/storedeps"
+	"github.com/tbereknyei/nixgg/internal/thunk"
 	"github.com/tbereknyei/nixgg/internal/toolchain"
 	"github.com/tbereknyei/nixgg/internal/wrapperenv"
 )
@@ -17,10 +18,12 @@ import (
 // LD is the shim entrypoint for raw `ld`. Only `-r` (partial link:
 // several objects in, one object out) is modelled; that shape doesn't
 // fit KindLink (no executable/.so results) or KindArchive (result is
-// one object, not an archive). Sandbox/eager-drv only — no native-mode
-// helper exists, since a build that needs `ld -r` accelerated (e.g.
-// Kbuild fusing a multi-object kernel module) already requires one of
-// those modes for its other steps.
+// one object, not an archive). Modelled in both modes — sandbox
+// registers a drv via `nix derivation add`; native mode writes a
+// sibling .nix thunk the same way Link/Archive/Transform do (this
+// fixture's own lib/test_dhry.o is the first to need `ld -r`
+// accelerated in native mode too, confirmed via
+// tests/drv-equivalence.sh).
 //
 // Everything else — including a raw full link, which some builds also
 // route through `ld` directly rather than a compiler driver — falls
@@ -46,9 +49,6 @@ func LD(args []string, cfg *toolchain.Config, l paths.Layout) error {
 		}
 		return Link(dispatch.ToolLD, args, cfg, l)
 	}
-	if !sandbox.Enabled() && !sandbox.EagerDrv() {
-		return Passthrough(real, args)
-	}
 	if carvedOut(output) {
 		logf("ld passthrough: %s is in a carved-out subtree", output)
 		return Passthrough(real, args)
@@ -71,42 +71,71 @@ func LD(args []string, cfg *toolchain.Config, l paths.Layout) error {
 	if err != nil {
 		return err
 	}
-	wrapperEnv, err := decodeStringMap(wrapperEnvJSON)
-	if err != nil {
-		return err
-	}
 
 	outName := filepath.Base(output)
 	name := "ld-" + outName
 	if override := multiTargetName(output); override != "" {
 		name = override
 	}
-	drv := expr.PartialLinkJSON(expr.PartialLinkJSONParams{
-		Name:      name,
-		OutName:   outName,
-		System:    cfg.System,
-		Bash:      cfg.BashRoot,
-		Coreutils: cfg.CoreutilsRoot,
-		ToolBin:   real,
-		Flags:     flags,
-		Inputs:    ci.JSON,
-		StoreDeps: storedeps.From(flags, wrapperEnvJSON, cfg.KnownStorePaths),
-		ExtraSrcs: []string{
-			baseNameOf(cfg.BashRoot),
-			baseNameOf(cfg.CoreutilsRoot),
-			baseNameOf(ldRootOf(real)),
-		},
-		Env: wrapperEnv,
-	})
-	drvPath, err := sandbox.DerivationAdd(cfg, drv)
+
+	if sandbox.Enabled() || sandbox.EagerDrv() {
+		wrapperEnv, err := decodeStringMap(wrapperEnvJSON)
+		if err != nil {
+			return err
+		}
+		drv := expr.PartialLinkJSON(expr.PartialLinkJSONParams{
+			Name:      name,
+			OutName:   outName,
+			System:    cfg.System,
+			Bash:      cfg.BashRoot,
+			Coreutils: cfg.CoreutilsRoot,
+			ToolBin:   real,
+			Flags:     flags,
+			Inputs:    ci.JSON,
+			StoreDeps: storedeps.From(flags, wrapperEnvJSON, cfg.KnownStorePaths),
+			ExtraSrcs: []string{
+				baseNameOf(cfg.BashRoot),
+				baseNameOf(cfg.CoreutilsRoot),
+				baseNameOf(ldRootOf(real)),
+			},
+			Env: wrapperEnv,
+		})
+		drvPath, err := sandbox.DerivationAdd(cfg, drv)
+		if err != nil {
+			return err
+		}
+		if err := sandbox.PointOutputAtDrv(output, drvPath); err != nil {
+			return err
+		}
+		logf("  drv:        %s", drvPath)
+		maybeSubmit(cfg, drvPath, output, true)
+		return nil
+	}
+
+	// Native mode: same partial link, modelled as a sibling .nix
+	// thunk. real (ld) is always an already-realised store path
+	// (realLDFor's resolution), never a working-tree file — no
+	// stage-tool.nix-style detour needed, unlike objtool's self-built
+	// binary.
+	wrapperEnv, err := decodeStringMap(wrapperEnvJSON)
 	if err != nil {
 		return err
 	}
-	if err := sandbox.PointOutputAtDrv(output, drvPath); err != nil {
+	e := expr.PartialLink(expr.PartialLinkParams{
+		Helpers:    cfg.Helpers,
+		Name:       name,
+		OutName:    outName,
+		ToolBin:    real,
+		Flags:      flags,
+		Inputs:     ci.Link,
+		StoreDeps:  storedeps.From(flags, wrapperEnvJSON, cfg.KnownStorePaths),
+		WrapperEnv: wrapperEnv,
+	})
+	thunkPath, err := submitPartialLinkThunk(l, e, output)
+	if err != nil {
 		return err
 	}
-	logf("  drv:        %s", drvPath)
-	maybeSubmit(cfg, drvPath, output, true)
+	logf("  thunk:      %s", thunkPath)
 	return nil
 }
 
@@ -203,4 +232,22 @@ func ldOutputArg(args []string) string {
 		}
 	}
 	return ""
+}
+
+// submitPartialLinkThunk writes e's thunk, symlinks output at it, and
+// records the symlink — the KindPartialLink analog of compile.go's
+// submitCompileThunk / objtool.go's submitTransformThunk.
+func submitPartialLinkThunk(l paths.Layout, e, output string) (thunkPath string, err error) {
+	id := thunk.Compute(e)
+	thunkPath, err = thunk.Write(l, id, e)
+	if err != nil {
+		return "", err
+	}
+	if err := thunk.LinkPlaceholder(l, output, thunkPath); err != nil {
+		return "", err
+	}
+	if err := thunk.RecordSymlink(l, id, output); err != nil {
+		return "", err
+	}
+	return thunkPath, nil
 }
