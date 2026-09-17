@@ -9,25 +9,23 @@
 # plain `vmlinux` output directly under QEMU rather than assembling a
 # bzImage.
 #
-# No rootfs is provided. examples/linux-kernel/default.nix enables
-# CONFIG_HYPERVISOR_GUEST/CONFIG_PVH, which embeds a
-# XEN_ELFNOTE_PHYS32_ENTRY note in vmlinux that QEMU's own `-kernel`
-# loader reads to boot the raw ELF directly — no bzImage, no real-mode
-# setup stage, no compressed decompression stub. (A bzImage was tried
-# first and dropped: `make bzImage` unconditionally re-walks the entire
-# recursive Kbuild descend regardless of vmlinux's own freshness, so
-# phase 2 would have needed ~35 more hand-replicated compiles just to
-# reach the boot sector.)
+# examples/linux-kernel/default.nix enables CONFIG_HYPERVISOR_GUEST/
+# CONFIG_PVH, which embeds a XEN_ELFNOTE_PHYS32_ENTRY note in vmlinux
+# that QEMU's own `-kernel` loader reads to boot the raw ELF directly —
+# no bzImage, no real-mode setup stage, no compressed decompression
+# stub. (A bzImage was tried first and dropped: `make bzImage`
+# unconditionally re-walks the entire recursive Kbuild descend
+# regardless of vmlinux's own freshness, so phase 2 would have needed
+# ~35 more hand-replicated compiles just to reach the boot sector.)
 #
-# With no CONFIG_BLK_DEV_INITRD and no root= on the cmdline, the kernel
-# reaches kernel_init_freeable(), fails to exec any of
-# /sbin/init,/etc/init,/bin/init,/bin/sh, and panics with a fixed,
-# version-independent message. panic=-1 plus QEMU's -no-reboot turns
-# that into a clean process exit instead of a reboot loop.
-#
-# Two lines in the serial log are the pass condition:
-#   "Linux version 6.12.0"       - real entry ran; printk/console live
-#   "No working init found"      - reached kernel_init_freeable()
+# The kernel boots to a REAL userspace process, not just its own entry
+# point: examples/linux-kernel/default.nix's linux-kernel-initramfs
+# output (a single static busybox, built by examples/linux-kernel/
+# initramfs.nix) is passed via `-initrd`. Its /init script echoes a
+# fixed marker string then calls `poweroff -f`, so a clean QEMU exit
+# (not a timeout, not a panic) is itself part of the pass condition —
+# proof a real program ran under nixgg's own kernel build, not just
+# that the kernel's own printk/start_kernel path executed.
 #
 # Usage:
 #   tests/kernel-boot-smoke.sh
@@ -44,7 +42,9 @@
 # --command` runs inside Nix's own private mount-namespace bind mount
 # of $ALT_STORE onto /nix/store, the same mechanism tests/smoke.sh's
 # own `nix run` fallback relies on for exactly this reason (see its
-# check_example's own comment).
+# check_example's own comment). The initramfs cpio itself needs no such
+# detour — QEMU only ever reads its bytes, never execs it on the host —
+# so it uses the same plain $ALT_STORE-prefixed path vmlinux already does.
 
 set -uo pipefail
 
@@ -85,20 +85,40 @@ if [[ ! -s "$vmlinux" ]]; then
   exit 1
 fi
 
+echo "==> building .#linux-kernel-initramfs" >&2
+initramfs_log="/tmp/nixgg-kernel-boot-smoke-initramfs.log"
+initramfs_root="/tmp/nixgg-kernel-boot-smoke-initramfs.result"
+initramfs_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$initramfs_root" \
+  --print-out-paths "$nixgg_root#linux-kernel-initramfs" 2>"$initramfs_log")
+if [[ -z "$initramfs_out" ]]; then
+  echo "INITRAMFS BUILD FAILED; see $initramfs_log:" >&2
+  tail -20 "$initramfs_log" >&2
+  exit 1
+fi
+
+initramfs="$ALT_STORE$initramfs_out/initramfs.cpio"
+if [[ ! -s "$initramfs" ]]; then
+  echo "MISSING: $initramfs_out/initramfs.cpio" >&2
+  exit 1
+fi
+
 echo "==> booting $vmlinux under QEMU (TCG, no KVM)" >&2
 boot_log="/tmp/nixgg-kernel-boot-smoke-boot.log"
 qemu_log="/tmp/nixgg-kernel-boot-smoke-qemu.log"
 "$PATCHED_NIX/bin/nix" shell --no-eval-cache nixpkgs#qemu --command \
   timeout 30 qemu-system-x86_64 \
   -kernel "$out/vmlinux" \
+  -initrd "$initramfs" \
   -nographic -no-reboot -m 256 \
   -append "console=ttyS0 panic=-1" \
   -serial mon:stdio \
   >"$boot_log" 2>"$qemu_log"
 qemu_status=$?
-if [[ $qemu_status -ne 0 && $qemu_status -ne 124 ]]; then
-  echo "QEMU FAILED (exit $qemu_status); see $qemu_log:" >&2
+if [[ $qemu_status -ne 0 ]]; then
+  echo "FAIL: qemu exited $qemu_status (want 0 — a clean poweroff); see $qemu_log:" >&2
   tail -20 "$qemu_log" >&2
+  echo "boot log ($boot_log):" >&2
+  tail -30 "$boot_log" >&2
   exit 1
 fi
 
@@ -107,8 +127,8 @@ if ! grep -q "Linux version 6.12.0" "$boot_log"; then
   echo "FAIL: no 'Linux version 6.12.0' in boot log" >&2
   fail=1
 fi
-if ! grep -q "No working init found" "$boot_log"; then
-  echo "FAIL: no 'No working init found' panic in boot log" >&2
+if ! grep -q "NIXGG_INIT_OK" "$boot_log"; then
+  echo "FAIL: no 'NIXGG_INIT_OK' marker in boot log — /init never ran" >&2
   fail=1
 fi
 
@@ -118,4 +138,4 @@ if [[ $fail -ne 0 ]]; then
   exit 1
 fi
 
-printf '\033[1;32mOK\033[0m       kernel booted and reached its expected panic\n'
+printf '\033[1;32mOK\033[0m       kernel booted, ran /init, and powered off cleanly\n'

@@ -564,7 +564,11 @@
             # rather than another mkNixggBuild call.
             linux-kernel = {
               dir = ./examples/linux-kernel;
-              args = { inherit (pkgs) stdenv flex bison elfutils pkg-config bc; inherit nixggBin; src = linux-src; };
+              args = {
+                inherit (pkgs) stdenv flex bison elfutils pkg-config bc pkgsStatic cpio;
+                inherit nixggBin;
+                src = linux-src;
+              };
             };
             # Two sources, no single `src`: phase 1 builds the codegen
             # tool, phase 2 execs it mid-build.
@@ -658,6 +662,7 @@
           # phase1 exposes the full mkNixggBuild attrset (not just .package).
           linux-kernel-phase1 = examples.linux-kernel.linux-kernel-phase1;
           linux-kernel-phase1-shell = examples.linux-kernel.linux-kernel-phase1.shell;
+          linux-kernel-initramfs = examples.linux-kernel.linux-kernel-initramfs;
           mosh-client = examples.mosh.packages.mosh-client;
 
           toolchain-json = toolchainJson;
