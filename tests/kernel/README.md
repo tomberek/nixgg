@@ -3,6 +3,11 @@
 A full Linux kernel built through nixgg's dynamic derivations, and a
 NixOS VM test that boots it.
 
+Originally contributed by Lyndon Sanche
+([#1](https://github.com/tomberek/nixgg/pull/1)), whose kernel fixtures
+this repo's other kernel work (`examples/linux-kernel`,
+`tests/kernel-boot-smoke.sh`) builds on.
+
 **These are not run by `tests/drv-equivalence.sh`, `tests/smoke.sh`, or
 `nix flake check`, and nothing in `flake.nix` references them.** They are
 run by hand.
