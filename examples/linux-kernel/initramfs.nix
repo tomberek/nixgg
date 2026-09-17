@@ -2,25 +2,20 @@
 # busybox providing /init, packed as a Linux-format (newc) cpio archive.
 #
 # Deliberately a plain stdenv.mkDerivation, not routed through
-# mkNixggBuild/nixgg's own shims — this is unaccelerated packaging (one
-# `cp`, one `cpio` invocation), the same category as
-# examples/linux-kernel/default.nix's phase2 hand-replicating Kbuild's
-# last few steps directly.
+# mkNixggBuild/nixgg's own shims — this is unaccelerated packaging, the
+# same category as examples/linux-kernel/default.nix's phase2
+# hand-replicating Kbuild's last few steps directly.
 #
 # pkgsStatic.busybox (not the ordinary pkgs.busybox) is required: the
 # ordinary build links against glibc, needing glibc's own loader/.so
-# closure staged into this tiny rootfs too. pkgsStatic's is a genuinely
-# static ELF (confirmed via `file`: "statically linked", no PT_INTERP),
-# so it runs directly once the guest kernel unpacks this cpio into its
-# own initramfs tmpfs — no /lib*, no loader, nothing else needed.
+# closure staged into this tiny rootfs too. pkgsStatic's is a
+# genuinely static ELF, so it runs directly once the guest kernel
+# unpacks this cpio — no /lib*, no loader, nothing else needed.
 {
   stdenv,
   pkgsStatic,
   cpio,
 }:
-let
-  busybox = pkgsStatic.busybox;
-in
 stdenv.mkDerivation {
   pname = "linux-kernel-initramfs";
   version = "1";
@@ -29,23 +24,16 @@ stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
 
-    mkdir -p rootfs/bin rootfs/dev rootfs/proc rootfs/sys
-    cp ${busybox}/bin/busybox rootfs/bin/busybox
+    mkdir -p rootfs/bin
+    cp ${pkgsStatic.busybox}/bin/busybox rootfs/bin/busybox
     chmod +w rootfs/bin/busybox
     ln -s busybox rootfs/bin/sh
 
-    # tests/kernel-boot-smoke.sh greps the boot log for NIXGG_INIT_OK —
-    # a real userspace process running under nixgg's own kernel build,
-    # not just the kernel's own entry point — then reboots so QEMU
-    # exits 0 instead of needing the timeout safety net. `poweroff -f`
-    # was tried first and doesn't work here: pm_power_off is never
-    # registered (no ACPI/platform power-off handler in this tinyconfig
-    # build), so the kernel just halts instead ("Power off not
-    # available: System halted instead"), hanging QEMU until the
-    # timeout. `reboot -f` (LINUX_REBOOT_CMD_RESTART) always works —
-    # QEMU's own `-no-reboot` flag (tests/kernel-boot-smoke.sh's own
-    # invocation) turns that into a clean process exit instead of an
-    # actual reboot loop.
+    # tests/kernel-boot-smoke.sh greps for NIXGG_INIT_OK to confirm a
+    # real process ran, then `reboot -f` — not `poweroff -f`, which
+    # hangs here: pm_power_off is never registered (no ACPI/platform
+    # power-off handler in this tinyconfig build). QEMU's own
+    # `-no-reboot` flag turns the reboot into a clean process exit.
 cat > rootfs/init <<'EOF'
 #!/bin/busybox sh
 echo NIXGG_INIT_OK

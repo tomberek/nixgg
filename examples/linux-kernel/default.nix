@@ -26,19 +26,15 @@
 # CONFIG_BLK_DEV_INITRD/DEVTMPFS/DEVTMPFS_MOUNT/BINFMT_ELF/
 # BINFMT_SCRIPT let that same script boot to a real userspace process
 # instead of just the kernel's own deterministic "no rootfs" panic:
-# without BLK_DEV_INITRD, QEMU's `-initrd` is silently ignored
-# (confirmed directly — the kernel panics identically with or without
-# it). BINFMT_ELF defaults to y upstream but, like every other option
-# here, allnoconfig (tinyconfig's base) forces it off regardless —
-# without it the kernel can't exec ANY ELF binary at all, confirmed
-# directly: /init (a real static ELF) failed with "Failed to execute
-# /init (error -2)" until this was added. BINFMT_SCRIPT is what lets
-# /init's own `#!/bin/busybox sh` shebang line be interpreted.
-# CONFIG_TMPFS is deliberately left off: it `depends on SHMEM` (off by
-# default on this allnoconfig-derived base) and isn't needed anyway —
-# init/do_mounts.c's own `rootfs_fs_type` already falls back to ramfs
-# when `IS_ENABLED(CONFIG_TMPFS)` is false, confirmed by reading that
-# fallback directly.
+# without BLK_DEV_INITRD, QEMU's `-initrd` is silently ignored.
+# BINFMT_ELF defaults to y upstream, but allnoconfig forces it off
+# regardless — without it the kernel can't exec ANY ELF binary,
+# confirmed directly ("Failed to execute /init (error -2)") until this
+# was added. BINFMT_SCRIPT lets /init's own `#!/bin/busybox sh`
+# shebang be interpreted. CONFIG_TMPFS is deliberately left off: it
+# `depends on SHMEM` (off by default here) and isn't needed —
+# init/do_mounts.c's `rootfs_fs_type` already falls back to ramfs when
+# tmpfs is unavailable.
 #
 # Sandbox mode requires the two-phase split below because a single
 # mkNixggBuild derivation can't satisfy Kbuild's recipe shape:
@@ -81,16 +77,13 @@
 #
 # `KBUILD_BUILD_USER`/`KBUILD_BUILD_HOST` are pinned in both phases:
 # scripts/mkcompile_h bakes `$(whoami)`/`uname -n` into
-# include/generated/compile.h by default, so two separate invocations
-# (native vs sandbox, different tempdirs) would otherwise produce
-# different content and diverging drv hashes purely from that, not
-# from anything native/sandbox-specific. `KBUILD_BUILD_TIMESTAMP` pins
-# the same class of thing for usr/gen_init_cpio.c's own default mtime
-# (`time(NULL)` when unset — confirmed as the exact source of a
-# usr/initramfs_data.{o,cpio} drv-equivalence mismatch that appeared
-# once CONFIG_BLK_DEV_INITRD was added below; usr/Makefile already
-# forwards this var to gen_initramfs.sh's own `-d` flag for exactly
-# this purpose).
+# include/generated/compile.h by default, so the two phases (different
+# tempdirs) would otherwise diverge purely from that.
+# `KBUILD_BUILD_TIMESTAMP` pins the same class of thing for
+# usr/gen_init_cpio.c's default mtime (`time(NULL)` when unset — the
+# source of a usr/initramfs_data.{o,cpio} mismatch once
+# CONFIG_BLK_DEV_INITRD was added below; usr/Makefile already forwards
+# this var to gen_initramfs.sh's `-d` flag).
 {
   mkNixggBuild,
   stdenv,

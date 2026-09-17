@@ -22,10 +22,10 @@
 # point: examples/linux-kernel/default.nix's linux-kernel-initramfs
 # output (a single static busybox, built by examples/linux-kernel/
 # initramfs.nix) is passed via `-initrd`. Its /init script echoes a
-# fixed marker string then calls `poweroff -f`, so a clean QEMU exit
-# (not a timeout, not a panic) is itself part of the pass condition —
-# proof a real program ran under nixgg's own kernel build, not just
-# that the kernel's own printk/start_kernel path executed.
+# fixed marker string then reboots, so a clean QEMU exit (not a
+# timeout, not a panic) is itself part of the pass condition — proof a
+# real program ran under nixgg's own kernel build, not just that the
+# kernel's own printk/start_kernel path executed.
 #
 # Usage:
 #   tests/kernel-boot-smoke.sh
@@ -38,13 +38,13 @@
 # interpreter/RPATH entries are resolved by the KERNEL's own ELF loader
 # against the real filesystem root, which never has $ALT_STORE's
 # closure — a bare exec fails "No such file or directory" for a reason
-# unrelated to the build (confirmed directly in CI). `nix shell
-# --command` runs inside Nix's own private mount-namespace bind mount
-# of $ALT_STORE onto /nix/store, the same mechanism tests/smoke.sh's
-# own `nix run` fallback relies on for exactly this reason (see its
-# check_example's own comment). The initramfs cpio itself needs no such
-# detour — QEMU only ever reads its bytes, never execs it on the host —
-# so it uses the same plain $ALT_STORE-prefixed path vmlinux already does.
+# unrelated to the build. `nix shell --command` runs inside Nix's own
+# private mount-namespace bind mount of $ALT_STORE onto /nix/store, the
+# same mechanism tests/smoke.sh's own `nix run` fallback relies on for
+# exactly this reason (see its check_example's own comment). The
+# initramfs cpio itself needs no such detour — QEMU only ever reads
+# its bytes, never execs it on the host — so it uses the same plain
+# $ALT_STORE-prefixed path vmlinux already does.
 
 set -uo pipefail
 
@@ -66,19 +66,28 @@ extra-system-features = builder-rpc-v0
 store = local?root=$ALT_STORE
 "
 
-echo "==> building .#linux-kernel" >&2
-build_log="/tmp/nixgg-kernel-boot-smoke-build.log"
-# -o (not --no-link) pins a GC root so the result can't be reaped
-# between this build and the QEMU run below.
-build_root="/tmp/nixgg-kernel-boot-smoke.result"
-out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$build_root" \
-  --print-out-paths "$nixgg_root#linux-kernel" 2>"$build_log")
-if [[ -z "$out" ]]; then
-  echo "BUILD FAILED; see $build_log:" >&2
-  tail -20 "$build_log" >&2
-  exit 1
-fi
+# build_flake_attr <attr> <result-root> <log-file>
+#
+# Builds "$nixgg_root#$attr" with a real GC root (-o, not --no-link —
+# a --no-link result has nothing keeping it alive between this build
+# and the QEMU run below) and echoes the printed out-path, or prints
+# the log's tail and returns non-zero. Callers prefix the echoed path
+# with $ALT_STORE to get the real on-disk path.
+build_flake_attr() {
+  local attr="$1" result_root="$2" log="$3"
+  local out
+  if ! out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$result_root" \
+       --print-out-paths "$nixgg_root#$attr" 2>"$log") || [[ -z "$out" ]]; then
+    echo "BUILD FAILED: $attr; see $log:" >&2
+    tail -20 "$log" >&2
+    return 1
+  fi
+  echo "$out"
+}
 
+echo "==> building .#linux-kernel" >&2
+out=$(build_flake_attr linux-kernel /tmp/nixgg-kernel-boot-smoke.result \
+  /tmp/nixgg-kernel-boot-smoke-build.log) || exit 1
 vmlinux="$ALT_STORE$out/vmlinux"
 if [[ ! -s "$vmlinux" ]]; then
   echo "MISSING: $out/vmlinux" >&2
@@ -86,16 +95,9 @@ if [[ ! -s "$vmlinux" ]]; then
 fi
 
 echo "==> building .#linux-kernel-initramfs" >&2
-initramfs_log="/tmp/nixgg-kernel-boot-smoke-initramfs.log"
-initramfs_root="/tmp/nixgg-kernel-boot-smoke-initramfs.result"
-initramfs_out=$("$PATCHED_NIX/bin/nix" build --no-eval-cache -o "$initramfs_root" \
-  --print-out-paths "$nixgg_root#linux-kernel-initramfs" 2>"$initramfs_log")
-if [[ -z "$initramfs_out" ]]; then
-  echo "INITRAMFS BUILD FAILED; see $initramfs_log:" >&2
-  tail -20 "$initramfs_log" >&2
-  exit 1
-fi
-
+initramfs_out=$(build_flake_attr linux-kernel-initramfs \
+  /tmp/nixgg-kernel-boot-smoke-initramfs.result \
+  /tmp/nixgg-kernel-boot-smoke-initramfs.log) || exit 1
 initramfs="$ALT_STORE$initramfs_out/initramfs.cpio"
 if [[ ! -s "$initramfs" ]]; then
   echo "MISSING: $initramfs_out/initramfs.cpio" >&2
@@ -115,7 +117,7 @@ qemu_log="/tmp/nixgg-kernel-boot-smoke-qemu.log"
   >"$boot_log" 2>"$qemu_log"
 qemu_status=$?
 if [[ $qemu_status -ne 0 ]]; then
-  echo "FAIL: qemu exited $qemu_status (want 0 — a clean poweroff); see $qemu_log:" >&2
+  echo "FAIL: qemu exited $qemu_status (want 0 — a clean reboot); see $qemu_log:" >&2
   tail -20 "$qemu_log" >&2
   echo "boot log ($boot_log):" >&2
   tail -30 "$boot_log" >&2
